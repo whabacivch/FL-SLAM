@@ -1,0 +1,13 @@
+{
+  "package_name": "fl_slam_poc",
+  "output_dir": "/home/will/Documents/Coding/Phantom Fellowship MIT/Impact Project_v1/fl_ws/build_3d/fl_slam_poc/rosidl_generator_type_description/fl_slam_poc",
+  "idl_tuples": [
+    "/home/will/Documents/Coding/Phantom Fellowship MIT/Impact Project_v1/fl_ws/build_3d/fl_slam_poc/rosidl_adapter/fl_slam_poc:msg/AnchorCreate.idl",
+    "/home/will/Documents/Coding/Phantom Fellowship MIT/Impact Project_v1/fl_ws/build_3d/fl_slam_poc/rosidl_adapter/fl_slam_poc:msg/LoopFactor.idl"
+  ],
+  "include_paths": [
+    "std_msgs:/opt/ros/jazzy/share/std_msgs",
+    "builtin_interfaces:/opt/ros/jazzy/share/builtin_interfaces",
+    "geometry_msgs:/opt/ros/jazzy/share/geometry_msgs"
+  ]
+}

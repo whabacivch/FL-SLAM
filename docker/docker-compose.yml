@@ -1,0 +1,44 @@
+version: "3.8"
+
+services:
+  fl-slam:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: fl-slam-poc:latest
+    container_name: fl-slam-poc
+    
+    # Allow GUI and display (for rviz if needed)
+    environment:
+      - DISPLAY=${DISPLAY:-:0}
+      - QT_X11_NO_MITSHM=1
+      - ROS_DOMAIN_ID=0
+    
+    # Mount source for live development
+    volumes:
+      - ../fl_ws/src/fl_slam_poc:/ros2_ws/src/fl_slam_poc:rw
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    
+    # Network for Foxglove
+    ports:
+      - "8765:8765"  # Foxglove WebSocket
+    
+    # Keep container running
+    stdin_open: true
+    tty: true
+    
+    # Start with bash
+    command: /bin/bash
+
+  # Foxglove visualization service
+  foxglove:
+    image: fl-slam-poc:latest
+    container_name: fl-slam-foxglove
+    depends_on:
+      - fl-slam
+    network_mode: "service:fl-slam"
+    command: >
+      bash -c "source /opt/ros/jazzy/setup.bash && 
+               source /ros2_ws/install/setup.bash && 
+               ros2 launch foxglove_bridge foxglove_bridge_launch.xml port:=8765"
+

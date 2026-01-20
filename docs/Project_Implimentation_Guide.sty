@@ -1,0 +1,314 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.7em}
+
+\title{\bf Technical Implementation Note:\\
+Frobenius--Legendre Compositional Inference for Dynamic SLAM\\
+}
+\author{William T. Habacivch Jr.}
+\date{January 15, 2026}
+
+\begin{document}
+\maketitle
+
+\section*{Purpose and Scope}
+This document specifies a mathematically exact and mechanically executable design for a \emph{Frobenius--Legendre compositional inference} backend for dynamic SLAM. The backend replaces graph-centric Dynamic Scene Graph (DSG) inference with an \emph{atlas of local probabilistic modules} updated by intrinsic statistical-manifold operations.
+
+The design intentionally stands on established theory from information geometry and Frobenius statistical manifolds: exponential families provide a dually-flat geometry with convex potentials (enabling Bregman/KL barycenters and Legendre projections), while Frobenius structure equips each family with a metric $g$, cubic tensor $C$, and an induced multiplication $\circ$ that supplies principled third-order corrections where approximations enter (linearization, mixture reduction, non-family factor approximation).
+
+We explicitly incorporate \emph{order-invariant evidence recomposition} and \emph{one-shot loop correction} without iterative global re-optimization. Loop closures and re-observations are treated as \emph{late-arriving evidence factors} inserted into the same barycenter calculus. Because fusion is associative/commutative (in the exact cases) and convex/closed-form in the dominant robotics families, loop evidence can be incorporated in a single recomposition step, with third-order Frobenius retraction correcting transport error introduced by linearization.
+
+A scene graph remains a derived view for downstream consumers (planning, visualization) and is never the primary inference substrate.
+
+\section{Design Principles (Non-Negotiable Invariants)}
+\textbf{P1. Closed-form-first exactness.} Use analytic closed-form operators wherever theory provides them; use optimization only as a declared, geometry-defined operator when unavoidable.\\
+\textbf{P2. Associative, order-robust fusion.} Evidence composition is commutative/associative whenever the model implies it (product-of-experts in a fixed family).\\
+\textbf{P3. Legendre/Bregman foundations.} Fusion and projection are implemented as Bregman barycenters and information projections induced by the log-partition potential $\psi$.\\
+\textbf{P4. Frobenius third-order correction only for approximations.} Linearization, mixture reduction, and non-family factor approximations are explicit and corrected via $(g,C,\circ)$.\\
+\textbf{P5. Soft association (no heuristic gating).} Correspondence uncertainty is represented via responsibilities from a declared generative model.\\
+\textbf{P6. One-shot loop correction by recomposition.} Loop closures are treated as late-arriving evidence inserted into barycenters; no global iterative relaxation is required under the declared assumptions.\\
+\textbf{P7. Local modularity.} The state is an atlas of local modules; updates remain local by construction.
+
+\section{Statistical-Manifold Foundations (Objects We Implement)}
+\subsection{Exponential family and convex potential}
+Let $\mathcal{E}$ be a regular exponential family:
+\begin{equation}
+p(x\mid\theta)=h(x)\exp\big(\langle \theta,T(x)\rangle - \psi(\theta)\big),
+\label{eq:expfam}
+\end{equation}
+with natural parameters $\theta$ and log-partition $\psi$.
+
+Define expectation coordinates:
+\begin{equation}
+\eta := \nabla \psi(\theta) = \mathbb{E}_\theta[T(x)].
+\end{equation}
+Define the Legendre dual potential:
+\begin{equation}
+\psi^\*(\eta) := \sup_{\theta}\{\langle\theta,\eta\rangle - \psi(\theta)\},
+\qquad \theta = \nabla\psi^\*(\eta).
+\end{equation}
+
+\subsection{Metric, cubic tensor, and Frobenius-induced product}
+Per family:
+\begin{equation}
+g(\theta)=\nabla^2\psi(\theta),
+\qquad
+C(\theta)=\nabla^3\psi(\theta),
+\label{eq:gC}
+\end{equation}
+computed analytically where tractable or via automatic differentiation of $\psi$ in canonical coordinates (validated numerically). Define the induced tangent multiplication $\circ$ by:
+\begin{equation}
+g(u\circ v, w)=C(u,v,w)\quad \text{for all tangent } w.
+\label{eq:frobprod}
+\end{equation}
+Where Frobenius conditions hold, $\circ$ is commutative/associative and metric-compatible; in implementation we use $\circ$ as a \emph{fixed geometric correction operator} for approximation-induced transport error, with empirical validation.
+
+\subsection{Bregman divergence (dually-flat geometry)}
+\begin{equation}
+D_\psi(\theta\|\theta')=\psi(\theta)-\psi(\theta')-\langle\nabla\psi(\theta'),\theta-\theta'\rangle.
+\label{eq:breg}
+\end{equation}
+
+\section{State Representation: Atlas of Modules}
+Each module $k$:
+\[
+\mathcal{M}_k = (\mathcal{F}_k,\theta_k,w_k,\rho_k,\text{meta}_k),
+\]
+with $\mathcal{F}_k$ defining $\psi_k,g_k,C_k,\circ_k$. $w_k$ is mass, $\rho_k$ retention.
+
+\textbf{Families (closed-form-first).}
+\begin{itemize}[leftmargin=1.2em]
+\item \textbf{Gaussian:} pose, kinematics, local geometry (information form).
+\item \textbf{Dirichlet/Categorical:} semantics, relations (pseudo-count form).
+\item \textbf{Optional directional:} vMF/Bingham (low-dimensional inversion if needed).
+\end{itemize}
+
+\section{Core Operator A: Fusion as a Legendre/Bregman Barycenter}
+Given parameters $\{\theta_i\}$ with weights $\{w_i\}$ in the same family:
+\begin{equation}
+\theta^\star = \arg\min_{\theta}\sum_i w_i\,D_\psi(\theta\|\theta_i).
+\label{eq:bary}
+\end{equation}
+Optimality:
+\begin{equation}
+\eta^\star=\frac{\sum_i w_i\,\eta_i}{\sum_i w_i},
+\qquad
+\theta^\star=\nabla\psi^\*(\eta^\star).
+\label{eq:etabary}
+\end{equation}
+
+\textbf{Closed-form coverage.} In Gaussian information and Dirichlet pseudo-count parameterizations, \eqref{eq:etabary} yields closed-form fusion (dominant robotics operations). Solvers are used only for low-dimensional inversions (Section~\ref{sec:solver}).
+
+\textbf{Associative special case.} When evidence factors correspond to product-of-experts in a fixed family (matching $h,T$), fusion reduces to additive sufficient-statistic accumulation, yielding order invariance.
+
+\section{Core Operator B: Soft Association (Responsibilities)}
+Given observations $\{y_j\}$ and candidate modules $k$:
+\[
+\ell_k(j)=p(y_j\mid\mathcal{M}_k),
+\]
+and ``new'' likelihood $\ell_{\text{new}}(j)$,
+\begin{equation}
+r_k(j)=\frac{w_k\,\ell_k(j)}{\sum_{k'} w_{k'}\ell_{k'}(j)+w_{\text{new}}\ell_{\text{new}}(j)},
+\qquad
+r_{\text{new}}(j)=\frac{w_{\text{new}}\ell_{\text{new}}(j)}{\sum_{k'} w_{k'}\ell_{k'}(j)+w_{\text{new}}\ell_{\text{new}}(j)}.
+\label{eq:resp}
+\end{equation}
+Responsibilities perform fractional routing of evidence (``copy'') without hard gates.
+
+\section{Core Operator C: Module Update (Barycenter of Retained Prior + Routed Evidence)}
+For module $k$, build:
+\[
+\mathcal{S}_k=\{(\theta_k,\rho_k w_k)\}\cup\{(\theta_{\text{obs}}^{(j)},r_k(j))\}_{j=1}^J.
+\]
+Update:
+\begin{equation}
+\theta_k^{+}=\mathrm{Barycenter}_\psi(\mathcal{S}_k).
+\label{eq:modulebary}
+\end{equation}
+Mass:
+\[
+w_k \leftarrow \rho_w w_k + \sum_j r_k(j).
+\]
+
+\section{One-Shot Loop Correction by Order-Invariant Evidence Recomposition}
+\subsection{Loop closures as late-arriving evidence}
+A loop closure is treated as an additional evidence factor that arrives after prior fusion steps. Let $\theta_{\text{loop}}$ denote the natural-parameter evidence induced by a loop constraint (possibly after linearization). For any affected module(s), extend the evidence set:
+\[
+\mathcal{S}_k \leftarrow \mathcal{S}_k \cup \{(\theta_{\text{loop}}, w_{\text{loop}})\}.
+\]
+Then compute the barycenter as usual:
+\[
+\theta_k^{+}=\mathrm{Barycenter}_\psi(\mathcal{S}_k).
+\]
+This yields \textbf{one-shot incorporation} of loop evidence without iterative relaxation, under the declared modeling assumptions.
+
+\subsection{Subset recomposition (tractable locality)}
+A loop may implicate many modules; recomposition is performed on a \emph{selected subset} (anchors) rather than the entire history:
+\begin{itemize}[leftmargin=1.2em]
+\item maintain a small set of key modules (poses/submap anchors/entities) with retained evidence mass,
+\item on loop detection, recompute barycenters only on the subset connected by the loop constraint,
+\item export updated derived views and allow downstream consumers to refresh.
+\end{itemize}
+This preserves locality while capturing drift correction where it matters.
+
+\subsection{When third-order correction is applied}
+If the loop constraint required linearization or any approximation, apply third-order Frobenius retraction:
+\[
+\Delta\theta=\theta^\star-\theta_0,\quad
+\theta_{\text{new}}=\theta_0+\Delta\theta+\tfrac{1}{2}(\Delta\theta\circ\Delta\theta).
+\]
+Exact in-family additive fusion does not require correction.
+
+\section{Explicit Approximation Triggers and Frobenius Third-Order Retraction}
+\subsection{Approximation triggers (the only places third-order is applied)}
+\begin{enumerate}[leftmargin=1.2em]
+\item Nonlinear measurement injection via linearization (pose/entity coupling).
+\item Mixture reduction / hypothesis compression (projecting mixtures to a single family member).
+\item Approximating out-of-family factors (robust costs, heavy-tailed noise) as in-family evidence.
+\end{enumerate}
+
+\subsection{Third-order correction operator}
+Given $\theta_0$ and candidate $\theta^\star$:
+\[
+\Delta\theta=\theta^\star-\theta_0,\quad
+\Delta\theta_{\text{corr}}=\Delta\theta+\frac{1}{2}(\Delta\theta\circ\Delta\theta),
+\quad
+\theta_{\text{new}}=\theta_0+\Delta\theta_{\text{corr}}.
+\]
+Compute $g=\nabla^2\psi(\theta_0)$ and $C=\nabla^3\psi(\theta_0)$, define $\circ$ via \eqref{eq:frobprod}. Invocation is logged.
+
+\section{Universal Solver for Non-Closed-Form Inversions}
+\label{sec:solver}
+When $\theta=\nabla\psi^\*(\eta)$ is not closed-form, solve via:
+\begin{itemize}[leftmargin=1.2em]
+\item \textbf{Mirror descent} with mirror map $\psi$ (intrinsic, stable),
+\item \textbf{Natural-gradient Newton} using metric $g=\nabla^2\psi$.
+\end{itemize}
+These are geometry-defined operators, not heuristic optimizers.
+
+\section{Limitations (Explicit, Nuanced)}
+This framework substantially reduces drift and avoids global iterative re-optimization, but it is not a universal substitute for batch bundle adjustment in all regimes:
+\begin{itemize}[leftmargin=1.2em]
+\item \textbf{Residual higher-order error:} third-order correction leaves $O(\|\Delta\theta\|^4)$ residuals; very long trajectories with strong nonlinearities may still accumulate drift.
+\item \textbf{Front-end dependence:} loop detection (place recognition) is external; recomposition assumes correct loop hypotheses.
+\item \textbf{Out-of-family modeling:} heavy-tailed or multimodal true processes require explicit mixture maintenance or incur projection error.
+\item \textbf{Nonlocal loops:} loops spanning many modules require subset selection (anchors). This is principled locality, but still a design choice that must be logged and evaluated.
+\end{itemize}
+
+\section{Algorithm (Updated)}
+\begin{algorithm}[h]
+\caption{Frobenius--Legendre Update with One-Shot Loop Recomposition}
+\begin{algorithmic}[1]
+\STATE Input: atlas modules $\{\mathcal{M}_k\}$, observations $\{y_j\}$, optional loop constraints $\{\theta_{\text{loop}}\}$
+\STATE Convert observations to evidence $\theta_{\text{obs}}^{(j)}$ and compute likelihoods $\ell_k(j)$
+\STATE Compute responsibilities $r_k(j),r_{\text{new}}(j)$ via Eq.~\eqref{eq:resp}
+\FOR{each module $k$ in the active subset (including loop-affected anchors if any)}
+  \STATE Build $\mathcal{S}_k=\{(\theta_k,\rho_k w_k)\}\cup\{(\theta_{\text{obs}}^{(j)},r_k(j))\}_j$
+  \IF{module $k$ is affected by loop constraints}
+     \STATE Add loop evidence: $\mathcal{S}_k \leftarrow \mathcal{S}_k \cup \{(\theta_{\text{loop}},w_{\text{loop}})\}$
+  \ENDIF
+  \STATE Compute barycenter $\theta^\star=\mathrm{Barycenter}_\psi(\mathcal{S}_k)$ (closed-form when available)
+  \IF{any evidence in $\mathcal{S}_k$ was produced by approximation}
+     \STATE Apply third-order retraction via $g,C,\circ$
+  \ENDIF
+  \STATE Update $\theta_k\leftarrow \theta^\star$ (or corrected), update $w_k$
+\ENDFOR
+\STATE Instantiate budgeted new modules from $r_{\text{new}}(j)$ (logged compute budget)
+\STATE Export derived graph view and publish telemetry
+\end{algorithmic}
+\end{algorithm}
+
+\section*{Conclusion}
+This  design makes loop closures and re-observations first-class citizens of the same Frobenius--Legendre calculus: they are late-arriving evidence factors incorporated by order-invariant barycenter recomposition, avoiding global iterative optimization. Closed-form analytic operators cover the dominant robotics families (Gaussian and Dirichlet/categorical), providing speed and robustness. Where approximation is unavoidable, third-order Frobenius retractions derived from $(g,C,\circ)$ correct transport error in a principled, logged manner. The result is a tractable, faster, and more robust dynamic SLAM inference substrate than heuristic-gated or graph-centric DSG pipelines, with explicit limitations and measurable ablations.
+
+
+\section*{Bibliography}
+\begin{thebibliography}{99}
+
+\bibitem{Amari1985}
+S.-I. Amari.
+\newblock {\em Differential-Geometrical Methods in Statistics}.
+\newblock Lecture Notes in Statistics 28, Springer-Verlag, 1985.
+
+\bibitem{Amari2016}
+S.-I. Amari.
+\newblock {\em Information Geometry and Its Applications}.
+\newblock Applied Mathematical Sciences 194, Springer Japan, 2016.
+
+\bibitem{AmariNagaoka2000}
+S.-I. Amari and H. Nagaoka.
+\newblock {\em Methods of Information Geometry}.
+\newblock Translations of Mathematical Monographs 191, American Mathematical Society, 2000.
+
+\bibitem{BarndorffNielsen1978}
+O. E. Barndorff-Nielsen.
+\newblock {\em Information and Exponential Families in Statistical Theory}.
+\newblock Wiley Series in Probability and Mathematical Statistics, John Wiley \& Sons, 1978.
+
+\bibitem{CombeManin2020}
+N. C. Combe and Yu. I. Manin.
+\newblock F-manifolds and geometry of information.
+\newblock {\em Bulletin of the London Mathematical Society}, 52(5):777--792, 2020.
+
+\bibitem{Combe2021a}
+N. C. Combe.
+\newblock Frobenius statistical manifolds \& geometric invariants.
+\newblock arXiv:2107.08446 [math.DG], 2021.
+
+\bibitem{Combe2021b}
+N. C. Combe.
+\newblock A note on exponential varieties, statistical manifolds and Frobenius structures.
+\newblock arXiv:2110.02607 [math.DG], 2021.
+
+\bibitem{Combe2021c}
+N. C. Combe.
+\newblock Algebraic properties of the information geometry's fourth Frobenius manifold.
+\newblock arXiv:2109.13605 [math.DG], 2021.
+
+\bibitem{Combe2022}
+N. C. Combe.
+\newblock Symplectic and Poisson geometry of the information geometry's Frobenius manifold.
+\newblock arXiv:2201.07517 [math.DG], 2022.
+
+\bibitem{Combe2023}
+N. C. Combe.
+\newblock On Frobenius structures in symmetric cones.
+\newblock arXiv:2309.04334 [math.DG], 2023.
+
+\bibitem{Dubrovin1996}
+B. Dubrovin.
+\newblock Geometry of 2D topological field theories.
+\newblock In {\em Integrable Systems and Quantum Groups}, Lecture Notes in Mathematics 1620, Springer, 1996.
+
+\bibitem{Eguchi1983}
+T. Eguchi.
+\newblock New approach to collective phenomena in superconductivity.
+\newblock {\em Physical Review Letters}, 51:507--510, 1983.
+
+\bibitem{Hertling2001}
+C. Hertling.
+\newblock {\em Frobenius Manifolds and Moduli Spaces for Singularities}.
+\newblock Cambridge Tracts in Mathematics 151, Cambridge University Press, 2001.
+
+\bibitem{Manin1999}
+Yu. I. Manin.
+\newblock {\em Frobenius Manifolds, Quantum Cohomology, and Moduli Spaces}.
+\newblock American Mathematical Society Colloquium Publications 47, AMS, 1999.
+
+\bibitem{Nielsen2020}
+F. Nielsen.
+\newblock An elementary introduction to information geometry.
+\newblock {\em Entropy}, 22(10):1100, 2020.
+
+\end{thebibliography}
+\end{document}

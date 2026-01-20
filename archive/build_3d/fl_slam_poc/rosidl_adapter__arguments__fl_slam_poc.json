@@ -1,0 +1,7 @@
+{
+  "package_name": "fl_slam_poc",
+  "non_idl_tuples": [
+    "/home/will/Documents/Coding/Phantom Fellowship MIT/Impact Project_v1/fl_ws/src/fl_slam_poc:msg/AnchorCreate.msg",
+    "/home/will/Documents/Coding/Phantom Fellowship MIT/Impact Project_v1/fl_ws/src/fl_slam_poc:msg/LoopFactor.msg"
+  ]
+}

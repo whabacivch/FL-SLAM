@@ -1,0 +1,55 @@
+# ROS 2 / Colcon build artifacts
+fl_ws/build/
+fl_ws/build_*/
+fl_ws/install/
+fl_ws/install_*/
+fl_ws/log/
+fl_ws/log_*/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime logs / artifacts
+.ros/
+diagnostic_logs/
+
+# ROS bags (can be large)
+*.bag
+*.db3
+rosbags/**
+!rosbags/README.md
+!rosbags/.gitkeep
+
+# Temporary files
+*.tmp
+*.bak
