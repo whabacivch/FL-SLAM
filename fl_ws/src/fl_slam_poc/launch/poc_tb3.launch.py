@@ -44,7 +44,7 @@ def generate_launch_description():
             DeclareLaunchArgument("camera_info_topic", default_value="/camera/depth/camera_info"),
             DeclareLaunchArgument(
                 "sensor_qos_reliability",
-                default_value="reliable",
+                default_value="both",
                 description="QoS reliability for sensor subscriptions: reliable, best_effort, system_default, both",
             ),
             SetEnvironmentVariable("TURTLEBOT3_MODEL", model),
