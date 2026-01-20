@@ -42,6 +42,12 @@ def generate_launch_description():
     base_frame = LaunchConfiguration("base_frame")
     odom_frame = LaunchConfiguration("odom_frame")
     sensor_qos_reliability = LaunchConfiguration("sensor_qos_reliability")
+    
+    # 3D Point Cloud Mode (optional)
+    use_3d_pointcloud = LaunchConfiguration("use_3d_pointcloud")
+    use_gpu = LaunchConfiguration("use_gpu")
+    pointcloud_topic = LaunchConfiguration("pointcloud_topic")
+    voxel_size = LaunchConfiguration("voxel_size")
 
     default_qos_path = (
         get_package_share_directory("fl_slam_poc") + "/config/qos_override.yaml"
@@ -95,10 +101,19 @@ def generate_launch_description():
                 description="Enable depth image processing"),
             DeclareLaunchArgument("enable_camera_info", default_value="true",
                 description="Enable camera intrinsics subscription"),
-            # Image decompression node (NEW - decompresses rosbag compressed images)
+            # 3D Point Cloud Mode (disabled by default for TurtleBot3)
+            DeclareLaunchArgument("use_3d_pointcloud", default_value="false",
+                description="Enable 3D point cloud mode (vs 2D LaserScan)"),
+            DeclareLaunchArgument("use_gpu", default_value="false",
+                description="Enable GPU acceleration for ICP"),
+            DeclareLaunchArgument("pointcloud_topic", default_value="/camera/depth/points",
+                description="PointCloud2 topic to subscribe to"),
+            DeclareLaunchArgument("voxel_size", default_value="0.05",
+                description="Voxel grid filter size in meters"),
+            # Image decompression node (decompresses rosbag compressed images)
             Node(
                 package="fl_slam_poc",
-                executable="image_decompress_node",
+                executable="image_decompress",
                 name="image_decompress",
                 output="screen",
                 parameters=[
@@ -140,13 +155,20 @@ def generate_launch_description():
                         "base_frame": base_frame,
                         "odom_frame": odom_frame,
                         "sensor_qos_reliability": sensor_qos_reliability,
+                        # 3D Point Cloud Mode
+                        "use_3d_pointcloud": use_3d_pointcloud,
+                        "enable_pointcloud": use_3d_pointcloud,  # Auto-enable with 3D mode
+                        "pointcloud_topic": pointcloud_topic,
+                        "use_gpu": use_gpu,
+                        "voxel_size": voxel_size,
+                        "gpu_fallback_to_cpu": True,
                     }
                 ],
                 condition=IfCondition(enable_frontend),
             ),
             Node(
                 package="fl_slam_poc",
-                executable="tb3_odom_bridge_node",
+                executable="tb3_odom_bridge",
                 name="tb3_odom_bridge",
                 output="screen",
                 parameters=[
@@ -163,7 +185,7 @@ def generate_launch_description():
             ),
             Node(
                 package="fl_slam_poc",
-                executable="fl_backend_node",
+                executable="backend_node",
                 name="fl_backend",
                 output="screen",
                 parameters=[

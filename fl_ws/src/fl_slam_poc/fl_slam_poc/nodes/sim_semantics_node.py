@@ -1,3 +1,13 @@
+"""
+EXPERIMENTAL: Simulated semantic category publisher for Dirichlet testing.
+
+This module is EXPERIMENTAL and not part of the main FL-SLAM pipeline.
+It publishes simulated Dirichlet mixture distributions for testing
+the experimental dirichlet_backend_node.
+
+Status: Experimental - kept for reference and future development.
+"""
+
 import numpy as np
 import rclpy
 from rclpy.node import Node

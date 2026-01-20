@@ -1,16 +1,13 @@
 """
-Utility modules for FL-SLAM.
+Utility modules for FL-SLAM - Legacy compatibility.
 
-Infrastructure only - NO inference/approximation logic here.
-Approximations must be context-aware with Frobenius correction.
+NOTE: StatusMonitor has moved to fl_slam_poc.frontend.processing.
+This module provides backward compatibility re-exports.
 """
 
-from fl_slam_poc.utils.sensor_sync import SensorSynchronizer, AlignedData
-from fl_slam_poc.utils.status_monitor import StatusMonitor, SensorStatus
+from fl_slam_poc.frontend.processing.status_monitor import StatusMonitor, SensorStatus
 
 __all__ = [
-    "SensorSynchronizer",
-    "AlignedData",
     "StatusMonitor",
     "SensorStatus",
 ]

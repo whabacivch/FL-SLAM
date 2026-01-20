@@ -28,6 +28,20 @@ ros2 launch fl_slam_poc poc_tb3.launch.py model:=waffle use_sim_time:=true
 ./scripts/test-integration.sh
 ```
 
+### Run (3D Point Cloud Mode)
+```bash
+# Download NVIDIA r2b dataset
+./scripts/download_r2b_dataset.sh
+
+# Run with GPU acceleration
+ros2 launch fl_slam_poc poc_3d_rosbag.launch.py \
+    bag:=rosbags/r2b_storage \
+    play_bag:=true \
+    use_gpu:=true
+
+# See docs/3D_POINTCLOUD.md for full documentation
+```
+
 ---
 
 ## Documentation
@@ -42,6 +56,7 @@ ros2 launch fl_slam_poc poc_tb3.launch.py model:=waffle use_sim_time:=true
 - **[docs/ROSBAG.md](docs/ROSBAG.md)** - Rosbag testing workflow
 - **[docs/TESTING.md](docs/TESTING.md)** - Testing framework and workflows
 - **[docs/INSTALLATION.md](docs/INSTALLATION.md)** - Installation and setup guide
+- **[docs/3D_POINTCLOUD.md](docs/3D_POINTCLOUD.md)** - 3D point cloud mode with GPU acceleration
 
 ### Reference
 - **[docs/Comprehensive Information Geometry.md](docs/Comprehensive Information Geometry.md)** - Mathematical formulas

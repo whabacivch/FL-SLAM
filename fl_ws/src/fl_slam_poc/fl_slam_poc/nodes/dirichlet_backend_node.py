@@ -1,3 +1,13 @@
+"""
+EXPERIMENTAL: Dirichlet semantic SLAM backend node.
+
+This module is EXPERIMENTAL and not part of the main FL-SLAM pipeline.
+It demonstrates Dirichlet-based semantic category fusion but is not
+integrated with the primary frontend/backend architecture.
+
+Status: Experimental - kept for reference and future development.
+"""
+
 import numpy as np
 import rclpy
 from rclpy.node import Node

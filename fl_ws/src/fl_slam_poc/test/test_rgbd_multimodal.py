@@ -14,8 +14,17 @@ Reference: Hybrid Laser + RGB-D Sensor Fusion Architecture
 import numpy as np
 import pytest
 
-from fl_slam_poc.operators import make_evidence, mean_cov, fuse_info
-from fl_slam_poc.operators.vmf_geometry import (
+# Backend fusion operators
+from fl_slam_poc.backend.fusion.gaussian_info import make_evidence, mean_cov, fuse_info
+from fl_slam_poc.backend.fusion.multimodal_fusion import (
+    laser_2d_to_3d_constraint,
+    fuse_laser_rgbd,
+    fuse_multimodal_3d,
+    spatial_association_weight,
+)
+
+# Frontend loops operators
+from fl_slam_poc.frontend.loops.vmf_geometry import (
     vmf_make_evidence,
     vmf_mean_param,
     vmf_barycenter,
@@ -23,13 +32,9 @@ from fl_slam_poc.operators.vmf_geometry import (
     A_d,
     A_d_inverse_series,
 )
-from fl_slam_poc.operators.multimodal_fusion import (
-    laser_2d_to_3d_constraint,
-    fuse_laser_rgbd,
-    fuse_multimodal_3d,
-    spatial_association_weight,
-)
-from fl_slam_poc.frontend.rgbd_processor import (
+
+# Frontend processing
+from fl_slam_poc.frontend.processing.rgbd_processor import (
     depth_to_pointcloud,
     compute_normals_from_depth,
     rgbd_to_evidence,

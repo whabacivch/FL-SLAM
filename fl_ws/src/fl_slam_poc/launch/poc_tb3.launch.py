@@ -68,7 +68,7 @@ def generate_launch_description():
             ),
             Node(
                 package="fl_slam_poc",
-                executable="tb3_odom_bridge_node",
+                executable="tb3_odom_bridge",
                 name="tb3_odom_bridge",
                 output="screen",
                 parameters=[{
@@ -80,7 +80,7 @@ def generate_launch_description():
             ),
             Node(
                 package="fl_slam_poc",
-                executable="fl_backend_node",
+                executable="backend_node",
                 name="fl_backend",
                 output="screen",
                 parameters=[{"use_sim_time": use_sim_time}],

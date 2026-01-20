@@ -1,7 +1,17 @@
+"""
+EXPERIMENTAL: Dirichlet geometry operators for semantic category fusion.
+
+This module is EXPERIMENTAL and not part of the main FL-SLAM pipeline.
+It provides information-geometric operations on Dirichlet distributions
+for the experimental semantic SLAM components.
+
+Status: Experimental - kept for reference and future development.
+"""
+
 import numpy as np
 from scipy.special import digamma, gammaln, polygamma
 
-from fl_slam_poc.operators.op_report import OpReport
+from fl_slam_poc.common.op_report import OpReport
 
 EPS = 1e-9  # numerical interior safeguard (domain constraint)
 
