@@ -12,6 +12,7 @@ GT_FILE="$PROJECT_ROOT/rosbags/m3dgr/Dynamic01.txt"
 EST_FILE="/tmp/fl_slam_trajectory.tum"
 GT_ALIGNED="/tmp/m3dgr_ground_truth_aligned.tum"
 RESULTS_DIR="$PROJECT_ROOT/results/m3dgr_$(date +%Y%m%d_%H%M%S)"
+LOG_FILE="$RESULTS_DIR/slam_run.log"
 
 echo "========================================"
 echo "FL-SLAM M3DGR Pipeline"
@@ -33,42 +34,52 @@ source "$PROJECT_ROOT/fl_ws/install/setup.bash" 2>/dev/null || source "$PROJECT_
 echo "[1/3] Running SLAM system..."
 
 # Get bag info for duration estimate
-BAG_DURATION=$(ros2 bag info "$BAG_PATH" 2>/dev/null | grep "Duration" | awk '{print $2}' | cut -d'.' -f1 || echo "unknown")
-echo "  Bag duration: ~${BAG_DURATION}s"
+BAG_DURATION=$(ros2 bag info "$BAG_PATH" 2>/dev/null | grep "Duration" | awk '{print $2}' | cut -d'.' -f1 || echo "180")
+TIMEOUT_SEC=$((BAG_DURATION + 30))  # Add 30s buffer for processing
+echo "  Bag duration: ~${BAG_DURATION}s (timeout: ${TIMEOUT_SEC}s)"
+echo "  Full log: $LOG_FILE"
 echo "  Starting playback with progress monitoring..."
 echo ""
 
-# Run SLAM and filter output to show progress
-ros2 launch fl_slam_poc poc_m3dgr_rosbag.launch.py bag:="$BAG_PATH" 2>&1 | \
-  while IFS= read -r line; do
-    # Filter out noisy warnings
-    if [[ "$line" == *"not found:"* ]]; then
-      continue
-    fi
-    if [[ "$line" == *"camera_color_optical_frame"* ]]; then
-      continue
-    fi
-    if [[ "$line" == *"SENSOR STALE"* ]]; then
-      continue
-    fi
-    if [[ "$line" == *"SENSOR MISSING"* ]]; then
+# Launch SLAM in background with full logging
+ros2 launch fl_slam_poc poc_m3dgr_rosbag.launch.py bag:="$BAG_PATH" > "$LOG_FILE" 2>&1 &
+LAUNCH_PID=$!
+
+# Monitor progress by tailing log with filtered display
+tail -f "$LOG_FILE" 2>/dev/null | while IFS= read -r line; do
+    # Filter out noisy warnings for display (but keep in log file)
+    if [[ "$line" == *"not found:"* ]] || \
+       [[ "$line" == *"camera_color_optical_frame"* ]] || \
+       [[ "$line" == *"SENSOR STALE"* ]] || \
+       [[ "$line" == *"SENSOR MISSING"* ]]; then
       continue
     fi
     # Show progress updates (backend status)
     if [[ "$line" == *"Backend status:"* ]]; then
-      # Extract just the status info
       status=$(echo "$line" | sed 's/.*Backend status: //')
       echo -ne "\r  Progress: $status                              "
     elif [[ "$line" == *"ERROR"* ]] || [[ "$line" == *"Traceback"* ]]; then
       echo ""
       echo "$line"
     elif [[ "$line" == *"Created anchor"* ]]; then
-      # Show anchor creation
       echo -ne "\r  $line                              "
     fi
-  done
+done &
+TAIL_PID=$!
 
+# Wait for timeout, then kill launch
+sleep "$TIMEOUT_SEC"
 echo ""
+echo "  Timeout reached (${TIMEOUT_SEC}s), stopping SLAM..."
+
+# Kill the launch process and all its children
+pkill -P $LAUNCH_PID 2>/dev/null || true
+kill $LAUNCH_PID 2>/dev/null || true
+kill $TAIL_PID 2>/dev/null || true
+
+# Give processes time to cleanup
+sleep 2
+
 echo "  SLAM complete!"
 echo ""
 

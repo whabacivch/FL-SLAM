@@ -60,11 +60,12 @@ def validate_trajectory(traj, name):
         print(f"    WARNING: {non_mono} non-monotonic timestamp gaps!")
         valid = False
     
-    # Check for duplicate timestamps
+    # Check for duplicate timestamps (strict: must be > 0, not >= 0)
     dups = np.sum(diffs == 0)
     if dups > 0:
         print(f"    WARNING: {dups} duplicate timestamps ({100*dups/len(timestamps):.1f}%)")
-        # Don't fail validation for this, just warn
+        print(f"    FAILED: Timestamps must be strictly monotonic (no duplicates)")
+        valid = False
     
     # Check coordinate ranges
     print(f"    Coordinate ranges:")

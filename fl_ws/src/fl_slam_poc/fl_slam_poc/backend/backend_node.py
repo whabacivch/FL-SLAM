@@ -824,7 +824,9 @@ class FLBackend(Node):
         
         # Export trajectory to file with ODOMETRY timestamp (not wall clock!)
         # Using odometry msg timestamp ensures proper alignment with ground truth
-        if self.trajectory_file and self.last_odom_stamp is not None:
+        # ONLY write on odom updates (tag=="odom"), not on loop updates
+        # Loop closures are corrections to existing poses, not new trajectory points
+        if self.trajectory_file and self.last_odom_stamp is not None and tag == "odom":
             timestamp = self.last_odom_stamp  # Use odometry message timestamp
             self.trajectory_file.write(
                 f"{timestamp:.6f} {mu[0]:.6f} {mu[1]:.6f} {mu[2]:.6f} "

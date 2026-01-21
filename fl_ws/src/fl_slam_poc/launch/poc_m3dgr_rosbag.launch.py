@@ -186,8 +186,8 @@ def generate_launch_description():
                         "output_topic": "/sim/odom",
                         "output_frame": odom_frame,
                         "child_frame": base_frame,
-                        # Use "both" to handle rosbag QoS variations
-                        "qos_reliability": "both",
+                        # Use "reliable" to avoid race condition with dual subscriptions
+                        "qos_reliability": "reliable",
                         "validate_frames": False,  # Disable frame validation for rosbag compatibility
                     }
                 ],
