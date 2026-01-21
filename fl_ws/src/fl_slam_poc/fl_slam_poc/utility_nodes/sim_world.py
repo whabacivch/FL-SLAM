@@ -1,6 +1,8 @@
 """
 Simulation World Node - Ground Truth & Odometry Provider.
 
+GAZEBO ONLY: Not used in the MVP M3DGR rosbag evaluation pipeline.
+
 Provides ground truth trajectory and noisy odometry for testing/evaluation.
 Does NOT provide synthetic sensors - those should come from a real simulator
 (e.g., Gazebo) for physically consistent data.

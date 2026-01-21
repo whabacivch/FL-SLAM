@@ -6,53 +6,33 @@ This document describes the consolidated testing framework for the FL-SLAM proje
 
 The FL-SLAM testing framework is organized into two tiers:
 
-1. **Minimal Tests** - Fast validation of core functionality (~30 seconds)
-2. **Integration Tests** - Full end-to-end system validation with rosbag data (~90 seconds)
+1. **MVP Evaluation (M3DGR)** - End-to-end SLAM + metrics/plots via `run_and_evaluate.sh`
+2. **Integration Tests (Alternative)** - End-to-end system validation with rosbag data via `test-integration.sh`
+
+**Note:** The previous Docker-based harness and minimal-test scripts were removed from the active workflow. Historical versions live under `archive/` for reference.
 
 ## Test Scripts Overview
 
-### Minimal Testing
+### MVP Evaluation (M3DGR)
 
-**Purpose:** Validate core functionality, mathematical invariants, and module wiring without launching the full SLAM system.
-
-**Native execution:**
-```bash
-./scripts/test-minimal.sh
-```
-
-**Docker execution:**
-```bash
-./scripts/docker-test.sh
-```
-
-**What it tests:**
-- ✓ Core module imports (geometry, operators, models, nodes)
-- ✓ Message type definitions (AnchorCreate, LoopFactor)
-- ✓ SE(3) operations and covariance transport
-- ✓ Information geometry operators (Gaussian, Dirichlet, vMF)
-- ✓ ICP solver properties and bounds
-- ✓ Mathematical invariants (associativity, symmetry, triangle inequality)
-- ✓ Frobenius corrections and adaptive models
-- ✓ RGB-D processing and multimodal fusion
+**Purpose:** Run the current MVP pipeline (rosbag SLAM + evaluation) end-to-end.
 
 **When to use:**
-- Before committing code changes
-- During development iterations
-- As a pre-push hook
-- In CI/CD pipelines (fast feedback)
+-- During algorithm/debug iterations (drift, timestamps, loop closures)
+-- Before merging changes that affect the runtime pipeline
 
-### Integration Testing
+**Execution:**
+```bash
+bash scripts/run_and_evaluate.sh
+```
+
+### Integration Testing (Alternative)
 
 **Purpose:** Validate the complete SLAM pipeline with real sensor data, including loop closure detection and backend optimization.
 
 **Native execution:**
 ```bash
 ./scripts/test-integration.sh
-```
-
-**Docker execution:**
-```bash
-./scripts/docker-test-integration.sh
 ```
 
 **What it tests:**
@@ -74,12 +54,7 @@ The FL-SLAM testing framework is organized into two tiers:
 
 Both test scripts support environment variables for customization:
 
-### Minimal Test Configuration
-```bash
-# No configuration needed - uses sensible defaults
-```
-
-### Integration Test Configuration
+### Integration Test Configuration (Alternative)
 
 ```bash
 # Rosbag path (default: rosbags/tb3_slam3d_small_ros2)
@@ -119,36 +94,7 @@ This script:
 
 **Inspect bag contents:**
 ```bash
-./scripts/inspect_bag_direct.py [path/to/bag]
-```
-
-## Docker Testing Workflow
-
-### Quick Development Loop
-
-```bash
-# 1. Start development environment
-./scripts/docker-run.sh
-
-# 2. Make code changes in your editor
-
-# 3. Run minimal tests (fast)
-./scripts/docker-test.sh
-
-# 4. If minimal tests pass, run integration (slower)
-./scripts/docker-test-integration.sh
-
-# 5. Stop containers when done
-./scripts/docker-stop.sh
-```
-
-### One-Shot Testing
-
-```bash
-# Build and test in one command
-./scripts/docker-build.sh && \
-./scripts/docker-test.sh && \
-./scripts/docker-test-integration.sh
+./scripts/inspect_rosbag_topics.sh [path/to/bag]
 ```
 
 ## Native Testing Workflow
@@ -158,28 +104,19 @@ Requirements:
 - Built workspace (`colcon build`)
 
 ```bash
-# Quick validation
-./scripts/test-minimal.sh
+# Unit tests (operators/models wiring + invariants)
+cd fl_ws/src/fl_slam_poc
+pytest -q
 
-# Full validation
+# Full validation (alternative integration)
+cd -
 ./scripts/test-integration.sh
+
+# MVP evaluation (M3DGR)
+bash scripts/run_and_evaluate.sh
 ```
 
 ## Understanding Test Results
-
-### Minimal Test Output
-
-```
-✓ Core modules imported successfully
-✓ Node modules imported successfully
-✓ Message types imported successfully
-
-Running: test_audit_invariants.py
-test_hellinger_identical_distributions ... PASSED
-test_fr_identical ... PASSED
-...
-✓ All minimal tests passed
-```
 
 ### Integration Test Output
 
@@ -241,30 +178,12 @@ Check 3: Backend status
    ENABLE_FOXGLOVE=0 ./scripts/test-integration.sh
    ```
 
-## CI/CD Integration
+## CI/CD Integration (Conceptual)
 
-For automated testing pipelines:
-
-```yaml
-# Example GitHub Actions workflow
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v2
-      
-      - name: Build Docker image
-        run: ./scripts/docker-build.sh
-      
-      - name: Run minimal tests
-        run: ./scripts/docker-test.sh
-      
-      - name: Download test data
-        run: ./scripts/download_tb3_rosbag.sh
-      
-      - name: Run integration tests
-        run: ./scripts/docker-test-integration.sh
-```
+This repo is primarily validated in a ROS 2 environment. A practical CI pipeline (when set up) should:
+- Build the ROS 2 workspace (`colcon build`)
+- Run unit tests (`pytest` under `fl_ws/src/fl_slam_poc/`)
+- Optionally run `scripts/test-integration.sh` if rosbag assets are available in CI
 
 ## Test Coverage
 
@@ -293,17 +212,14 @@ jobs:
 When adding new features:
 
 1. Add unit tests to `test/test_audit_invariants.py` or `test/test_rgbd_multimodal.py`
-2. Ensure minimal tests pass
-3. Verify integration tests still pass
-4. Update this document if adding new test scripts
+2. Ensure `pytest -q` passes under `fl_ws/src/fl_slam_poc/`
+3. Verify `scripts/test-integration.sh` and/or `scripts/run_and_evaluate.sh` still pass when applicable
+4. Update this document if adding new test workflows
 
 ## Summary
 
-| Script | Duration | Use Case | Requires Bag |
-|--------|----------|----------|--------------|
-| `test-minimal.sh` | ~30s | Quick validation | No |
-| `test-integration.sh` | ~90s | Full system test | Yes |
-| `docker-test.sh` | ~30s | Quick Docker validation | No |
-| `docker-test-integration.sh` | ~90s | Full Docker system test | Yes |
-
-For most development work, run `docker-test.sh` frequently and `docker-test-integration.sh` before commits.
+| Workflow | Typical Duration | Use Case | Requires Bag |
+|----------|------------------|----------|--------------|
+| `pytest -q` (under `fl_ws/src/fl_slam_poc/`) | ~seconds | Unit/invariant checks | No |
+| `scripts/test-integration.sh` | ~minutes | Alternative end-to-end check | Yes |
+| `scripts/run_and_evaluate.sh` | ~minutes | MVP M3DGR evaluation | Yes |

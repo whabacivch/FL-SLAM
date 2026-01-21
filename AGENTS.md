@@ -15,13 +15,14 @@ These rules apply only to this project. Other projects have their own rules.
 - POC testing status and notes: `docs/POC_Testing_Status.md`
 - ROS 2 workspace (code + packages): `fl_ws/`
 - Primary package repository: `fl_ws/src/fl_slam_poc/`
-- Docker environment and scripts: `docker/` and `scripts/`
+- Scripts and evaluation entrypoints: `scripts/`
 
 ## Quickstart and Validation
 - Prereqs: ROS 2 + Python (see `requirements.txt`); keep any system deps documented in `CHANGELOG.md`.
-- Build/run via Docker: `scripts/docker-build.sh`, `scripts/docker-run.sh`, `scripts/docker-demo.sh`.
-- Key nodes/scripts: `fl_ws/src/fl_slam_poc/scripts/fl_backend_node`, `fl_ws/src/fl_slam_poc/scripts/frontend_node`, `fl_ws/src/fl_slam_poc/scripts/sim_world_node`.
-- Run tests: `scripts/test-minimal.sh` (quick) and `scripts/test-integration.sh` (full). See `docs/TESTING.md` for complete documentation.
+- Build: `cd fl_ws && source /opt/ros/jazzy/setup.bash && colcon build --packages-select fl_slam_poc && source install/setup.bash`.
+- MVP run + evaluation (M3DGR): `bash scripts/run_and_evaluate.sh` (produces metrics/plots under `results/`).
+- Key nodes (launched by `poc_m3dgr_rosbag.launch.py`): `frontend_node`, `backend_node`, plus utility nodes for decompression/conversion/odom bridging.
+- Run integration test (alternative datasets): `scripts/test-integration.sh`. See `docs/TESTING.md` for complete documentation.
 - Operator/model change map: operators in `fl_ws/src/fl_slam_poc/fl_slam_poc/operators/`, models in `fl_ws/src/fl_slam_poc/fl_slam_poc/models/`.
 - Logs/artifacts (ignore in reviews): `fl_ws/log/`, `fl_ws/build*/`, `fl_ws/install*/`.
 

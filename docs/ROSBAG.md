@@ -6,29 +6,31 @@ This file is the source of truth. If other rosbag docs exist, treat them as hist
 
 For complete testing documentation, see **[TESTING.md](TESTING.md)**.
 
-## Quick Start (Local)
+## Quick Start (M3DGR MVP)
 
 1. Build:
 
 `cd fl_ws && source /opt/ros/jazzy/setup.bash && colcon build --packages-select fl_slam_poc && source install/setup.bash`
 
+2. Run MVP pipeline (SLAM + metrics + plots):
+
+`bash scripts/run_and_evaluate.sh`
+
+Results are saved to `results/m3dgr_YYYYMMDD_HHMMSS/`.
+
+## Quick Start (TB3 / Alternative Integration)
+
 If you don't have the bag yet:
 
 `./scripts/download_tb3_rosbag.sh`
 
-2. Run integration test (asserts anchors + loop factors + backend mode; writes logs to `diagnostic_logs/`):
+Run the integration test (writes logs to `diagnostic_logs/`):
 
 `./scripts/test-integration.sh`
 
 Override bag path if needed:
 
 `BAG_PATH=/absolute/path/to/bag_dir ./scripts/test-integration.sh`
-
-## Quick Start (Docker)
-
-`./scripts/docker-test-integration.sh`
-
-Foxglove: connect to `ws://localhost:8765`.
 
 ## Pass/Fail Meaning
 
@@ -51,10 +53,11 @@ If you want a weaker check (anchors-only), run:
 ## Launch Entry Point
 
 Rosbag launch file:
-- `fl_ws/src/fl_slam_poc/launch/poc_tb3_rosbag.launch.py`
+- MVP: `fl_ws/src/fl_slam_poc/launch/poc_m3dgr_rosbag.launch.py`
+- Alternative: `fl_ws/src/fl_slam_poc/launch/poc_tb3_rosbag.launch.py`
 
 ## Troubleshooting
 
 - If you see TF errors or missing transforms, first verify bag frames with:
-  - `python3 scripts/inspect_bag_direct.py /path/to/bag_dir`
+  - `bash scripts/inspect_rosbag_topics.sh /path/to/bag_dir`
 - If backend stays `DEAD_RECKONING`, it is not receiving loop factors from the frontend.

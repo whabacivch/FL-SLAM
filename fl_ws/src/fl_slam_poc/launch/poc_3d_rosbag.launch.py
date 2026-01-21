@@ -2,6 +2,7 @@
 FL-SLAM 3D Point Cloud Mode Launch File
 
 This launch file configures the system for 3D point cloud input with GPU acceleration.
+ALTERNATIVE DATASET/PIPELINE (FUTURE/OPTIONAL): not used by the MVP M3DGR evaluation.
 Designed for use with:
 - RealSense D455 rosbags
 - NVIDIA r2b_storage dataset
@@ -40,8 +41,6 @@ def generate_launch_description():
     enable_frontend = LaunchConfiguration("enable_frontend")
     enable_backend = LaunchConfiguration("enable_backend")
     enable_odom_bridge = LaunchConfiguration("enable_odom_bridge")
-    enable_foxglove = LaunchConfiguration("enable_foxglove")
-    foxglove_port = LaunchConfiguration("foxglove_port")
     
     # 3D Point Cloud Configuration
     use_3d_pointcloud = LaunchConfiguration("use_3d_pointcloud")
@@ -95,8 +94,6 @@ def generate_launch_description():
             DeclareLaunchArgument("enable_frontend", default_value="true"),
             DeclareLaunchArgument("enable_backend", default_value="true"),
             DeclareLaunchArgument("enable_odom_bridge", default_value="true"),
-            DeclareLaunchArgument("enable_foxglove", default_value="true"),
-            DeclareLaunchArgument("foxglove_port", default_value="8765"),
             
             # 3D Point Cloud Mode Arguments
             DeclareLaunchArgument("use_3d_pointcloud", default_value="true",
@@ -242,30 +239,6 @@ def generate_launch_description():
                     }
                 ],
                 condition=IfCondition(enable_backend),
-            ),
-            
-            # Foxglove bridge for visualization
-            Node(
-                package="foxglove_bridge",
-                executable="foxglove_bridge",
-                name="foxglove_bridge",
-                output="screen",
-                parameters=[{
-                    "use_sim_time": use_sim_time,
-                    "port": foxglove_port,
-                    "address": "0.0.0.0",
-                    "capabilities": [
-                        "clientPublish",
-                        "parameters",
-                        "parametersSubscribe",
-                        "services",
-                        "connectionGraph",
-                        "assets",
-                    ],
-                    "num_threads": 0,
-                    "max_qos_depth": 25,
-                }],
-                condition=IfCondition(enable_foxglove),
             ),
             
             # Bag playback (without QoS overrides)

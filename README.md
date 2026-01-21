@@ -14,18 +14,10 @@ colcon build --packages-select fl_slam_poc
 source install/setup.bash
 ```
 
-### Run (Gazebo)
+### Run (M3DGR Rosbag + Evaluation)
 ```bash
-ros2 launch fl_slam_poc poc_tb3.launch.py model:=waffle use_sim_time:=true
-```
-
-### Run (Rosbag)
-```bash
-# Download sample bag (first time only)
-./scripts/download_tb3_rosbag.sh
-
-# Run integration test
-./scripts/test-integration.sh
+# Full pipeline: SLAM + metrics + plots
+bash scripts/run_and_evaluate.sh
 ```
 
 ### Run (3D Point Cloud Mode)
@@ -40,6 +32,17 @@ ros2 launch fl_slam_poc poc_3d_rosbag.launch.py \
     use_gpu:=true
 
 # See docs/3D_POINTCLOUD.md for full documentation
+```
+
+### Run (Gazebo / Alternative)
+```bash
+ros2 launch fl_slam_poc poc_tb3.launch.py model:=waffle use_sim_time:=true
+```
+
+### Run (TB3 Rosbag / Alternative)
+```bash
+./scripts/download_tb3_rosbag.sh
+./scripts/test-integration.sh
 ```
 
 ---
@@ -92,6 +95,8 @@ Based on system design:
 
 See [`docs/EVALUATION.md`](docs/EVALUATION.md) for detailed guide.
 
+See [`ROADMAP.md`](ROADMAP.md) for prioritized next steps.
+
 ---
 
 ## Documentation
@@ -100,6 +105,7 @@ See [`docs/EVALUATION.md`](docs/EVALUATION.md) for detailed guide.
 - **[AGENTS.md](AGENTS.md)** - Design invariants and rules (P1-P7)
 - **[CHANGELOG.md](CHANGELOG.md)** - Project history and decisions
 - **[docs/POC_Testing_Status.md](docs/POC_Testing_Status.md)** - Current testing state
+- **[ROADMAP.md](ROADMAP.md)** - Planned work and file map
 
 ### Operational
 - **[docs/GAZEBO_INTEGRATION.md](docs/GAZEBO_INTEGRATION.md)** - Gazebo setup and troubleshooting
@@ -131,14 +137,13 @@ See [`docs/EVALUATION.md`](docs/EVALUATION.md) for detailed guide.
 ### Code Structure
 ```
 fl_slam_poc/
-├── operators/      # Core math (Gaussian, Dirichlet, ICP, distances) - EXACT
-├── models/         # Generative models (NIG, birth, adaptive) - EXACT
-├── geometry/       # SE(3) operations + documentation - EXACT
-├── frontend/       # Helper modules (orchestration, call operators/models)
-├── utils/          # Infrastructure (sensor sync, status monitoring)
-├── nodes/          # ROS nodes (frontend, backend, simulation)
-├── constants.py    # Centralized magic numbers
-└── config.py       # Parameter grouping
+├── backend/        # Backend SLAM inference node + fusion + parameter models
+├── frontend/       # Frontend orchestration + sensor I/O + loop/anchor processing
+├── common/         # Shared transforms/constants/op reports
+├── operators/      # Experimental Dirichlet operators + legacy compat exports
+├── geometry/       # Legacy SE(3) import compatibility
+├── utility_nodes/  # Utility ROS nodes (decompress, converters, odom bridge)
+└── nodes/          # Experimental ROS nodes (Dirichlet/semantics)
 ```
 
 ### Data Flow
@@ -199,47 +204,19 @@ pip install -r requirements.txt
 
 See **[docs/TESTING.md](docs/TESTING.md)** for complete testing documentation.
 
-### Quick Validation (Minimal Tests)
+### MVP Validation (M3DGR)
 ```bash
-./scripts/test-minimal.sh
+bash scripts/run_and_evaluate.sh
 ```
 
-Tests core functionality and mathematical invariants (~30 seconds).
+Runs the full rosbag pipeline and produces metrics/plots under `results/`.
 
-### Full System Test (Integration)
+### Full System Test (Alternative Integration)
 ```bash
 ./scripts/test-integration.sh
 ```
 
-Tests complete SLAM pipeline with rosbag data (~90 seconds).
-
-**Pass Criteria**:
-- `/sim/anchor_create` published ≥1 times
-- `/sim/loop_factor` published ≥1 times
-- `/cdwm/backend_status` reports `mode: "SLAM_ACTIVE"`
-
----
-
-## Docker
-
-### Build
-```bash
-./scripts/docker-build.sh
-```
-
-### Run (Interactive)
-```bash
-./scripts/docker-run.sh
-```
-
-### Testing
-```bash
-# Quick validation
-./scripts/docker-test.sh
-
-# Full integration test
-./scripts/docker-test-integration.sh
-```
+Runs an alternative integration scenario (dataset/launch dependent).
 
 ---
 

@@ -1,3 +1,11 @@
+"""
+GAZEBO SIMULATION (FUTURE/OPTIONAL)
+
+This launch file is intended for live testing in TurtleBot3 Gazebo worlds.
+It is not used by the MVP M3DGR rosbag evaluation pipeline.
+See `ROADMAP.md` for planned validation work.
+"""
+
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, SetEnvironmentVariable
 from launch.conditions import IfCondition
@@ -11,8 +19,6 @@ def generate_launch_description():
     model = LaunchConfiguration("model")
     launch_gazebo = LaunchConfiguration("launch_gazebo")
     use_sim_time = LaunchConfiguration("use_sim_time")
-    enable_foxglove = LaunchConfiguration("enable_foxglove")
-    foxglove_port = LaunchConfiguration("foxglove_port")
     enable_frontend = LaunchConfiguration("enable_frontend")
     scan_topic = LaunchConfiguration("scan_topic")
     odom_topic = LaunchConfiguration("odom_topic")
@@ -34,8 +40,6 @@ def generate_launch_description():
             DeclareLaunchArgument("model", default_value="waffle"),
             DeclareLaunchArgument("launch_gazebo", default_value="true"),
             DeclareLaunchArgument("use_sim_time", default_value="true"),
-            DeclareLaunchArgument("enable_foxglove", default_value="true"),
-            DeclareLaunchArgument("foxglove_port", default_value="8765"),
             DeclareLaunchArgument("enable_frontend", default_value="true"),
             DeclareLaunchArgument("scan_topic", default_value="/scan"),
             DeclareLaunchArgument("odom_topic", default_value="/odom"),
@@ -84,30 +88,6 @@ def generate_launch_description():
                 name="fl_backend",
                 output="screen",
                 parameters=[{"use_sim_time": use_sim_time}],
-            ),
-            # Foxglove bridge for visualization
-            # See: https://github.com/foxglove/foxglove-sdk/blob/main/ros/src/foxglove_bridge/README.md
-            Node(
-                package="foxglove_bridge",
-                executable="foxglove_bridge",
-                name="foxglove_bridge",
-                output="screen",
-                parameters=[{
-                    "use_sim_time": use_sim_time,
-                    "port": foxglove_port,
-                    "address": "0.0.0.0",
-                    "capabilities": [
-                        "clientPublish",
-                        "parameters",
-                        "parametersSubscribe",
-                        "services",
-                        "connectionGraph",
-                        "assets",
-                    ],
-                    "num_threads": 0,
-                    "max_qos_depth": 25,
-                }],
-                condition=IfCondition(enable_foxglove),
             ),
         ]
     )

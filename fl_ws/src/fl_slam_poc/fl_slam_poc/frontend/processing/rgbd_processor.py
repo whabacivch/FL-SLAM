@@ -294,7 +294,7 @@ def transform_evidence_to_global(
     Returns:
         Evidence list with positions and normals in global frame
     """
-    from fl_slam_poc.geometry.se3 import rotvec_to_rotmat
+    from fl_slam_poc.common.transforms.se3 import rotvec_to_rotmat
     
     T = np.asarray(T_camera_to_global, dtype=np.float64)
     

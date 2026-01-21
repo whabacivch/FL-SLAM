@@ -1245,3 +1245,38 @@ Status monitoring: Will report DEAD_RECKONING if no loop factors
 ✅ Clear diagnostic logging for troubleshooting initialization
 ✅ Faster startup due to zero-motion kickstart
 ✅ More robust to QoS and timing variations in rosbags
+
+## 2026-01-21 - MVP Import Closure Cleanup + Roadmap + Artifact Hygiene
+
+### MVP Import Refactor (Reduce Re-export Bloat)
+- Refactored package `__init__.py` modules to avoid eager imports and keep MVP runtime closure minimal:
+  - `fl_ws/src/fl_slam_poc/fl_slam_poc/frontend/__init__.py` (lazy exports)
+  - `fl_ws/src/fl_slam_poc/fl_slam_poc/common/__init__.py` (lazy module access; no eager `config` import)
+  - `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/fusion/__init__.py` (lazy exports; avoids pulling in multimodal by default)
+  - `fl_ws/src/fl_slam_poc/fl_slam_poc/operators/__init__.py` (legacy compat stays, but lazy to avoid bloat)
+- Updated MVP codepaths to import implementation modules directly:
+  - `frontend/frontend_node.py` now imports RGB-D helpers from `frontend/processing/rgbd_processor.py` directly.
+  - `frontend/processing/rgbd_processor.py` and `frontend/loops/icp.py` now import SE(3) helpers from `common/transforms/se3.py` (not the legacy wrapper).
+
+### Cleanup (Obsolete / Abandoned Code)
+- Removed abandoned Rerun bridge vendoring under `fl_ws/src/cpp-example-ros2-bridge/`.
+- Removed unused visualization stub under `fl_ws/src/fl_slam_poc/fl_slam_poc/visualizer/`.
+- Removed temporary M3DGR helper scripts:
+  - `scripts/run-m3dgr-rerun.sh`, `scripts/run-m3dgr-rviz.sh`, `scripts/run-m3dgr-test.sh`
+  - `scripts/align_ground_truth_fixed.py` (superseded)
+
+### Documentation + Roadmap
+- Added `ROADMAP.md` with MVP status, priorities, and file map.
+- Updated docs to remove Docker workflow references and reflect current MVP:
+  - `README.md`, `AGENTS.md`, `docs/TESTING.md`, `docs/ROSBAG.md`, `docs/EVALUATION.md`, `docs/INSTALLATION.md`, `archive/README.md`
+- Added clear “future/optional” headers to non-MVP launch files and Gazebo-only node.
+
+### Repo Hygiene
+- Updated `.gitignore` to ignore evaluation output and user RViz configs:
+  - `results/`
+  - `config/*.rviz`
+
+### Verification
+- `pytest -q` under `fl_ws/src/fl_slam_poc` passes.
+- `colcon build --packages-select fl_slam_poc` succeeds.
+- `bash scripts/run_and_evaluate.sh` runs end-to-end on M3DGR (trajectory drift remains an open algorithm issue).

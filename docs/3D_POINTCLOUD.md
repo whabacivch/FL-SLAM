@@ -249,8 +249,10 @@ pytest src/fl_slam_poc/test/test_pointcloud_3d.py -v
 # Download test data
 ./scripts/download_r2b_dataset.sh
 
-# Run 3D integration test
-./scripts/test-3d-integration.sh
+# Run 3D rosbag launch (adjust bag path as needed)
+ros2 launch fl_slam_poc poc_3d_rosbag.launch.py \
+  bag:=rosbags/r2b_storage \
+  play_bag:=true
 ```
 
 ## Troubleshooting
@@ -258,7 +260,7 @@ pytest src/fl_slam_poc/test/test_pointcloud_3d.py -v
 ### GPU Not Detected
 
 ```python
-from fl_slam_poc.operators.pointcloud_gpu import is_gpu_available
+from fl_slam_poc.frontend.loops.pointcloud_gpu import is_gpu_available
 print(f"GPU available: {is_gpu_available()}")
 ```
 

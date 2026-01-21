@@ -1,3 +1,11 @@
+"""
+ALTERNATIVE DATASET (2D/TB3 ROSBAG) - FUTURE/OPTIONAL
+
+This launch file is kept for validating non-M3DGR datasets.
+It is not used by the MVP `scripts/run_and_evaluate.sh` pipeline.
+See `ROADMAP.md` for planned validation work.
+"""
+
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, TimerAction
 from launch.conditions import IfCondition
@@ -18,8 +26,6 @@ def generate_launch_description():
     enable_frontend = LaunchConfiguration("enable_frontend")
     enable_backend = LaunchConfiguration("enable_backend")
     enable_odom_bridge = LaunchConfiguration("enable_odom_bridge")
-    enable_foxglove = LaunchConfiguration("enable_foxglove")
-    foxglove_port = LaunchConfiguration("foxglove_port")
     
     # RGB-D decompression (NEW - for rosbags with compressed images)
     enable_decompress = LaunchConfiguration("enable_decompress")
@@ -64,8 +70,6 @@ def generate_launch_description():
             DeclareLaunchArgument("enable_frontend", default_value="true"),
             DeclareLaunchArgument("enable_backend", default_value="true"),
             DeclareLaunchArgument("enable_odom_bridge", default_value="true"),
-            DeclareLaunchArgument("enable_foxglove", default_value="true"),
-            DeclareLaunchArgument("foxglove_port", default_value="8765"),
             # RGB-D decompression (NEW)
             DeclareLaunchArgument("enable_decompress", default_value="true",
                 description="Enable image decompression for rosbags with compressed RGB-D"),
@@ -196,29 +200,6 @@ def generate_launch_description():
                     }
                 ],
                 condition=IfCondition(enable_backend),
-            ),
-            # Foxglove bridge for visualization
-            Node(
-                package="foxglove_bridge",
-                executable="foxglove_bridge",
-                name="foxglove_bridge",
-                output="screen",
-                parameters=[{
-                    "use_sim_time": use_sim_time,
-                    "port": foxglove_port,
-                    "address": "0.0.0.0",
-                    "capabilities": [
-                        "clientPublish",
-                        "parameters",
-                        "parametersSubscribe",
-                        "services",
-                        "connectionGraph",
-                        "assets",
-                    ],
-                    "num_threads": 0,
-                    "max_qos_depth": 25,
-                }],
-                condition=IfCondition(enable_foxglove),
             ),
             TimerAction(
                 period=bag_start_delay_sec,

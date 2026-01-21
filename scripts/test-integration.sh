@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
-# FL-SLAM full integration test (rosbag + Foxglove + basic health checks).
+# FL-SLAM full integration test (rosbag + basic health checks).
 #
 # Defaults to M3DGR Dynamic01 rosbag (Livox + RGB-D).
 #
 # Overrides:
 #   BAG_PATH=/path/to/bag ./scripts/test-integration.sh
-#   ENABLE_FOXGLOVE=0 ./scripts/test-integration.sh
 #   TIMEOUT_SEC=120 STARTUP_SEC=25 ./scripts/test-integration.sh
 
 set -euo pipefail
@@ -18,7 +17,6 @@ TIMEOUT_SEC="${TIMEOUT_SEC:-120}"
 STARTUP_SEC="${STARTUP_SEC:-25}"
 REQUIRE_LOOP="${REQUIRE_LOOP:-1}"
 REQUIRE_SLAM_ACTIVE="${REQUIRE_SLAM_ACTIVE:-1}"
-ENABLE_FOXGLOVE="${ENABLE_FOXGLOVE:-1}"
 
 echo "=========================================="
 echo "FL-SLAM Integration Test Suite"
@@ -30,9 +28,6 @@ echo "  Timeout:      ${TIMEOUT_SEC}s"
 echo "  Startup wait: ${STARTUP_SEC}s"
 echo "  Require loop: ${REQUIRE_LOOP}"
 echo "  SLAM active:  ${REQUIRE_SLAM_ACTIVE}"
-if [[ "${ENABLE_FOXGLOVE}" -eq 1 ]]; then
-  echo "  Foxglove:     ws://localhost:8765"
-fi
 echo ""
 
 ROS_SETUP="/opt/ros/jazzy/setup.bash"
@@ -96,7 +91,6 @@ setsid timeout "${TIMEOUT_SEC}" ros2 launch fl_slam_poc "${LAUNCH_FILE}" \
   play_bag:=true \
   bag:="${BAG_PATH}" \
   use_sim_time:=true \
-  enable_foxglove:="$([[ "${ENABLE_FOXGLOVE}" -eq 1 ]] && echo true || echo false)" \
   > >(tee "${RUN_LOG}") 2>&1 &
 
 LAUNCH_PID=$!
@@ -170,7 +164,7 @@ if [[ "${backend_ok}" -eq 1 ]]; then
   echo "  ✓ Backend status: ${backend_mode}"
 elif rg -q "Backend status: mode=" "${RUN_LOG}"; then
   backend_ok=1
-  backend_mode="$(rg "Backend status: mode=" "${RUN_LOG}" | tail -n 1 | sed -E 's/.*mode=([^, ]+).*/\\1/')"
+  backend_mode="$(rg "Backend status: mode=" "${RUN_LOG}" | tail -n 1 | sed -E 's/.*mode=([^, ]+).*/\1/')"
   echo "  ✓ Backend status from log: ${backend_mode}"
 else
   echo "  ✗ No backend status detected"

@@ -29,7 +29,9 @@ Results are saved to `results/m3dgr_YYYYMMDD_HHMMSS/`.
 For rapid iteration without evaluation:
 
 ```bash
-bash scripts/run-m3dgr-rerun.sh
+ros2 launch fl_slam_poc poc_m3dgr_rosbag.launch.py \
+  bag:=rosbags/m3dgr/Dynamic01_ros2 \
+  play_bag:=true
 ```
 
 ### Manual Evaluation

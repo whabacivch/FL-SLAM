@@ -93,16 +93,10 @@ If not available → **Option 2** (add message definitions to our workspace)
 Once we have PointCloud2 data available:
 
 ```bash
-# Update test script to use M3DGR bag
 cd ~/Documents/Coding/Phantom\ Fellowship\ MIT/Impact\ Project_v1
 
-# Configure topics
-export POINTCLOUD_TOPIC=/camera/depth/points  # After conversion
-export ODOM_TOPIC=/odom
-export BAG_PATH=rosbags/m3dgr/Dynamic01_ros2
-
-# Run 3D integration test
-bash scripts/test-3d-integration.sh
+# Run the current MVP pipeline (SLAM + plots/metrics)
+bash scripts/run_and_evaluate.sh
 ```
 
 ## Current Bag Location

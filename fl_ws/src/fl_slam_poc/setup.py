@@ -15,6 +15,7 @@ setup(
                 "launch/poc_3d_rosbag.launch.py",
                 "launch/poc_tb3.launch.py",
                 "launch/poc_tb3_rosbag.launch.py",
+                "launch/poc_m3dgr_rosbag.launch.py",
             ],
         ),
         (

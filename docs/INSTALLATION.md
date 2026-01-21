@@ -37,8 +37,8 @@ See **[TESTING.md](TESTING.md)** for complete testing documentation.
 
 ### Quick Validation
 ```bash
-cd /path/to/Impact Project_v1
-./scripts/test-minimal.sh
+cd /path/to/Impact Project_v1/fl_ws/src/fl_slam_poc
+pytest -q
 ```
 
 ### Full Integration Test (requires test data)

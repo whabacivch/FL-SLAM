@@ -43,12 +43,18 @@ Thumbs.db
 .ros/
 diagnostic_logs/
 
+# Evaluation / test results (large, reproducible)
+results/
+
 # ROS bags (can be large)
 *.bag
 *.db3
 rosbags/**
 !rosbags/README.md
 !rosbags/.gitkeep
+
+# User-specific RViz configs
+config/*.rviz
 
 # Temporary files
 *.tmp

@@ -322,7 +322,6 @@ def transport_covariance_to_frame(
     
     This is exact covariance transport via the adjoint representation.
     """
-    from fl_slam_poc.geometry.se3 import se3_adjoint
+    from fl_slam_poc.common.transforms.se3 import se3_adjoint
     Ad = se3_adjoint(T_target)
     return Ad @ cov_at_identity @ Ad.T
-

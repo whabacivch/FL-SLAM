@@ -853,7 +853,12 @@ class Frontend(Node):
             camera_frame: Camera frame ID for TF lookup
         """
         try:
-            from fl_slam_poc.frontend import depth_to_pointcloud, rgbd_to_evidence, transform_evidence_to_global, subsample_evidence_spatially
+            from fl_slam_poc.frontend.processing.rgbd_processor import (
+                depth_to_pointcloud,
+                rgbd_to_evidence,
+                transform_evidence_to_global,
+                subsample_evidence_spatially,
+            )
             from rclpy.time import Time
             
             # Get camera intrinsics

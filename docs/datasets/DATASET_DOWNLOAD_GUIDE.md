@@ -178,7 +178,8 @@ Once you have Newer College `01_short_experiment`:
 # 3D Mode (PointCloud2)
 POINTCLOUD_TOPIC=/os1_cloud_node/points \
 ODOM_TOPIC=/integrated/odom \
-bash scripts/test-3d-integration.sh
+ros2 launch fl_slam_poc poc_3d_rosbag.launch.py \
+  play_bag:=true
 
 # Or create a custom launch config
 ```
@@ -219,4 +220,4 @@ gdown --folder https://drive.google.com/drive/folders/[FOLDER_ID]
 3. Configure `poc_3d_rosbag.launch.py` with correct topic names:
    - `pointcloud_topic=/livox/mid360/lidar`
    - `odom_topic=/odom`
-4. Run: `bash scripts/test-3d-integration.sh`
+4. Run: `ros2 launch fl_slam_poc poc_3d_rosbag.launch.py play_bag:=true`
