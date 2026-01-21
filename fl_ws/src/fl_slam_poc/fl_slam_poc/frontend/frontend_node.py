@@ -51,6 +51,7 @@ from fl_slam_poc.backend.parameters import (
 )
 from fl_slam_poc.backend.fusion.gaussian_info import make_evidence
 from fl_slam_poc.frontend.loops.vmf_geometry import vmf_make_evidence
+from fl_slam_poc.common import constants
 from fl_slam_poc.common.op_report import OpReport
 from fl_slam_poc.common.transforms.se3 import rotmat_to_quat, rotvec_to_rotmat, se3_compose
 from fl_slam_poc.msg import AnchorCreate, LoopFactor
@@ -114,6 +115,10 @@ class Frontend(Node):
         self.declare_parameter("rgbd_evidence_topic", "/sim/rgbd_evidence")
         self.declare_parameter("rgbd_publish_every_n_scans", 5)
         self.declare_parameter("rgbd_max_points_per_msg", 500)
+        # RGB-D synchronization + depth descriptor range (used even in 3D PointCloud mode)
+        self.declare_parameter("rgbd_sync_max_dt_sec", 0.1)
+        self.declare_parameter("rgbd_min_depth_m", 0.1)
+        self.declare_parameter("rgbd_max_depth_m", 10.0)
         
         # Budgets
         self.declare_parameter("descriptor_bins", 60)
@@ -157,7 +162,7 @@ class Frontend(Node):
         # 3D Point Cloud Mode
         self.declare_parameter("use_3d_pointcloud", False)  # Enable 3D point cloud mode
         self.declare_parameter("enable_pointcloud", False)  # Subscribe to PointCloud2
-        self.declare_parameter("pointcloud_topic", "/camera/depth/points")
+        self.declare_parameter("pointcloud_topic", constants.POINTCLOUD_TOPIC_DEFAULT)
         self.declare_parameter("pointcloud_range_min", 0.1)
         self.declare_parameter("pointcloud_range_max", 50.0)
         
@@ -244,7 +249,13 @@ class Frontend(Node):
         
         # Initialize DescriptorBuilder (uses models.nig)
         descriptor_bins = int(self.get_parameter("descriptor_bins").value)
-        self.descriptor_builder = DescriptorBuilder(descriptor_bins)
+        self.rgbd_sync_max_dt_sec = float(self.get_parameter("rgbd_sync_max_dt_sec").value)
+        self.rgbd_min_depth_m = float(self.get_parameter("rgbd_min_depth_m").value)
+        self.rgbd_max_depth_m = float(self.get_parameter("rgbd_max_depth_m").value)
+        self.descriptor_builder = DescriptorBuilder(
+            descriptor_bins,
+            depth_range_m=(self.rgbd_min_depth_m, self.rgbd_max_depth_m),
+        )
         
         # Adaptive models (from models.adaptive, models.timestamp)
         align_prior = float(self.get_parameter("alignment_sigma_prior").value)
@@ -317,9 +328,7 @@ class Frontend(Node):
         self.status_monitor.add_sensor("odom", str(self.get_parameter("odom_topic").value))
         if sensor_config["enable_image"]:
             self.status_monitor.add_sensor("camera", sensor_config["camera_topic"])
-        # Only register depth sensor if NOT in 3D pointcloud mode
-        # (in 3D mode we use PointCloud2 directly, not depth images)
-        if sensor_config["enable_depth"] and not sensor_config["use_3d_pointcloud"]:
+        if sensor_config["enable_depth"]:
             self.status_monitor.add_sensor("depth", sensor_config["depth_topic"])
     
     def _init_publishers(self):
@@ -399,13 +408,15 @@ class Frontend(Node):
         pose_weight = self.align_pose.weight(pose_dt)
 
         # Get image features if enabled
-        image_feat, image_dt = self.sensor_io.get_nearest_image(scan_stamp)
+        image_rgb, image_dt = self.sensor_io.get_nearest_image(scan_stamp)
         if image_dt is not None:
             self.align_image.update(image_dt)
         image_weight = self.align_image.weight(image_dt)
 
         # Get synchronized RGB-D pair for true evidence extraction
-        rgb_array, depth_array, rgbd_dt, depth_frame = self.sensor_io.get_synchronized_rgbd(scan_stamp, max_dt=0.1)
+        rgb_array, depth_array, rgbd_dt, depth_frame = self.sensor_io.get_synchronized_rgbd(
+            scan_stamp, max_dt=self.rgbd_sync_max_dt_sec
+        )
         if rgbd_dt is not None:
             self.align_depth.update(rgbd_dt)
         depth_weight = self.align_depth.weight(rgbd_dt)
@@ -449,8 +460,8 @@ class Frontend(Node):
 
         # Build descriptor (uses models.nig via descriptor_builder)
         scan_desc = self.descriptor_builder.scan_descriptor(msg)
-        image_feat_desc = self.descriptor_builder.image_descriptor(None)  # TODO: extract image features
-        depth_feat_desc = self.descriptor_builder.depth_descriptor(depth_points)
+        image_feat_desc = self.descriptor_builder.image_descriptor(rgb_array if rgb_array is not None else image_rgb)
+        depth_feat_desc = self.descriptor_builder.depth_descriptor(depth_array)
         desc = self.descriptor_builder.compose_descriptor(scan_desc, image_feat_desc, depth_feat_desc)
 
         obs_weight = pose_weight * image_weight * depth_weight
@@ -590,6 +601,20 @@ class Frontend(Node):
         self.align_pose.update(pose_dt)
         pose_weight = self.align_pose.weight(pose_dt)
 
+        # Get image features if enabled
+        image_rgb, image_dt = self.sensor_io.get_nearest_image(pc_stamp)
+        if image_dt is not None:
+            self.align_image.update(image_dt)
+        image_weight = self.align_image.weight(image_dt)
+
+        # Get synchronized RGB-D pair for appearance/depth descriptors (and optional dense evidence)
+        rgb_array, depth_array, rgbd_dt, _depth_frame = self.sensor_io.get_synchronized_rgbd(
+            pc_stamp, max_dt=self.rgbd_sync_max_dt_sec
+        )
+        if rgbd_dt is not None:
+            self.align_depth.update(rgbd_dt)
+        depth_weight = self.align_depth.weight(rgbd_dt)
+
         # Build a scan-like range histogram descriptor from point ranges.
         rmin = float(self.get_parameter("pointcloud_range_min").value)
         rmax = float(self.get_parameter("pointcloud_range_max").value)
@@ -608,11 +633,11 @@ class Frontend(Node):
         else:
             scan_desc = np.zeros(self.descriptor_builder.descriptor_bins, dtype=float)
 
-        image_feat_desc = self.descriptor_builder.image_descriptor(None)
-        depth_feat_desc = self.descriptor_builder.depth_descriptor(None)
+        image_feat_desc = self.descriptor_builder.image_descriptor(rgb_array if rgb_array is not None else image_rgb)
+        depth_feat_desc = self.descriptor_builder.depth_descriptor(depth_array)
         desc = self.descriptor_builder.compose_descriptor(scan_desc, image_feat_desc, depth_feat_desc)
 
-        obs_weight = pose_weight
+        obs_weight = pose_weight * image_weight * depth_weight
 
         # Initialize global model if needed
         self.descriptor_builder.init_global_model(desc)

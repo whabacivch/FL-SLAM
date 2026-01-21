@@ -24,6 +24,7 @@ try:
 except ImportError:
     CvBridge = None
 
+from fl_slam_poc.common import constants
 from fl_slam_poc.common.transforms.se3 import quat_to_rotmat, se3_compose, rotmat_to_rotvec, rotvec_to_rotmat
 
 
@@ -156,7 +157,7 @@ class SensorIO:
             # Subscribe to LaserScan (2D mode) or PointCloud2 (3D mode)
             if self.use_3d_pointcloud:
                 # 3D mode: Subscribe to PointCloud2 instead of LaserScan
-                pointcloud_topic = self.config.get("pointcloud_topic", "/camera/depth/points")
+                pointcloud_topic = self.config.get("pointcloud_topic", constants.POINTCLOUD_TOPIC_DEFAULT)
                 self.node.create_subscription(
                     PointCloud2, pointcloud_topic, self._on_pointcloud, qos)
                 self.node.get_logger().info(
@@ -169,7 +170,7 @@ class SensorIO:
             
             # Optionally subscribe to both PointCloud2 AND LaserScan
             if self.enable_pointcloud and not self.use_3d_pointcloud:
-                pointcloud_topic = self.config.get("pointcloud_topic", "/camera/depth/points")
+                pointcloud_topic = self.config.get("pointcloud_topic", constants.POINTCLOUD_TOPIC_DEFAULT)
                 self.node.create_subscription(
                     PointCloud2, pointcloud_topic, self._on_pointcloud, qos)
             
@@ -177,9 +178,9 @@ class SensorIO:
                 self.node.create_subscription(
                     Image, self.config["camera_topic"], self._on_image, qos)
             
-            # Only subscribe to depth images if NOT in 3D pointcloud mode
-            # (in 3D mode we use PointCloud2 directly, not depth images)
-            if self.config.get("enable_depth", False) and not self.use_3d_pointcloud:
+            # Depth images are optional and may be used for RGB-D evidence/appearance
+            # even when the primary sparse geometry source is PointCloud2.
+            if self.config.get("enable_depth", False):
                 self.node.create_subscription(
                     Image, self.config["depth_topic"], self._on_depth, qos)
             
@@ -418,10 +419,10 @@ class SensorIO:
             self._image_callback(msg)
     
     def _on_depth(self, msg: Image):
-        """Buffer depth array and 3D points for RGB-D evidence extraction."""
+        """Buffer depth array (and optionally 3D points) for RGB-D evidence extraction."""
         if self._is_duplicate("depth", msg.header.stamp, msg.header.frame_id):
             return
-        if self.cv_bridge is None or self.depth_intrinsics is None:
+        if self.cv_bridge is None:
             return
         
         try:
@@ -431,10 +432,12 @@ class SensorIO:
             self.node.get_logger().warn(f"Depth conversion failed: {e}", throttle_duration_sec=5.0)
             return
         
-        # Still compute points for legacy descriptor/ICP use
-        points = self._depth_to_points(depth, msg.header)
-        if points is None:
-            return
+        # Optionally compute points for legacy descriptor/ICP use (2D scan mode only).
+        # In 3D PointCloud mode, depth points are not required and often cannot be TF-transformed
+        # during rosbag playback (missing TF), so we avoid triggering TF warnings.
+        points = None
+        if not self.use_3d_pointcloud and self.depth_intrinsics is not None:
+            points = self._depth_to_points(depth, msg.header)
         
         stamp = stamp_to_sec(msg.header.stamp)
         frame_id = msg.header.frame_id or self.config.get("camera_frame", "camera_link")

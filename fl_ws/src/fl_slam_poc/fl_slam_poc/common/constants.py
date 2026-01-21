@@ -215,8 +215,9 @@ GPU_BATCH_SIZE = 10000
 # 3D Sensor Defaults
 # =============================================================================
 
-# Default point cloud topic (RealSense D455 style)
-POINTCLOUD_TOPIC_DEFAULT = "/camera/depth/points"
+# Default point cloud topic (generic LiDAR-style naming).
+# For RGB-D cameras that publish PointCloud2, override this to `/camera/depth/points`.
+POINTCLOUD_TOPIC_DEFAULT = "/lidar/points"
 
 # Point cloud message queue size
 POINTCLOUD_QUEUE_SIZE = 2

@@ -246,6 +246,7 @@ See [`docs/TESTING.md`](docs/TESTING.md) for complete testing documentation.
 
 ### Input
 - `/scan` - LaserScan
+- `/lidar/points` - PointCloud2 (optional / 3D mode)
 - `/odom` - Odometry (absolute or delta)
 - `/camera/image_raw` - Image (optional)
 - `/camera/depth/image_raw` - Depth (optional)

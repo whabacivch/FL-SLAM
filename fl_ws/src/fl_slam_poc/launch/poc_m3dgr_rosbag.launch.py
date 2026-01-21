@@ -57,7 +57,7 @@ def generate_launch_description():
             # Livox CustomMsg -> PointCloud2
             DeclareLaunchArgument("enable_livox_convert", default_value="true"),
             DeclareLaunchArgument("livox_input_topic", default_value="/livox/mid360/lidar"),
-            DeclareLaunchArgument("pointcloud_topic", default_value="/camera/depth/points"),
+            DeclareLaunchArgument("pointcloud_topic", default_value="/lidar/points"),
             # CRITICAL FIX: Publish in base_link frame since M3DGR rosbag has no TF
             DeclareLaunchArgument("pointcloud_frame_id", default_value="base_link"),
 

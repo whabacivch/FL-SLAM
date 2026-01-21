@@ -23,7 +23,7 @@ VOXEL_SIZE="${VOXEL_SIZE:-0.05}"
 ENABLE_FOXGLOVE="${ENABLE_FOXGLOVE:-1}"
 
 # Topic configuration (override for different datasets)
-POINTCLOUD_TOPIC="${POINTCLOUD_TOPIC:-/camera/depth/points}"
+POINTCLOUD_TOPIC="${POINTCLOUD_TOPIC:-/lidar/points}"
 ODOM_TOPIC="${ODOM_TOPIC:-/odom}"
 CAMERA_TOPIC="${CAMERA_TOPIC:-/camera/color/image_raw}"
 DEPTH_TOPIC="${DEPTH_TOPIC:-/camera/depth/image_raw}"

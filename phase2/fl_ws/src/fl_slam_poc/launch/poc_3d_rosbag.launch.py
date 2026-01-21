@@ -108,7 +108,7 @@ def generate_launch_description():
                 description="Voxel grid filter size in meters"),
             DeclareLaunchArgument("max_correspondence_distance", default_value="0.5",
                 description="Maximum ICP correspondence distance in meters"),
-            DeclareLaunchArgument("pointcloud_topic", default_value="/camera/depth/points",
+            DeclareLaunchArgument("pointcloud_topic", default_value="/lidar/points",
                 description="PointCloud2 topic to subscribe to"),
             DeclareLaunchArgument("pointcloud_rate_limit_hz", default_value="30.0",
                 description="Rate limit for point cloud processing"),

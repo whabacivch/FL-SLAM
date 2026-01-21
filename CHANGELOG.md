@@ -4,6 +4,28 @@ Project: Frobenius-Legendre SLAM POC (Impact Project_v1)
 
 This file tracks all significant changes, design decisions, and implementation milestones for the FL-SLAM project.
 
+## 2026-01-21: 3D Mode Sensor Wiring (LiDAR + RGB-D)
+
+### Summary
+Fixes a key wiring issue where LiDAR data was being published into a camera-named PointCloud2 topic, while camera RGB-D streams were decompressed but not used for association in 3D mode.
+
+### Changes
+- **Topic hygiene**
+  - Standardized the default PointCloud2 topic to `/lidar/points` for 3D geometry pipelines (override to `/camera/depth/points` for RGB-D cameras publishing PointCloud2).
+  - Updated the Livox converter default output to `/lidar/points`.
+  - Updated the M3DGR rosbag launch default PointCloud2 topic to `/lidar/points` (Livox CustomMsg → PointCloud2).
+- **RGB-D availability in 3D mode**
+  - `SensorIO` now subscribes to depth images even when `use_3d_pointcloud=True` (when `enable_depth=True`) so RGB-D can contribute in LiDAR-driven 3D runs.
+  - To preserve rosbag robustness and avoid TF spam, depth images are buffered in raw form in 3D mode (depth→points conversion remains skipped in 3D mode).
+  - Frontend status monitoring now registers `depth` whenever `enable_depth=True`, including in 3D mode.
+- **Non-placeholder appearance/depth descriptors**
+  - `DescriptorBuilder` now computes fixed-size RGB and depth histogram descriptors (exact, deterministic) and includes them in the multi-modal descriptor used for soft responsibilities.
+  - New parameters: `rgbd_sync_max_dt_sec`, `rgbd_min_depth_m`, `rgbd_max_depth_m`.
+
+### Invariants
+- No ground-truth ingestion: `/vrpn_client_node/*` remains evaluation-only.
+- No heuristic gating added: association remains responsibility-based; descriptors only change the likelihood model inputs.
+
 ## 2026-01-21: Evaluation Pipeline & Warning Fixes
 
 ### Summary
@@ -31,12 +53,12 @@ Comprehensive upgrade to the SLAM evaluation pipeline with publication-quality m
 
 **4. Skip TF Lookup in 3D Mode**
 - **Problem**: TF lookup warnings for camera_color_optical_frame when using 3D pointcloud mode
-- **Fix**: Don't subscribe to depth images when `use_3d_pointcloud=True` (points already in base_link)
+- **Fix**: In 3D pointcloud mode, depth images can be subscribed for RGB-D descriptors/evidence, but depth→points conversion (TF-dependent) is skipped to avoid TF spam during rosbag playback
 - **Files**: `frontend/processing/sensor_io.py`
 
 **5. Skip Depth Sensor Registration in 3D Mode**
 - **Problem**: "SENSOR MISSING: depth" warnings in 3D pointcloud mode
-- **Fix**: Don't register depth sensor in status monitor when `use_3d_pointcloud=True`
+- **Fix**: Register depth when `enable_depth=True` (including in 3D mode) so RGB-D contributions are visible and auditable
 - **Files**: `frontend/frontend_node.py`
 
 ### Enhanced Evaluation Pipeline
@@ -89,8 +111,8 @@ After running `scripts/run_and_evaluate.sh`:
 - `scripts/evaluate_slam.py` - Complete rewrite with all enhancements
 - `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/backend_node.py` - Trajectory timestamp fix
 - `fl_ws/src/fl_slam_poc/fl_slam_poc/utility_nodes/tb3_odom_bridge.py` - Zero delta first pose
-- `fl_ws/src/fl_slam_poc/fl_slam_poc/frontend/frontend_node.py` - Skip depth sensor in 3D mode
-- `fl_ws/src/fl_slam_poc/fl_slam_poc/frontend/processing/sensor_io.py` - Skip depth subscription in 3D mode
+- `fl_ws/src/fl_slam_poc/fl_slam_poc/frontend/frontend_node.py` - Depth status monitoring behavior
+- `fl_ws/src/fl_slam_poc/fl_slam_poc/frontend/processing/sensor_io.py` - 3D mode depth buffering (skip TF-dependent depth→points)
 
 ---
 
@@ -1043,7 +1065,7 @@ Upgraded FL-SLAM to support 3D point cloud input with optional GPU acceleration.
 ```python
 use_3d_pointcloud: bool = False    # Switch to 3D point cloud mode
 enable_pointcloud: bool = False    # Subscribe to PointCloud2
-pointcloud_topic: str = "/camera/depth/points"
+pointcloud_topic: str = "/lidar/points"  # Override to /camera/depth/points for RGB-D cameras
 ```
 
 **Point Cloud Processing:**

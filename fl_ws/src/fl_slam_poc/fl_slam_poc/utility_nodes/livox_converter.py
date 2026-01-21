@@ -22,7 +22,7 @@ class LivoxConverterNode(Node):
         
         # Parameters
         self.declare_parameter('input_topic', '/livox/mid360/lidar')
-        self.declare_parameter('output_topic', '/camera/depth/points')
+        self.declare_parameter('output_topic', '/lidar/points')
         self.declare_parameter('frame_id', 'mid360_frame')
         
         input_topic = self.get_parameter('input_topic').value

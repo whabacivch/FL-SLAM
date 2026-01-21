@@ -44,9 +44,21 @@ Set these parameters in your launch file:
 {
     "use_3d_pointcloud": True,        # Switch to 3D mode
     "enable_pointcloud": True,        # Subscribe to PointCloud2
-    "pointcloud_topic": "/camera/depth/points",  # PointCloud2 topic
+    "pointcloud_topic": "/lidar/points",  # PointCloud2 topic (override to /camera/depth/points for RGB-D cameras)
     "use_gpu": True,                  # Enable GPU acceleration
     "voxel_size": 0.05,               # Voxel grid size (meters)
+}
+```
+
+Optional (recommended when RGB-D is available): include camera appearance + depth histograms in soft association:
+
+```python
+{
+    "enable_image": True,
+    "enable_depth": True,
+    "rgbd_sync_max_dt_sec": 0.1,      # Max RGB↔depth timestamp mismatch
+    "rgbd_min_depth_m": 0.1,          # Depth descriptor min range (m)
+    "rgbd_max_depth_m": 10.0,         # Depth descriptor max range (m)
 }
 ```
 
@@ -107,7 +119,7 @@ The ROS2 Benchmark dataset contains RealSense D455 data with point clouds:
 Any rosbag with PointCloud2 messages is compatible:
 
 **Required topics:**
-- PointCloud2 (e.g., `/camera/depth/points`)
+- PointCloud2 (e.g., `/lidar/points` or `/camera/depth/points`)
 - Odometry (e.g., `/odom`)
 
 **Optional topics:**
@@ -214,7 +226,7 @@ result = icp_gpu(source, target, max_iter=20)
 # SensorIO automatically subscribes to PointCloud2 in 3D mode
 sensor_io = SensorIO(node, {
     "use_3d_pointcloud": True,
-    "pointcloud_topic": "/camera/depth/points",
+    "pointcloud_topic": "/lidar/points",
     ...
 })
 

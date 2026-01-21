@@ -50,7 +50,8 @@ Dataset Contents:
 To use with FL-SLAM:
   ros2 launch fl_slam_poc poc_3d_rosbag.launch.py \
     bag:=${DEST_DIR}/r2b_storage \
-    play_bag:=true
+    play_bag:=true \
+    pointcloud_topic:=/camera/depth/points
 USAGE
   exit 0
 fi

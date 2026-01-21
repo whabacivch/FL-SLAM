@@ -51,7 +51,7 @@ This guide explains how to download the recommended datasets for testing FL-SLAM
 
 **ROS Topics:**
 ```
-/livox/mid360/lidar              - PointCloud2 @ 10Hz
+/livox/mid360/lidar              - Livox CustomMsg @ 10Hz (convert to PointCloud2 on /lidar/points)
 /camera/color/image_raw/compressed - RGB @ 15Hz
 /camera/aligned_depth_to_color/image_raw/compressedDepth - Depth @ 15Hz
 /odom                            - Wheel Odometry @ 20Hz ✓✓✓
@@ -221,6 +221,8 @@ gdown --folder https://drive.google.com/drive/folders/[FOLDER_ID]
    - Save both to: `rosbags/m3dgr/`
 2. Run `bash scripts/inspect_rosbag_topics.sh rosbags/m3dgr/Outdoor01.bag`
 3. Configure `poc_3d_rosbag.launch.py` with correct topic names:
-   - `pointcloud_topic=/livox/mid360/lidar`
+   - `pointcloud_topic=/lidar/points` (PointCloud2)
    - `odom_topic=/odom`
-4. Run: `ros2 launch fl_slam_poc poc_3d_rosbag.launch.py play_bag:=true` (Phase 2)
+4. For M3DGR sequences that publish Livox `CustomMsg` (not PointCloud2), prefer the MVP launch:
+   - `ros2 launch fl_slam_poc poc_m3dgr_rosbag.launch.py` (runs Livox CustomMsg → PointCloud2 conversion to `/lidar/points`)
+   - Phase 2 `poc_3d_rosbag.launch.py` expects a `sensor_msgs/PointCloud2` topic directly
