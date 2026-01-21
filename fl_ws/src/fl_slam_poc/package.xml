@@ -3,7 +3,7 @@
   <name>fl_slam_poc</name>
   <version>0.0.1</version>
   <description>Frobenius-Legendre compositional inference SLAM POC (ROS 2 Jazzy)</description>
-  <maintainer email="you@example.com">you</maintainer>
+  <maintainer email="whab13@mit.edu">Will Haber</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>

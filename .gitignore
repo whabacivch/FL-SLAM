@@ -34,6 +34,9 @@ htmlcov/
 *.swp
 *.swo
 *~
+.bevel/
+.cursor/
+*.code-workspace
 
 # OS
 .DS_Store
