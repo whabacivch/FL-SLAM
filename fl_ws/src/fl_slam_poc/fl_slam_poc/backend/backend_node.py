@@ -308,6 +308,7 @@ class FLBackend(Node):
         self.last_odom_time: Optional[float] = None
         self.last_loop_time: Optional[float] = None
         self.last_odom_stamp: Optional[float] = None  # Odometry message timestamp for trajectory export
+        self._last_odom_key: Optional[tuple] = None  # For duplicate detection
         self.node_start_time = time.time()
         self.status_period = 5.0
         self.warned_no_loops = False
@@ -334,6 +335,12 @@ class FLBackend(Node):
 
     def on_odom(self, msg: Odometry):
         """Process delta odometry with adjoint covariance transport."""
+        # Duplicate detection: skip if we've already processed this exact message
+        odom_key = (msg.header.stamp.sec, msg.header.stamp.nanosec)
+        if odom_key == self._last_odom_key:
+            return  # Skip duplicate
+        self._last_odom_key = odom_key
+        
         self.odom_count += 1
         self.last_odom_time = time.time()
         # Store odometry message timestamp for trajectory export (NOT wall clock!)

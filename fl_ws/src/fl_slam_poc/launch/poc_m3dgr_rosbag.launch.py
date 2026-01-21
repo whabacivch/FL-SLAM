@@ -90,7 +90,7 @@ def generate_launch_description():
 
             DeclareLaunchArgument(
                 "sensor_qos_reliability",
-                default_value="both",
+                default_value="reliable",  # Use single subscription to avoid duplicate processing
                 description="QoS reliability for sensor subscriptions: reliable, best_effort, system_default, both",
             ),
 
