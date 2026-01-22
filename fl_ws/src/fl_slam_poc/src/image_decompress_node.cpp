@@ -68,7 +68,6 @@ class ImageDecompressNode final : public rclcpp::Node
  public:
   ImageDecompressNode() : rclcpp::Node("image_decompress_cpp")
   {
-    declare_parameter<bool>("use_sim_time", true);
     declare_parameter<std::string>("rgb_compressed_topic", "/camera/color/image_raw/compressed");
     declare_parameter<std::string>("depth_compressed_topic", "/camera/aligned_depth_to_color/image_raw/compressedDepth");
     declare_parameter<std::string>("rgb_output_topic", "/camera/image_raw");

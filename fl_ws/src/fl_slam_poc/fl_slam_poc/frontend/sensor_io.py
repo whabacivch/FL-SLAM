@@ -15,16 +15,14 @@ import ast
 import json
 import time
 import numpy as np
+import importlib
 import tf2_ros
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import CameraInfo, Image, Imu, LaserScan, PointCloud2, PointField
 from nav_msgs.msg import Odometry
 from tf2_ros import TransformException
-try:
-    from cv_bridge import CvBridge
-except ImportError:
-    CvBridge = None
+CvBridge = None
 
 from fl_slam_poc.common import constants
 from fl_slam_poc.common.se3 import quat_to_rotmat, se3_compose, rotmat_to_rotvec, rotvec_to_rotmat
@@ -145,18 +143,24 @@ class SensorIO:
             static_qos=tf_static_qos,
         )
         
-        # CV Bridge (handle NumPy 2.x incompatibility gracefully)
-        if CvBridge is not None:
-            try:
-                self.cv_bridge = CvBridge()
-            except (ImportError, AttributeError, RuntimeError) as e:
-                self.node.get_logger().warn(
-                    f"cv_bridge initialization failed (NumPy 2.x compatibility issue): {e}. "
-                    "Image processing will be disabled."
-                )
-                self.cv_bridge = None
-        else:
-            self.cv_bridge = None
+        # CV Bridge (import lazily; tolerate NumPy ABI mismatches)
+        self.cv_bridge = None
+        try:
+            cv_bridge_mod = importlib.import_module("cv_bridge")
+            cv_bridge_cls = getattr(cv_bridge_mod, "CvBridge", None)
+            if cv_bridge_cls is not None:
+                try:
+                    self.cv_bridge = cv_bridge_cls()
+                except Exception as e:
+                    self.node.get_logger().warn(
+                        f"cv_bridge initialization failed: {e}. Image processing disabled."
+                    )
+            else:
+                self.node.get_logger().warn("cv_bridge module loaded but CvBridge class not found.")
+        except Exception as e:
+            self.node.get_logger().warn(
+                f"cv_bridge import failed: {e}. Image processing disabled."
+            )
         
         # Subscribe to sensors
         self._setup_subscriptions()

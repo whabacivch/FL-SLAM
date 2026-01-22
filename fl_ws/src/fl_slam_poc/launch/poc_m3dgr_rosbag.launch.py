@@ -3,6 +3,7 @@ from launch.actions import DeclareLaunchArgument, ExecuteProcess, TimerAction
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -57,6 +58,11 @@ def generate_launch_description():
     gravity_x = LaunchConfiguration("gravity_x")
     gravity_y = LaunchConfiguration("gravity_y")
     gravity_z = LaunchConfiguration("gravity_z")
+
+    gravity_value = ParameterValue(
+        PythonExpression(["[", gravity_x, ",", gravity_y, ",", gravity_z, "]"]),
+        value_type=list,
+    )
 
     return LaunchDescription(
         [
@@ -214,7 +220,7 @@ def generate_launch_description():
                         "imu_accel_random_walk": imu_accel_random_walk,
                         "keyframe_translation_threshold": keyframe_translation_threshold,
                         "keyframe_rotation_threshold": keyframe_rotation_threshold,
-                        "gravity": [gravity_x, gravity_y, gravity_z],
+                        "gravity": gravity_value,
 
                         # Reduced birth intensity to prevent too many anchors diluting responsibilities
                         "birth_intensity": 5.0,
@@ -261,7 +267,7 @@ def generate_launch_description():
                         "enable_imu_fusion": enable_imu,
                         "imu_gyro_random_walk": imu_gyro_random_walk,
                         "imu_accel_random_walk": imu_accel_random_walk,
-                        "gravity": [gravity_x, gravity_y, gravity_z],
+                        "gravity": gravity_value,
                     }
                 ],
                 condition=IfCondition(enable_backend),

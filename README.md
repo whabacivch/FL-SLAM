@@ -12,6 +12,8 @@ In practice, this means layering defenses in SLAM: Use principled tools like Wis
 
 The current **MVP (Minimum Viable Product)** focuses on the **M3DGR Dynamic01 rosbag** evaluation pipeline. This is the smallest reproducible case for validating the FL-SLAM algorithm.
 
+Bag topic inventory + usage map (canonical): `docs/BAG_TOPICS_AND_USAGE.md`.
+
 **MVP Components:**
 - M3DGR rosbag processing (Livox LiDAR + IMU + RGB-D)
 - Frontend: sensor association, ICP loop detection, anchor management, IMU preintegration

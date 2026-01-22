@@ -43,7 +43,7 @@ def _pointcloud2_fields_for_livox(has_time_offset: bool) -> tuple[list[PointFiel
       - intensity uint8 (from reflectivity)
       - ring uint8 (from line)
       - tag uint8
-      - timebase uint64 (constant per message; preserved for downstream)
+      - timebase_low uint32, timebase_high uint32 (constant per message; preserved for downstream)
 
     If per-point time offset exists, includes:
       - time_offset uint32 (units depend on driver; treated as raw)
@@ -56,7 +56,7 @@ def _pointcloud2_fields_for_livox(has_time_offset: bool) -> tuple[list[PointFiel
     #   pad: 1 byte (to 16)
     #   [time_offset uint32] optional
     #   pad to align timebase at 8-byte boundary
-    #   timebase uint64
+    #   timebase_low uint32 + timebase_high uint32
     fields: list[PointField] = []
     offsets: dict[str, int] = {}
 
@@ -73,11 +73,12 @@ def _pointcloud2_fields_for_livox(has_time_offset: bool) -> tuple[list[PointFiel
 
     if has_time_offset:
         add("time_offset", 16, PointField.UINT32)
-        # pad 4 bytes (offset 20->24) so timebase is aligned at 24
-        add("timebase", 24, PointField.UINT64)
-        point_step = 32
+        add("timebase_low", 20, PointField.UINT32)
+        add("timebase_high", 24, PointField.UINT32)
+        point_step = 28
     else:
-        add("timebase", 16, PointField.UINT64)
+        add("timebase_low", 16, PointField.UINT32)
+        add("timebase_high", 20, PointField.UINT32)
         point_step = 24
 
     return fields, point_step, offsets
@@ -183,6 +184,8 @@ class LivoxConverterNode(Node):
 
         # timebase is present in livox_ros_driver2 CustomMsg (uint64). Preserve if available.
         timebase = int(getattr(msg, "timebase", 0))
+        timebase_low = np.uint32(timebase & 0xFFFFFFFF)
+        timebase_high = np.uint32((timebase >> 32) & 0xFFFFFFFF)
 
         cloud_msg = PointCloud2()
         cloud_msg.header = Header()
@@ -199,8 +202,8 @@ class LivoxConverterNode(Node):
 
         # Pack binary payload deterministically with explicit offsets (no numpy alignment surprises).
         if has_time_offset:
-            names = ["x", "y", "z", "intensity", "ring", "tag", "time_offset", "timebase"]
-            formats = ["<f4", "<f4", "<f4", "u1", "u1", "u1", "<u4", "<u8"]
+            names = ["x", "y", "z", "intensity", "ring", "tag", "time_offset", "timebase_low", "timebase_high"]
+            formats = ["<f4", "<f4", "<f4", "u1", "u1", "u1", "<u4", "<u4", "<u4"]
             offsets_list = [
                 offsets["x"],
                 offsets["y"],
@@ -209,7 +212,8 @@ class LivoxConverterNode(Node):
                 offsets["ring"],
                 offsets["tag"],
                 offsets["time_offset"],
-                offsets["timebase"],
+                offsets["timebase_low"],
+                offsets["timebase_high"],
             ]
             dtype = np.dtype({"names": names, "formats": formats, "offsets": offsets_list, "itemsize": point_step})
             arr = np.zeros((xyz.shape[0],), dtype=dtype)
@@ -220,10 +224,11 @@ class LivoxConverterNode(Node):
             arr["ring"] = ring
             arr["tag"] = tag
             arr["time_offset"] = time_offset  # type: ignore[assignment]
-            arr["timebase"] = np.uint64(timebase)
+            arr["timebase_low"] = timebase_low
+            arr["timebase_high"] = timebase_high
         else:
-            names = ["x", "y", "z", "intensity", "ring", "tag", "timebase"]
-            formats = ["<f4", "<f4", "<f4", "u1", "u1", "u1", "<u8"]
+            names = ["x", "y", "z", "intensity", "ring", "tag", "timebase_low", "timebase_high"]
+            formats = ["<f4", "<f4", "<f4", "u1", "u1", "u1", "<u4", "<u4"]
             offsets_list = [
                 offsets["x"],
                 offsets["y"],
@@ -231,7 +236,8 @@ class LivoxConverterNode(Node):
                 offsets["intensity"],
                 offsets["ring"],
                 offsets["tag"],
-                offsets["timebase"],
+                offsets["timebase_low"],
+                offsets["timebase_high"],
             ]
             dtype = np.dtype({"names": names, "formats": formats, "offsets": offsets_list, "itemsize": point_step})
             arr = np.zeros((xyz.shape[0],), dtype=dtype)
@@ -241,7 +247,8 @@ class LivoxConverterNode(Node):
             arr["intensity"] = intensity
             arr["ring"] = ring
             arr["tag"] = tag
-            arr["timebase"] = np.uint64(timebase)
+            arr["timebase_low"] = timebase_low
+            arr["timebase_high"] = timebase_high
 
         cloud_msg.data = arr.tobytes()
 

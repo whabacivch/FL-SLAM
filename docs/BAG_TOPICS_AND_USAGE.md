@@ -70,7 +70,7 @@ Key topics:
   - `intensity` (uint8, from reflectivity)
   - `ring` (uint8, from line)
   - `tag` (uint8)
-  - `timebase` (uint64, message-level timebase preserved per point)
+  - `timebase_low`, `timebase_high` (uint32, message-level timebase preserved per point)
 - **Per-point time offset**: not available in `livox_ros_driver2` MID360 messages; if available for other drivers it will be included as `time_offset`.
 
 ### Critical assumptions (must be explicit)
@@ -89,6 +89,7 @@ Each section should include:
 - bag truth frames
 - TF/camera_info presence
 - topic inventory and what the pipeline consumes
+
 ## NVIDIA r2b / other bags (placeholder)
 
 Add sections here as datasets are added.
@@ -98,4 +99,3 @@ Each section should include:
 - bag truth frames
 - TF/camera_info presence
 - topic inventory and what the pipeline consumes
-
