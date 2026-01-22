@@ -15,6 +15,7 @@ TIMEOUT_SEC="${TIMEOUT_SEC:-120}"
 STARTUP_SEC="${STARTUP_SEC:-25}"
 REQUIRE_LOOP="${REQUIRE_LOOP:-1}"
 REQUIRE_SLAM_ACTIVE="${REQUIRE_SLAM_ACTIVE:-1}"
+VENV_PATH="${VENV_PATH:-${PROJECT_DIR}/.venv}"
 echo "=========================================="
 echo "FL-SLAM Integration Test Suite"
 echo "=========================================="
@@ -26,6 +27,33 @@ echo "  Startup wait: ${STARTUP_SEC}s"
 echo "  Require loop: ${REQUIRE_LOOP}"
 echo "  SLAM active:  ${REQUIRE_SLAM_ACTIVE}"
 echo ""
+
+if [[ -d "${VENV_PATH}" ]]; then
+  # shellcheck disable=SC1090
+  source "${VENV_PATH}/bin/activate"
+else
+  echo "ERROR: Python venv not found at ${VENV_PATH}" >&2
+  echo "Create it with: python3 -m venv \"${VENV_PATH}\"" >&2
+  exit 1
+fi
+
+echo "Running preflight checks..."
+python3 - <<'PY'
+import sys
+
+try:
+    import jax
+except Exception as exc:
+    print(f"ERROR: Failed to import jax: {exc}")
+    sys.exit(1)
+
+devices = jax.devices()
+if not any(d.platform == "gpu" for d in devices):
+    print(f"ERROR: JAX GPU backend not available. Detected devices: {devices}")
+    sys.exit(1)
+
+print(f"Preflight OK: jax {jax.__version__}, devices={devices}")
+PY
 ROS_SETUP="/opt/ros/jazzy/setup.bash"
 WS_ROOT="${PROJECT_DIR}/fl_ws"
 if [[ ! -d "${BAG_PATH}" && ! -f "${BAG_PATH}" ]]; then

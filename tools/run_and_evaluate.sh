@@ -14,6 +14,7 @@ GT_ALIGNED="/tmp/m3dgr_ground_truth_aligned.tum"
 RESULTS_DIR="$PROJECT_ROOT/results/m3dgr_$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="$RESULTS_DIR/slam_run.log"
 OP_REPORT_FILE="$RESULTS_DIR/op_report.jsonl"
+VENV_PATH="${VENV_PATH:-$PROJECT_ROOT/.venv}"
 
 echo "========================================"
 echo "FL-SLAM M3DGR Pipeline"
@@ -26,6 +27,42 @@ echo ""
 # Clean previous run
 rm -f "$EST_FILE" "$GT_ALIGNED"
 mkdir -p "$RESULTS_DIR"
+
+# Activate project venv (required for JAX + eval deps)
+if [ -d "$VENV_PATH" ]; then
+  # shellcheck disable=SC1090
+  source "$VENV_PATH/bin/activate"
+else
+  echo "ERROR: Python venv not found at $VENV_PATH"
+  echo "Create it with: python3 -m venv \"$VENV_PATH\""
+  exit 1
+fi
+
+# Preflight checks (JAX GPU + eval deps)
+echo "Running preflight checks..."
+python3 - <<'PY'
+import sys
+
+try:
+    import jax
+except Exception as exc:
+    print(f"ERROR: Failed to import jax: {exc}")
+    sys.exit(1)
+
+devices = jax.devices()
+if not any(d.platform == "gpu" for d in devices):
+    print(f"ERROR: JAX GPU backend not available. Detected devices: {devices}")
+    sys.exit(1)
+
+try:
+    import evo  # noqa: F401
+    import matplotlib  # noqa: F401
+except Exception as exc:
+    print(f"ERROR: Missing evaluation dependency: {exc}")
+    sys.exit(1)
+
+print(f"Preflight OK: jax {jax.__version__}, devices={devices}")
+PY
 
 # Source ROS2 (suppress rerun_bridge not found warning)
 source /opt/ros/jazzy/setup.bash
@@ -51,7 +88,11 @@ echo "  Starting playback with progress monitoring..."
 echo ""
 
 # Launch SLAM in background with full logging
-ros2 launch fl_slam_poc poc_m3dgr_rosbag.launch.py bag:="$BAG_PATH" > "$LOG_FILE" 2>&1 &
+# Explicitly force C++ RGB-D decompression (Python decompressor is removed).
+ros2 launch fl_slam_poc poc_m3dgr_rosbag.launch.py \
+  bag:="$BAG_PATH" \
+  enable_decompress_cpp:=true \
+  > "$LOG_FILE" 2>&1 &
 LAUNCH_PID=$!
 
 # Capture OpReports for evaluation diagnostics
@@ -106,11 +147,6 @@ echo ""
 if [ ! -f "$EST_FILE" ]; then
     echo "ERROR: Estimated trajectory not found at $EST_FILE"
     exit 1
-fi
-
-# Activate venv if it exists (for evo package)
-if [ -d "$HOME/.venv" ]; then
-  source "$HOME/.venv/bin/activate" 2>/dev/null || true
 fi
 
 # Align ground truth timestamps

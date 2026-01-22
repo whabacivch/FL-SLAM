@@ -24,7 +24,7 @@ def generate_launch_description():
     odom_frame = LaunchConfiguration("odom_frame")
     base_frame = LaunchConfiguration("base_frame")
 
-    enable_decompress = LaunchConfiguration("enable_decompress")
+    enable_decompress_cpp = LaunchConfiguration("enable_decompress_cpp")
     rgb_compressed_topic = LaunchConfiguration("rgb_compressed_topic")
     depth_compressed_topic = LaunchConfiguration("depth_compressed_topic")
     camera_topic = LaunchConfiguration("camera_topic")
@@ -80,8 +80,8 @@ def generate_launch_description():
             DeclareLaunchArgument("base_frame", default_value="base_link"),
 
             # RGB-D decompression (M3DGR: compressed RGB + compressedDepth)
-            # DISABLED: NumPy 2.x compatibility issues in sandbox
-            DeclareLaunchArgument("enable_decompress", default_value="false"),
+            # C++ decompressor is enabled by default to avoid NumPy/cv_bridge ABI issues.
+            DeclareLaunchArgument("enable_decompress_cpp", default_value="true"),
             DeclareLaunchArgument("rgb_compressed_topic", default_value="/camera/color/image_raw/compressed"),
             DeclareLaunchArgument("depth_compressed_topic", default_value="/camera/aligned_depth_to_color/image_raw/compressedDepth"),
             DeclareLaunchArgument("camera_topic", default_value="/camera/image_raw"),
@@ -140,11 +140,11 @@ def generate_launch_description():
                 condition=IfCondition(enable_livox_convert),
             ),
 
-            # Image decompression node
+            # Image decompression node (C++ / cv_bridge)
             Node(
                 package="fl_slam_poc",
-                executable="image_decompress",
-                name="image_decompress",
+                executable="image_decompress_cpp",
+                name="image_decompress_cpp",
                 output="screen",
                 parameters=[
                     {
@@ -157,7 +157,7 @@ def generate_launch_description():
                         "qos_reliability": sensor_qos_reliability,
                     }
                 ],
-                condition=IfCondition(enable_decompress),
+                condition=IfCondition(enable_decompress_cpp),
             ),
 
             # Frontend (3D pointcloud mode)

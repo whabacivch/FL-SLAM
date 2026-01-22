@@ -46,7 +46,7 @@ These rules apply only to this project. Other projects have their own rules.
 ## System Snapshot (MVP - M3DGR Rosbag Pipeline)
 **Component Summary**
 - `tb3_odom_bridge`: absolute → delta odom conversion (`/odom` → `/sim/odom`). Generic odom bridge (legacy name, not TB3-specific).
-- `image_decompress`: rosbag image decompression for RGB-D processing (optional, when `enable_decompress:=true`).
+- `image_decompress_cpp`: rosbag image decompression for RGB-D processing (enabled by default; controlled by `enable_decompress_cpp`).
 - `livox_converter`: Livox LiDAR message conversion (`/livox/mid360/lidar` → `/lidar/points`).
 - `frontend_node`: sensor association, ICP loop detection, anchor management (`/scan`, `/lidar/points`, `/camera/*`, `/odom` → `/sim/loop_factor`, `/sim/anchor_create`, `/sim/imu_segment`).
 - `backend_node`: information-geometric fusion, trajectory estimation (`/sim/odom`, `/sim/loop_factor`, `/sim/anchor_create`, `/sim/imu_segment` → `/cdwm/state`, `/cdwm/trajectory`, `/cdwm/map`).
@@ -108,7 +108,7 @@ Rosbag Topics → Utility Nodes → Frontend (association + ICP + IMU segments) 
 - Primary package: `Impact Project_v1/fl_ws/src/fl_slam_poc`.
 - Package structure (flattened):
   - `fl_slam_poc/common/` - Pure Python utilities (no ROS imports): SE(3) operations, Dirichlet geometry, IMU preintegration, constants, op reports.
-  - `fl_slam_poc/frontend/` - Sensor processing + utility nodes: frontend orchestration, sensor I/O, anchor management, loop processing, ICP, point cloud GPU, utility nodes (image_decompress, livox_converter, tb3_odom_bridge).
+  - `fl_slam_poc/frontend/` - Sensor processing + utility nodes: frontend orchestration, sensor I/O, anchor management, loop processing, ICP, point cloud GPU, utility nodes (livox_converter, tb3_odom_bridge).
   - `fl_slam_poc/backend/` - State estimation + fusion: backend orchestration, Gaussian fusion, IMU kernels (`imu_jax_kernel.py`), information distances, parameter models (NIG, birth, adaptive: `process_noise.py`, `adaptive.py`), routing (`dirichlet_routing.py`), Lie operators (`lie_jax.py`).
 - Add new operators/utilities to `fl_slam_poc/common/`.
 - Add new sensor processing or utility nodes to `fl_slam_poc/frontend/`.

@@ -7,7 +7,7 @@ Inspect M3DGR camera topics to determine:
 """
 import rclpy
 from rclpy.serialization import serialize_message, deserialize_message
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import Image, CameraInfo, CompressedImage
 from nav_msgs.msg import Odometry
 from tf2_msgs.msg import TFMessage
 import sqlite3
@@ -15,11 +15,24 @@ import numpy as np
 import sys
 import os
 
-bag_path = 'rosbags/m3dgr/Dynamic01_ros2'
-db_path = f'{bag_path}/Dynamic01_ros2.db3'
+def _resolve_db3_path(bag_path: str) -> str:
+    # ROS 2 bags are directories containing one or more *.db3 files.
+    if os.path.isfile(bag_path) and bag_path.endswith(".db3"):
+        return bag_path
+    if not os.path.isdir(bag_path):
+        return ""
+    for name in sorted(os.listdir(bag_path)):
+        if name.endswith(".db3"):
+            return os.path.join(bag_path, name)
+    return ""
+
+
+bag_path = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("BAG_PATH", "rosbags/m3dgr/Dynamic01_ros2")
+db_path = _resolve_db3_path(bag_path)
 
 if not os.path.exists(db_path):
-    print(f"Error: Database not found at {db_path}")
+    print(f"Error: Database not found for bag_path='{bag_path}'.")
+    print("Pass the bag directory (containing *.db3) or a specific *.db3 file.")
     sys.exit(1)
 
 conn = sqlite3.connect(db_path)
@@ -48,8 +61,10 @@ for (topic,) in rgb_topics:
         row = cursor.fetchone()
         if row:
             try:
-                # Try to deserialize - may need special handling for compressed
-                print(f"     (compressed - frame ID in decompressed message)")
+                msg = deserialize_message(row[1], CompressedImage)
+                rgb_frame = msg.header.frame_id or rgb_frame
+                print(f"     Frame ID: {msg.header.frame_id}")
+                print(f"     Format: {msg.format}")
             except:
                 pass
 
@@ -98,11 +113,17 @@ for (topic,) in depth_topics:
     row = cursor.fetchone()
     if row:
         try:
-            msg = deserialize_message(row[1], Image)
-            depth_frame = msg.header.frame_id
-            print(f"     Frame ID: {msg.header.frame_id}")
-            print(f"     Size: {msg.width}x{msg.height}")
-            print(f"     Encoding: {msg.encoding}")
+            if "compressed" in topic:
+                msg = deserialize_message(row[1], CompressedImage)
+                depth_frame = msg.header.frame_id
+                print(f"     Frame ID: {msg.header.frame_id}")
+                print(f"     Format: {msg.format}")
+            else:
+                msg = deserialize_message(row[1], Image)
+                depth_frame = msg.header.frame_id
+                print(f"     Frame ID: {msg.header.frame_id}")
+                print(f"     Size: {msg.width}x{msg.height}")
+                print(f"     Encoding: {msg.encoding}")
         except Exception as e:
             print(f"     (could not deserialize compressed: {e})")
 

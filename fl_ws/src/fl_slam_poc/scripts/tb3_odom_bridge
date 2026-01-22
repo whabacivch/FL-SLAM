@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+
+from fl_slam_poc.frontend.tb3_odom_bridge import main
+
+
+if __name__ == "__main__":
+    main()
+

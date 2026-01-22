@@ -139,7 +139,7 @@ See: `phase2/fl_ws/src/fl_slam_poc/launch/poc_tb3_rosbag.launch.py`
 ros2 launch fl_slam_poc poc_tb3_rosbag.launch.py \
   bag:=rosbags/tb3_slam3d_small_ros2 \
   play_bag:=true \
-  enable_decompress:=true \
+  enable_decompress_cpp:=true \
   enable_image:=true \
   enable_depth:=true
 ```
@@ -149,7 +149,7 @@ ros2 launch fl_slam_poc poc_tb3_rosbag.launch.py \
 ros2 launch fl_slam_poc poc_tb3_rosbag.launch.py \
   bag:=rosbags/tb3_slam3d_small_ros2 \
   play_bag:=true \
-  enable_decompress:=false \
+  enable_decompress_cpp:=false \
   enable_image:=false \
   enable_depth:=false
 ```
@@ -204,7 +204,7 @@ python3 -c "from cv_bridge import CvBridge; print('cv_bridge OK')"
 
 ### Map Has Only Yellow Points (No RGB)
 - RGB-D processing not enabled or not receiving images
-- Check `enable_decompress:=true` and `enable_image:=true` in launch
+- Check `enable_decompress_cpp:=true` and `enable_image:=true` in launch
 
 ### Backend Status Shows 0 Dense Modules
 - RGB-D evidence not being processed

@@ -14,6 +14,7 @@
 #   FL_ROS_SETUP=/opt/ros/jazzy/setup.bash
 #   FL_PKG=fl_slam_poc              Package to build (default: fl_slam_poc)
 #   FL_CLEAN=1                      If set, remove build/install/log for FL_PKG before build
+#   FL_VENV=.venv                   Project venv path (relative to repo root)
 #
 # Notes:
 # - Must be sourced (not executed) so the sourced setup.bash affects your shell.
@@ -32,6 +33,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FL_WS_DIR="${FL_WS_DIR:-fl_ws}"
 FL_ROS_SETUP="${FL_ROS_SETUP:-/opt/ros/jazzy/setup.bash}"
 FL_PKG="${FL_PKG:-fl_slam_poc}"
+FL_VENV="${FL_VENV:-.venv}"
 
 if [[ ! -d "${REPO_ROOT}/${FL_WS_DIR}" ]]; then
   _fl_err "Workspace not found: ${REPO_ROOT}/${FL_WS_DIR}"
@@ -51,6 +53,17 @@ if command -v git >/dev/null 2>&1; then
   [[ -n "${SHA}" ]] && _fl_msg "Git SHA: ${SHA}"
 else
   _fl_msg "Git: (not found)"
+fi
+
+VENV_PATH="${REPO_ROOT}/${FL_VENV}"
+if [[ -d "${VENV_PATH}" ]]; then
+  _fl_msg "Activating venv: ${VENV_PATH}"
+  # shellcheck disable=SC1090
+  source "${VENV_PATH}/bin/activate"
+else
+  _fl_err "Python venv not found: ${VENV_PATH}"
+  _fl_err "Create it with: python3 -m venv \"${VENV_PATH}\""
+  return 2
 fi
 
 _fl_msg "Sourcing ROS: ${FL_ROS_SETUP}"

@@ -40,6 +40,25 @@ Hardened IMU wiring and diagnostics across the 3D pointcloud path, enforced fail
 - **IMU GPU contract:** When `enable_imu_fusion=true`, backend requires GPU at startup (fail-fast).
 - **Timebase policy:** Canonical dt is derived from IMU stamp endpoints.
 
+## 2026-01-22: Retire Python RGB-D Decompressor (Use C++ cv_bridge) ✅
+
+### Summary
+
+Removed the legacy Python `image_decompress` node and switched the rosbag pipeline to rely exclusively on the C++ decompressor (`image_decompress_cpp`) for compressed RGB + compressedDepth decoding, eliminating NumPy/cv_bridge ABI fragility in evaluation runs.
+
+### Changes
+
+- `fl_ws/src/fl_slam_poc/src/image_decompress_node.cpp`
+  - Publish RGB as `rgb8` and decode `compressedDepth` according to `compressed_depth_image_transport` semantics.
+- `fl_ws/src/fl_slam_poc/launch/poc_m3dgr_rosbag.launch.py`
+  - Removed the Python decompressor node and its `enable_decompress` flag; kept `enable_decompress_cpp`.
+- `fl_ws/src/fl_slam_poc/CMakeLists.txt`, `fl_ws/src/fl_slam_poc/setup.py`
+  - Removed installation/entrypoints for the Python decompressor.
+- `tools/run_and_evaluate.sh`
+  - Forces `enable_decompress_cpp:=true` to prevent accidental regressions.
+- `docs/MAP_VISUALIZATION.md`, `AGENTS.md`
+  - Updated flags and component naming to `enable_decompress_cpp`.
+
 ## 2026-01-22: Repository Flattening + Tooling Cleanup ✅
 
 ### Summary
