@@ -1,0 +1,240 @@
+"""
+Bin atlas and map structures for Golden Child SLAM v2.
+
+Reference: docs/GOLDEN_CHILD_INTERFACE_SPEC.md Sections 4.1, 4.2
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Tuple
+
+from fl_slam_poc.common.jax_init import jax, jnp
+from fl_slam_poc.common import constants
+from fl_slam_poc.common.primitives import (
+    domain_projection_psd,
+    inv_mass,
+    safe_normalize,
+)
+
+
+# =============================================================================
+# Bin Atlas
+# =============================================================================
+
+
+@dataclass
+class BinAtlas:
+    """
+    Fixed bin atlas for directional binning.
+    
+    Contains B_BINS unit vectors uniformly distributed on S^2.
+    """
+    dirs: jnp.ndarray  # (B_BINS, 3) unit vectors
+
+
+def _create_fibonacci_atlas_jax(n_bins: int) -> jnp.ndarray:
+    """
+    Create Fibonacci lattice on sphere using JAX.
+    
+    Produces quasi-uniform distribution of points on S^2.
+    Note: Not JIT compiled since this is only called once at init time.
+    """
+    indices = jnp.arange(n_bins, dtype=jnp.float64) + 0.5
+    phi = jnp.arccos(1 - 2 * indices / n_bins)
+    theta = jnp.pi * (1 + jnp.sqrt(5)) * indices
+    
+    x = jnp.sin(phi) * jnp.cos(theta)
+    y = jnp.sin(phi) * jnp.sin(theta)
+    z = jnp.cos(phi)
+    
+    dirs = jnp.stack([x, y, z], axis=1)
+    
+    # Normalize to ensure unit vectors
+    norms = jnp.linalg.norm(dirs, axis=1, keepdims=True)
+    dirs = dirs / (norms + constants.GC_EPS_MASS)
+    
+    return dirs
+
+
+def create_fibonacci_atlas(n_bins: int = constants.GC_B_BINS) -> BinAtlas:
+    """
+    Create fixed bin atlas with Fibonacci lattice directions.
+    
+    Args:
+        n_bins: Number of bins (default from constants)
+        
+    Returns:
+        BinAtlas with uniformly distributed directions
+    """
+    dirs = _create_fibonacci_atlas_jax(n_bins)
+    return BinAtlas(dirs=dirs)
+
+
+# =============================================================================
+# Map Bin Statistics
+# =============================================================================
+
+
+@dataclass
+class MapBinStats:
+    """
+    Map bin sufficient statistics (additive, associative).
+    
+    All statistics are stored as sufficient statistics that can be
+    additively updated without losing information.
+    
+    Reference: docs/GOLDEN_CHILD_INTERFACE_SPEC.md Section 4.2
+    """
+    # Directional sufficient stats
+    S_dir: jnp.ndarray  # (B_BINS, 3) resultant vectors Σ w u
+    N_dir: jnp.ndarray  # (B_BINS,) mass / ESS
+    
+    # Spatial sufficient stats
+    N_pos: jnp.ndarray  # (B_BINS,)
+    sum_p: jnp.ndarray  # (B_BINS, 3) Σ w p
+    sum_ppT: jnp.ndarray  # (B_BINS, 3, 3) Σ w p p^T
+
+
+def create_empty_map_stats(n_bins: int = constants.GC_B_BINS) -> MapBinStats:
+    """
+    Create empty map statistics (zero initialized).
+    
+    Args:
+        n_bins: Number of bins
+        
+    Returns:
+        Empty MapBinStats
+    """
+    return MapBinStats(
+        S_dir=jnp.zeros((n_bins, 3), dtype=jnp.float64),
+        N_dir=jnp.zeros(n_bins, dtype=jnp.float64),
+        N_pos=jnp.zeros(n_bins, dtype=jnp.float64),
+        sum_p=jnp.zeros((n_bins, 3), dtype=jnp.float64),
+        sum_ppT=jnp.zeros((n_bins, 3, 3), dtype=jnp.float64),
+    )
+
+
+def update_map_stats(
+    map_stats: MapBinStats,
+    increments_S_dir: jnp.ndarray,
+    increments_N_dir: jnp.ndarray,
+    increments_N_pos: jnp.ndarray,
+    increments_sum_p: jnp.ndarray,
+    increments_sum_ppT: jnp.ndarray,
+) -> MapBinStats:
+    """
+    Update map statistics additively.
+    
+    Args:
+        map_stats: Current map statistics
+        increments_*: Increments to add
+        
+    Returns:
+        Updated MapBinStats
+    """
+    return MapBinStats(
+        S_dir=map_stats.S_dir + increments_S_dir,
+        N_dir=map_stats.N_dir + increments_N_dir,
+        N_pos=map_stats.N_pos + increments_N_pos,
+        sum_p=map_stats.sum_p + increments_sum_p,
+        sum_ppT=map_stats.sum_ppT + increments_sum_ppT,
+    )
+
+
+def compute_map_derived_stats(
+    map_stats: MapBinStats,
+    eps_mass: float = constants.GC_EPS_MASS,
+    eps_psd: float = constants.GC_EPS_PSD,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """
+    Compute derived statistics from sufficient stats.
+    
+    Uses InvMass for all mass-based computations (no N==0 branches).
+    
+    Args:
+        map_stats: Map sufficient statistics
+        eps_mass: Mass regularization
+        eps_psd: PSD projection epsilon
+        
+    Returns:
+        Tuple of (mu_dir, kappa, centroid, Sigma_c)
+        - mu_dir: (B_BINS, 3) mean directions
+        - kappa: (B_BINS,) concentration parameters
+        - centroid: (B_BINS, 3) centroids
+        - Sigma_c: (B_BINS, 3, 3) centroid covariances
+    """
+    n_bins = map_stats.N_dir.shape[0]
+    
+    mu_dir = jnp.zeros((n_bins, 3), dtype=jnp.float64)
+    kappa = jnp.zeros(n_bins, dtype=jnp.float64)
+    centroid = jnp.zeros((n_bins, 3), dtype=jnp.float64)
+    Sigma_c = jnp.zeros((n_bins, 3, 3), dtype=jnp.float64)
+    
+    # Import kappa operator
+    from fl_slam_poc.backend.operators.kappa import kappa_from_resultant_v2
+    
+    for b in range(n_bins):
+        # Directional statistics
+        S_b = map_stats.S_dir[b]
+        N_d = map_stats.N_dir[b]
+        
+        # Mean direction (with safe normalize)
+        mu_b, _ = safe_normalize(S_b, eps_mass)
+        mu_dir = mu_dir.at[b].set(mu_b)
+        
+        # Resultant length and kappa
+        inv_N_d = inv_mass(float(N_d), eps_mass).inv_mass
+        S_norm = float(jnp.linalg.norm(S_b))
+        Rbar = S_norm * inv_N_d
+        kappa_result, _, _ = kappa_from_resultant_v2(Rbar)
+        kappa = kappa.at[b].set(kappa_result.kappa)
+        
+        # Spatial statistics
+        N_p = map_stats.N_pos[b]
+        sum_p_b = map_stats.sum_p[b]
+        sum_ppT_b = map_stats.sum_ppT[b]
+        
+        # Centroid (with InvMass)
+        inv_N_p = inv_mass(float(N_p), eps_mass).inv_mass
+        c_b = sum_p_b * inv_N_p
+        centroid = centroid.at[b].set(c_b)
+        
+        # Centroid covariance
+        Sigma_raw = sum_ppT_b * inv_N_p - jnp.outer(c_b, c_b)
+        Sigma_psd = domain_projection_psd(Sigma_raw, eps_psd).M_psd
+        Sigma_c = Sigma_c.at[b].set(Sigma_psd)
+    
+    return mu_dir, kappa, centroid, Sigma_c
+
+
+# =============================================================================
+# Forgetting for Map Statistics
+# =============================================================================
+
+
+def apply_forgetting(
+    map_stats: MapBinStats,
+    forgetting_factor: float = 0.99,
+) -> MapBinStats:
+    """
+    Apply exponential forgetting to map statistics.
+    
+    This implements the "all accumulators must use forgetting" requirement.
+    
+    Args:
+        map_stats: Current map statistics
+        forgetting_factor: Factor in (0, 1), closer to 1 = slower forgetting
+        
+    Returns:
+        Map statistics with forgetting applied
+    """
+    gamma = float(forgetting_factor)
+    
+    return MapBinStats(
+        S_dir=gamma * map_stats.S_dir,
+        N_dir=gamma * map_stats.N_dir,
+        N_pos=gamma * map_stats.N_pos,
+        sum_p=gamma * map_stats.sum_p,
+        sum_ppT=gamma * map_stats.sum_ppT,
+    )

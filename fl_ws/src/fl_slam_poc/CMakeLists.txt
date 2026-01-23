@@ -38,8 +38,8 @@ install(TARGETS image_decompress_cpp
 # Install Python node entrypoints into the ROS 2 "libexec" location so that
 # `ros2 launch` can resolve Node(executable=...) for this package.
 install(PROGRAMS
-  scripts/frontend_node
   scripts/backend_node
+  scripts/gc_backend_node
   scripts/odom_bridge
   scripts/livox_converter
   DESTINATION lib/${PROJECT_NAME}

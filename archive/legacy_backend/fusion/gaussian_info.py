@@ -65,17 +65,18 @@ def make_evidence(mean: np.ndarray, cov: np.ndarray) -> Tuple[np.ndarray, np.nda
     
     The log-density is: log p(x) ∝ -½x'Λx + η'x - ψ(Λ,η)
     
-    Uses Cholesky-based solve for numerical stability and adds regularization
-    to prevent singular matrix errors.
+    Uses Cholesky-based solve for numerical stability with regularization.
+    Strict: raises LinAlgError if matrix is not positive definite after regularization.
     """
     cov = np.asarray(cov, dtype=float)
     mean = _as_vector(mean)
     
-    # Regularize to prevent singular matrices
+    # Regularization: add small diagonal to ensure positive definiteness
+    # This is a documented approximation trigger if reg > 0
     reg = np.eye(cov.shape[0], dtype=cov.dtype) * constants.COV_REGULARIZATION_MIN
     cov_reg = cov + reg
     
-    # Use Cholesky solve for stability (strict)
+    # Strict Cholesky - raises LinAlgError if not PSD (no fallback)
     L_chol = np.linalg.cholesky(cov_reg)
     L = np.linalg.solve(L_chol, np.eye(cov.shape[0], dtype=cov.dtype))
     L = L @ L.T  # Reconstruct precision matrix
@@ -119,18 +120,18 @@ def mean_cov(L: np.ndarray, h: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         Σ = Λ⁻¹
         μ = Ση = Λ⁻¹η
     
-    Uses Cholesky-based solve for numerical stability and adds regularization
-    to prevent singular matrix errors.
+    Uses Cholesky-based solve for numerical stability with regularization.
+    Strict: raises LinAlgError if matrix is not positive definite after regularization.
     """
     L = np.asarray(L, dtype=float)
     h = _as_vector(h)
     
-    # Regularize to prevent singular matrices
-    # Add small diagonal term to ensure positive definiteness
+    # Regularization: add small diagonal to ensure positive definiteness
+    # This is a documented approximation trigger if reg > 0
     reg = np.eye(L.shape[0], dtype=L.dtype) * constants.COV_REGULARIZATION_MIN
     L_reg = L + reg
     
-    # Use Cholesky solve for stability (strict)
+    # Strict Cholesky - raises LinAlgError if not PSD (no fallback)
     L_chol = np.linalg.cholesky(L_reg)
     cov = np.linalg.solve(L_chol, np.eye(L.shape[0], dtype=L.dtype))
     cov = cov @ cov.T  # Reconstruct from Cholesky factor
@@ -675,11 +676,9 @@ def compute_odom_precision_from_covariance(
     
     # Ensure positive definiteness with regularization
     cov_clamped = 0.5 * (cov_clamped + cov_clamped.T)  # Symmetrize
-    eigvals = np.linalg.eigvalsh(cov_clamped)
-    if eigvals.min() < 1e-10:
-        cov_clamped += np.eye(6) * (1e-10 - eigvals.min())
+    cov_clamped = cov_clamped + np.eye(6) * constants.COV_REGULARIZATION_MIN
     
-    # Invert to get precision (strict)
+    # Strict Cholesky - raises LinAlgError if not PSD (no fallback)
     L_chol = np.linalg.cholesky(cov_clamped)
     precision = np.linalg.solve(L_chol, np.eye(6))
     precision = precision @ precision.T

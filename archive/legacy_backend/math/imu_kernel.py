@@ -287,15 +287,80 @@ def imu_batched_projection_kernel(
     # For single anchor case, use first anchor
     joint_mean = jnp.concatenate([anchor_mus[0], delta_mu], axis=0)
     
-    # Joint covariance block structure
-    joint_cov = jnp.zeros((30, 30), dtype=current_cov.dtype)
-    joint_cov = joint_cov.at[:15, :15].set(anchor_covs[0])
-    joint_cov = joint_cov.at[15:, 15:].set(new_cov)
-    # Cross-covariance from IMU constraint (approximate)
-    cross_cov = jnp.zeros((15, 15), dtype=current_cov.dtype)
-    cross_cov = cross_cov.at[:9, :9].set(cov_delta * 0.5)  # Shared uncertainty
-    joint_cov = joint_cov.at[:15, 15:].set(cross_cov)
-    joint_cov = joint_cov.at[15:, :15].set(cross_cov.T)
+    # =========================================================================
+    # INFORMATION-FORM FACTOR CONSTRUCTION (Principled)
+    # =========================================================================
+    # The IMU preintegration creates a binary factor connecting anchor and current.
+    # The measurement model (linearized) is:
+    #   r = xi_current[:9] - (xi_anchor[:9] + delta_preint)
+    # 
+    # Jacobians (allowed in sensor→evidence extraction per AGENTS.md):
+    #   J_anchor = -I_9  (residual decreases when anchor increases)
+    #   J_current = +I_9 (residual increases when current increases)
+    #
+    # Information matrix for joint state from this factor:
+    #   L_factor = [[J_a.T @ R_inv @ J_a, J_a.T @ R_inv @ J_c],
+    #               [J_c.T @ R_inv @ J_a, J_c.T @ R_inv @ J_c]]
+    #            = [[R_inv, -R_inv],
+    #               [-R_inv, R_inv]]
+    #
+    # This is added to the prior joint information matrix.
+    # The cross-information is -R_inv, NOT an ad-hoc 0.5*cov_delta.
+    # =========================================================================
+    
+    # Compute IMU factor precision (R_imu_inv) from moment-matched covariance
+    # cov_delta is the 9x9 covariance of the moment-matched residual
+    # Regularize and invert to get precision
+    n9 = 9
+    I9 = jnp.eye(n9, dtype=cov_delta.dtype)
+    cov_delta_reg = cov_delta + I9 * COV_REGULARIZATION
+    
+    # Cholesky-based inversion for precision
+    L_cov = cholesky(cov_delta_reg, lower=True)
+    R_inv_9 = solve_triangular(L_cov, I9, lower=True)
+    R_inv_9 = R_inv_9.T @ R_inv_9  # R_inv = (L^-1)^T @ L^-1
+    
+    # Embed 9x9 precision into 15x15 (only affects p, rotvec, v, not biases)
+    R_inv = jnp.zeros((15, 15), dtype=current_cov.dtype)
+    R_inv = R_inv.at[:9, :9].set(R_inv_9)
+    
+    # Convert prior covariances to information form
+    # Lambda = Sigma^{-1}
+    I15 = jnp.eye(15, dtype=current_cov.dtype)
+    
+    anchor_cov_reg = anchor_covs[0] + I15 * COV_REGULARIZATION
+    L_anc = cholesky(anchor_cov_reg, lower=True)
+    Lambda_anchor = solve_triangular(L_anc, I15, lower=True)
+    Lambda_anchor = Lambda_anchor.T @ Lambda_anchor
+    
+    current_cov_reg = new_cov + I15 * COV_REGULARIZATION
+    L_cur = cholesky(current_cov_reg, lower=True)
+    Lambda_current = solve_triangular(L_cur, I15, lower=True)
+    Lambda_current = Lambda_current.T @ Lambda_current
+    
+    # Joint information matrix: prior + IMU factor
+    # Prior (assuming independent): [[Lambda_anchor, 0], [0, Lambda_current]]
+    # IMU factor: [[R_inv, -R_inv], [-R_inv, R_inv]]
+    # Joint = Prior + Factor
+    joint_info = jnp.zeros((30, 30), dtype=current_cov.dtype)
+    
+    # Prior blocks
+    joint_info = joint_info.at[:15, :15].set(Lambda_anchor)
+    joint_info = joint_info.at[15:, 15:].set(Lambda_current)
+    
+    # Add IMU factor contribution (principled cross-information structure)
+    joint_info = joint_info.at[:15, :15].set(joint_info[:15, :15] + R_inv)
+    joint_info = joint_info.at[15:, 15:].set(joint_info[15:, 15:] + R_inv)
+    joint_info = joint_info.at[:15, 15:].set(joint_info[:15, 15:] - R_inv)  # Cross-info = -R_inv
+    joint_info = joint_info.at[15:, :15].set(joint_info[15:, :15] - R_inv)  # Symmetric
+    
+    # Convert back to covariance form for downstream Schur marginalization
+    # joint_cov = joint_info^{-1}
+    I30 = jnp.eye(30, dtype=current_cov.dtype)
+    joint_info_reg = joint_info + I30 * COV_REGULARIZATION
+    L_joint = cholesky(joint_info_reg, lower=True)
+    joint_cov = solve_triangular(L_joint, I30, lower=True)
+    joint_cov = joint_cov.T @ joint_cov
 
     # Return JAX arrays for diagnostics (convert to Python types outside JIT)
     hellinger_mean = jnp.mean(h_weights)

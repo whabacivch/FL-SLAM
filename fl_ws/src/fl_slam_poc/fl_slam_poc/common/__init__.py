@@ -1,40 +1,24 @@
 """
-Common package for FL-SLAM.
+Common package for Golden Child SLAM v2.
 
-Shared utilities and transforms used by both frontend and backend.
-
-Subpackages:
-- transforms/: SE(3) geometry operations
+Contains shared utilities:
+- belief: Gaussian belief representations (BeliefGaussianInfo)
+- certificates: Certificate audit trail (CertBundle)
+- constants: Configuration constants
+- geometry/: SE(3) operations (JAX and NumPy)
+- jax_init: JAX initialization
+- primitives: Branch-free numeric primitives
 """
 
-from __future__ import annotations
-
-from importlib import import_module
-from typing import Any
+from fl_slam_poc.common import constants
+from fl_slam_poc.common.jax_init import jax, jnp
+from fl_slam_poc.common.belief import BeliefGaussianInfo
+from fl_slam_poc.common.certificates import CertBundle
 
 __all__ = [
-    "OpReport",
     "constants",
-    "jax_init",
+    "jax",
+    "jnp",
+    "BeliefGaussianInfo",
+    "CertBundle",
 ]
-
-_LAZY_ATTRS: dict[str, tuple[str, str | None]] = {
-    "OpReport": ("fl_slam_poc.common.op_report", "OpReport"),
-    # Expose these as submodules, but do not eagerly import them at package import time.
-    "constants": ("fl_slam_poc.common.constants", None),
-    # JAX initialization module (imported eagerly to ensure JAX is initialized once)
-    "jax_init": ("fl_slam_poc.common.jax_init", None),
-}
-
-
-def __getattr__(name: str) -> Any:
-    target = _LAZY_ATTRS.get(name)
-    if target is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    module_name, attr_name = target
-    module = import_module(module_name)
-    return module if attr_name is None else getattr(module, attr_name)
-
-
-def __dir__() -> list[str]:
-    return sorted(set(globals().keys()) | set(_LAZY_ATTRS.keys()))

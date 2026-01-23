@@ -91,7 +91,7 @@ class Frontend(Node):
     
     def _declare_parameters(self):
         """Declare all ROS parameters with defaults."""
-        self.declare_parameter("use_sim_time", False)
+        # Note: use_sim_time is auto-declared by ROS 2 - do not redeclare
         # Topics
         self.declare_parameter("scan_topic", "/scan")
         self.declare_parameter("odom_topic", "/odom")
@@ -980,9 +980,9 @@ class Frontend(Node):
             if icp_result is not None:
                 try:
                     # Validate transformation is finite
-                    if not np.all(np.isfinite(icp_result.transformation)):
+                    if not np.all(np.isfinite(icp_result.transform)):
                         raise ContractViolation(
-                            f"icp_result.transformation: Contains inf/nan: {icp_result.transformation}"
+                            f"icp_result.transform: Contains inf/nan: {icp_result.transform}"
                         )
 
                     # Validate MSE is finite and non-negative
@@ -993,8 +993,8 @@ class Frontend(Node):
 
                     # Log actual ICP values for first few loops (data flow audit)
                     if self._loop_debug_count <= 5:
-                        trans_norm = np.linalg.norm(icp_result.transformation[:3])
-                        rot_norm = np.linalg.norm(icp_result.transformation[3:])
+                        trans_norm = np.linalg.norm(icp_result.transform[:3])
+                        rot_norm = np.linalg.norm(icp_result.transform[3:])
                         self.get_logger().info(
                             f"Frontend ICP validation #{self._loop_debug_count}: "
                             f"converged={icp_result.converged}, mse={icp_result.mse:.6f}, "

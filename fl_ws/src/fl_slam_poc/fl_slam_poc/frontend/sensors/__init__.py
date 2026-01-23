@@ -1,38 +1,16 @@
 """
-Sensor I/O subpackage.
+Sensor utility nodes for Golden Child SLAM v2.
 
-Handles:
-- Sensor message subscription and buffering
-- TF lookups and transforms
-- Camera intrinsics management
-- RGB-D processing
-- Livox converter and odometry bridge utilities
-
-Usage:
-    from fl_slam_poc.frontend.sensors import (
-        SensorIO,
-        depth_to_pointcloud,
-        compute_normals_from_depth,
-        rgbd_to_evidence,
-    )
+- livox_converter: Converts Livox CustomMsg to PointCloud2
+- odom_bridge: Bridges odometry topics
 """
 
-from __future__ import annotations
-
-from fl_slam_poc.frontend.sensors.sensor_io import SensorIO
-from fl_slam_poc.frontend.sensors.rgbd_processor import (
-    depth_to_pointcloud,
-    compute_normals_from_depth,
-    rgbd_to_evidence,
-    transform_evidence_to_global,
-    subsample_evidence_spatially,
-)
+from fl_slam_poc.frontend.sensors.livox_converter import LivoxConverterNode, main as livox_main
+from fl_slam_poc.frontend.sensors.odom_bridge import OdomBridge, main as odom_main
 
 __all__ = [
-    "SensorIO",
-    "depth_to_pointcloud",
-    "compute_normals_from_depth",
-    "rgbd_to_evidence",
-    "transform_evidence_to_global",
-    "subsample_evidence_spatially",
+    "LivoxConverterNode",
+    "livox_main",
+    "OdomBridge",
+    "odom_main",
 ]

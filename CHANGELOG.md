@@ -4,6 +4,125 @@ Project: Frobenius-Legendre SLAM POC (Impact Project_v1)
 
 This file tracks all significant changes, design decisions, and implementation milestones for the FL-SLAM project.
 
+## 2026-01-23: Golden Child SLAM v2 Implementation ✅
+
+### Summary
+
+Complete implementation of the Golden Child SLAM v2 specification - a strict "branch-free, fixed-cost, local-chart" SLAM backend that eliminates all methodology issues from the previous audit.
+
+### Key Features
+
+1. **Branch-Free Total Functions**: Every operator always runs, with continuous influence scalars instead of conditional gates
+2. **6D SE(3) Representation**: Using `[translation(3), rotvec(3)]` representation with JAX for all math
+3. **Certificate Audit Trail**: Every operator returns `(result, CertBundle, ExpectedEffect)` tuple
+4. **Domain Projections Always Applied**: `DomainProjectionPSD` and `SPDCholeskySolveLifted` always execute with recorded magnitudes
+
+### Files Created
+
+**Common Layer:**
+- `fl_slam_poc/common/primitives.py` - Branch-free numeric primitives (Symmetrize, DomainProjectionPSD, InvMass, Clamp, etc.)
+- `fl_slam_poc/common/certificates.py` - CertBundle, ExpectedEffect, component certificates
+- `fl_slam_poc/common/belief.py` - BeliefGaussianInfo (22D state), HypothesisSet
+
+**Operators:**
+- `fl_slam_poc/backend/operators/point_budget.py` - PointBudgetResample
+- `fl_slam_poc/backend/operators/predict.py` - PredictDiffusion
+- `fl_slam_poc/backend/operators/deskew.py` - DeskewUTMomentMatch (produces UTCache)
+- `fl_slam_poc/backend/operators/binning.py` - BinSoftAssign, ScanBinMomentMatch
+- `fl_slam_poc/backend/operators/kappa.py` - KappaFromResultant (single continuous formula)
+- `fl_slam_poc/backend/operators/wahba.py` - WahbaSVD
+- `fl_slam_poc/backend/operators/translation.py` - TranslationWLS
+- `fl_slam_poc/backend/operators/lidar_evidence.py` - LidarQuadraticEvidence (reuses UTCache)
+- `fl_slam_poc/backend/operators/fusion.py` - FusionScaleFromCertificates, InfoFusionAdditive
+- `fl_slam_poc/backend/operators/recompose.py` - PoseUpdateFrobeniusRecompose
+- `fl_slam_poc/backend/operators/map_update.py` - PoseCovInflationPushforward
+- `fl_slam_poc/backend/operators/anchor_drift.py` - AnchorDriftUpdate (continuous rho)
+- `fl_slam_poc/backend/operators/hypothesis.py` - HypothesisBarycenterProjection
+
+**Structures:**
+- `fl_slam_poc/backend/structures/bin_atlas.py` - BinAtlas, MapBinStats with forgetting
+
+**Pipeline:**
+- `fl_slam_poc/backend/pipeline.py` - 15-step per-scan execution, RuntimeManifest
+
+**Tests:**
+- `test/test_golden_child_invariants.py` - Chart ID, dimensions, budgets
+- `test/test_primitives.py` - Branch-free primitive correctness
+- `test/test_operators.py` - Operator contract verification
+
+### Methodology Issues Fixed
+
+1. ✅ **Delta Accumulation** - Now uses absolute state in local charts
+2. ✅ **Double-Counting Uncertainty** - Information fusion is additive once
+3. ✅ **Non-SPD Matrices** - DomainProjectionPSD always applied
+4. ✅ **JAX Silent NaN** - All operations use lifted solves
+5. ✅ **Unbounded Covariance Growth** - Forgetting factor on map stats
+6. ✅ **Residual Accumulation** - Relinearization at anchor updates
+7. ✅ **Framework Mix** - Pure JAX implementation
+
+### Design Invariants Enforced
+
+- **No if/else gates** that change computation paths based on data
+- **All operators are total functions** that always execute
+- **Continuous influence scalars** replace hard thresholds
+- **Every approximation is logged** with magnitude in CertBundle
+- **Frobenius correction is conditional on trigger magnitude**, not boolean flags
+
+### Reference
+
+docs/GOLDEN_CHILD_INTERFACE_SPEC.md - Full specification
+
+---
+
+## 2026-01-23: Information-Form IMU Fusion + SE(3) Adjoint Transport ✅
+
+### Summary
+
+Fixed root causes of `LinAlgError: Matrix is not positive definite` by replacing ad-hoc approximations with principled information geometry approaches.
+
+### Root Causes Fixed
+
+1. **IMU Kernel Cross-Covariance (imu_kernel.py:294-298)**
+   - **Problem**: Ad-hoc `cross_cov = cov_delta * 0.5` violates PSD requirements for block matrices
+   - **Fix**: Information-form factor construction with proper structure:
+     ```
+     L_factor = [[R_inv, -R_inv], [-R_inv, R_inv]]
+     ```
+   - **Rationale**: The IMU constraint's Jacobians are J_anchor=-I, J_current=+I, giving cross-information = -R_inv (not arbitrary scaling)
+
+2. **Odom Bridge Covariance (odom_bridge.py)**
+   - **Problem**: First-order approximation `Σ_delta ≈ Σ_prev + Σ_curr` ignores rotation effects
+   - **Fix**: Proper SE(3) Adjoint transport:
+     ```
+     Σ_delta = Σ_prev + Ad(T_prev⁻¹) @ Σ_curr @ Ad(T_prev⁻¹).T
+     ```
+   - **Rationale**: Barfoot (2017), Sola (2018) - covariance transport on Lie groups uses Adjoint representation
+
+### Changes
+
+- **`imu_kernel.py`**: Rewrote joint covariance construction to use information-form factor structure
+  - Convert prior covariances to precision matrices (Λ = Σ⁻¹)
+  - Add IMU factor contribution with mathematically correct cross-information structure
+  - Convert back to covariance for downstream Schur marginalization
+  - Jacobians are in sensor→evidence extraction (allowed per AGENTS.md)
+
+- **`odom_bridge.py`**: 
+  - `compute_delta_covariance()` now uses `se3_cov_compose()` with Adjoint transport
+  - OpReport updated to reflect exact (not approximate) operation
+  - Import `se3_cov_compose` from geometry module
+
+### Invariants Enforced
+
+- **Closed-form-first**: Both fixes use closed-form operations (no iterative solvers)
+- **No heuristics**: Removed ad-hoc `0.5` scaling, replaced with principled Jacobian-based structure
+- **Single path**: No fallbacks or branching - strict operations that fail loudly on invalid input
+
+### References
+
+- Barfoot (2017): State Estimation for Robotics - SE(3) covariance propagation
+- Sola et al. (2018): A micro Lie theory - Adjoint representation
+- Amari (2016): Information Geometry - natural parameters and duality
+
 ## 2026-01-23: Strict Failures, JAX SE(3), Determinism + Observability ✅
 
 ### Summary
@@ -32,7 +151,6 @@ Added an explicit engineering invariant to prevent silent coexistence of multipl
   - Added "No Fallbacks / No Multi-Paths (Required)" section with fail-fast + runtime-manifest requirements.
   - Shortened and hardened the document to reduce ambiguity and enforce first-principles invariants in review.
   - Fixed spec reference path for `Project_Implimentation_Guide.sty`.
-
 
 ## 2026-01-23: Prospector Lint Cleanup (Phases 1-4) ✅
 
