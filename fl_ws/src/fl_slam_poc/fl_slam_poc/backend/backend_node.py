@@ -1380,8 +1380,8 @@ class FLBackend(Node):
                 "keyframe_j": keyframe_j,
                 "dt_header": float(dt_header),
                 "dt_stamps": float(dt_stamps),
-                "dt_gap_start": float(dt_gap_start) if dt_gap_start is not None else None,
-                "dt_gap_end": float(dt_gap_end) if dt_gap_end is not None else None,
+                "dt_gap_start": float(dt_gap_start) if dt_gap_start is not None else 0.0,
+                "dt_gap_end": float(dt_gap_end) if dt_gap_end is not None else 0.0,
                 "stamp_delta_min": stamp_delta_min,
                 "stamp_delta_mean": stamp_delta_mean,
                 "stamp_delta_max": stamp_delta_max,
@@ -1411,6 +1411,11 @@ class FLBackend(Node):
                 "routing_retention": routing_diag["retention"],
                 "routing_hellinger_shift": routing_diag["hellinger_shift"],
                 "routing_max_resp": max_resp,
+                # Adaptive bias keys required by evaluator
+                # When adaptive=False, traces are 0.0 (no adaptive covariance)
+                "bias_rw_cov_adaptive": False,
+                "bias_rw_cov_trace_gyro": 0.0,
+                "bias_rw_cov_trace_accel": 0.0,
             },
             notes="IMU two-state factor: joint update + single e-projection + Schur marginalization.",
         ))
