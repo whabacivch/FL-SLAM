@@ -250,6 +250,11 @@ IMU_ACCEL_BIAS_INNOV_STD_PRIOR = 1.0e-3     # m/s^2/sqrt(s)
 # Default IMU topic (M3DGR: Livox MID-360 IMU)
 IMU_TOPIC_DEFAULT = "/livox/mid360/imu"
 
+# IMU acceleration scale factor (prior)
+# Livox Mid-360 IMU (ICM40609) outputs acceleration in g's, needs scaling to m/s².
+# Set to 9.81 for Livox sensors, 1.0 for sensors that output m/s² directly.
+IMU_ACCEL_SCALE_DEFAULT = 9.81  # g to m/s² conversion
+
 # Gravity vector (world frame, z-down by default; override via ROS params if needed)
 GRAVITY_DEFAULT = (0.0, 0.0, -9.81)
 

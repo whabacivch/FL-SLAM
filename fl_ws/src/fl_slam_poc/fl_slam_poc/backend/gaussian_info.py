@@ -467,3 +467,246 @@ def hellinger_squared_from_moments(
     h_sq = max(0.0, 1.0 - bc)
     
     return float(h_sq)
+
+
+# =============================================================================
+# α-Divergence and Trust-Scaled Fusion (Information-Geometric Trust Region)
+# =============================================================================
+
+# Prior: α = 0.5 gives symmetric divergence (related to Hellinger)
+# α → 1 gives KL(p||q), α → 0 gives KL(q||p)
+# ESS interpretation: α = 0.5 means "penalize both over-updating and under-updating equally"
+ALPHA_DIVERGENCE_DEFAULT = 0.5
+
+# Prior: maximum α-divergence per update step
+# ESS interpretation: ~1 pseudocount's worth of information change is the expected maximum
+# This prevents catastrophic jumps while allowing meaningful updates
+MAX_ALPHA_DIVERGENCE_PRIOR = 1.0
+
+
+def alpha_divergence(
+    L1: np.ndarray, h1: np.ndarray,
+    L2: np.ndarray, h2: np.ndarray,
+    alpha: float = ALPHA_DIVERGENCE_DEFAULT,
+) -> float:
+    """
+    α-divergence D_α(p₁ || p₂) between two Gaussians.
+    
+    The α-divergence family generalizes KL:
+        D_α(p||q) = (1/(α(1-α))) * (1 - ∫ p^α q^{1-α} dx)
+    
+    Special cases:
+        α → 1: KL(p||q)  "information gained" (forward KL)
+        α → 0: KL(q||p)  "information lost" (reverse KL)
+        α = 0.5: Symmetric, related to Hellinger (√2 * H²)
+    
+    For Gaussians, this has closed form via the moment-generating function.
+    
+    Properties:
+        - α = 0.5 satisfies symmetry: D_0.5(p||q) = D_0.5(q||p)
+        - Does NOT satisfy triangle inequality (not a metric)
+        - Bounded below by 0, unbounded above
+    
+    Args:
+        L1, h1: Information form of distribution p₁
+        L2, h2: Information form of distribution p₂
+        alpha: Divergence parameter in (0, 1), default 0.5 for symmetry
+    
+    Returns:
+        D_α(p₁ || p₂) ≥ 0
+    
+    Reference: Amari (2016), Chapter 3
+    """
+    # Clamp alpha to valid range (avoid singularities at 0 and 1)
+    alpha = float(np.clip(alpha, 0.01, 0.99))
+    
+    mu1, cov1 = mean_cov(L1, h1)
+    mu2, cov2 = mean_cov(L2, h2)
+    
+    d = cov1.shape[0]
+    
+    # Weighted covariance: Σ_α = α*Σ₁ + (1-α)*Σ₂
+    cov_alpha = alpha * cov1 + (1.0 - alpha) * cov2
+    
+    # Log determinants
+    _, logdet1 = np.linalg.slogdet(cov1)
+    _, logdet2 = np.linalg.slogdet(cov2)
+    _, logdet_alpha = np.linalg.slogdet(cov_alpha)
+    
+    # Determinant ratio term
+    # log|Σ_α| - α*log|Σ₁| - (1-α)*log|Σ₂|
+    log_det_term = logdet_alpha - alpha * logdet1 - (1.0 - alpha) * logdet2
+    
+    # Mahalanobis term
+    diff = mu1 - mu2
+    try:
+        cov_alpha_inv = np.linalg.inv(cov_alpha)
+        mahal_sq = float(diff @ cov_alpha_inv @ diff)
+    except np.linalg.LinAlgError:
+        cov_alpha_inv = np.linalg.pinv(cov_alpha)
+        mahal_sq = float(diff @ cov_alpha_inv @ diff)
+    
+    # α-divergence formula for Gaussians:
+    # D_α = (1/(2α(1-α))) * (α(1-α)*mahal² + log_det_term)
+    # Simplified: D_α = 0.5 * mahal² + log_det_term / (2α(1-α))
+    d_alpha = 0.5 * alpha * (1.0 - alpha) * mahal_sq + 0.5 * log_det_term
+    d_alpha = d_alpha / (alpha * (1.0 - alpha))
+    
+    return float(max(0.0, d_alpha))
+
+
+def trust_scaled_fusion(
+    prior_L: np.ndarray,
+    prior_h: np.ndarray,
+    factor_L: np.ndarray,
+    factor_h: np.ndarray,
+    max_divergence: float = MAX_ALPHA_DIVERGENCE_PRIOR,
+    alpha: float = ALPHA_DIVERGENCE_DEFAULT,
+) -> Tuple[np.ndarray, np.ndarray, dict]:
+    """
+    Fuse a factor with trust-region scaling using α-divergence.
+    
+    This is the power posterior / tempered likelihood approach:
+        posterior ∝ prior × likelihood^β
+    
+    In information form:
+        L_post = L_prior + β × L_factor
+        h_post = h_prior + β × h_factor
+    
+    where β ∈ [0, 1] is computed to satisfy the trust region constraint.
+    
+    Key property: This stays ENTIRELY in the Gaussian family!
+    - No mixture reduction needed
+    - Preserves conjugacy and associativity
+    - β = 1 gives full update, β → 0 gives "do nothing"
+    
+    The trust region is based on α-divergence:
+        β = argmax β' s.t. D_α(posterior(β') || prior) ≤ max_divergence
+    
+    For efficiency, we use a closed-form approximation:
+        β ≈ exp(-D_α(full_posterior || prior) / max_divergence)
+    
+    This gives smooth scaling: high divergence → low β, low divergence → β ≈ 1.
+    
+    Args:
+        prior_L, prior_h: Prior in information form
+        factor_L, factor_h: Factor (evidence) to fuse
+        max_divergence: Trust region radius (prior: 1.0 = ~1 pseudocount change)
+        alpha: α-divergence parameter (prior: 0.5 for symmetry)
+    
+    Returns:
+        (L_post, h_post, diagnostics): Posterior and diagnostic dict
+        
+    Diagnostics include:
+        - beta: Tempering coefficient used
+        - divergence_full: D_α if full update were applied
+        - divergence_actual: D_α of actual (scaled) update
+        - trust_quality: exp(-divergence_actual / max_divergence) ∈ (0, 1]
+    """
+    prior_L = np.asarray(prior_L, dtype=float)
+    prior_h = _as_vector(prior_h)
+    factor_L = np.asarray(factor_L, dtype=float)
+    factor_h = _as_vector(factor_h)
+    
+    # Compute what the full posterior would be
+    full_post_L = prior_L + factor_L
+    full_post_h = prior_h + factor_h
+    
+    # Compute α-divergence for full update
+    div_full = alpha_divergence(full_post_L, full_post_h, prior_L, prior_h, alpha=alpha)
+    
+    # Compute trust scaling factor β
+    # β = exp(-div_full / max_divergence) gives smooth decay
+    # High divergence → β → 0, low divergence → β → 1
+    if max_divergence > 0:
+        beta = float(np.exp(-div_full / max_divergence))
+    else:
+        beta = 1.0
+    
+    # Clamp β to [0, 1]
+    beta = float(np.clip(beta, 0.0, 1.0))
+    
+    # Apply scaled fusion (power posterior)
+    # L_post = L_prior + β * L_factor
+    # h_post = h_prior + β * h_factor
+    post_L = prior_L + beta * factor_L
+    post_h = prior_h + beta * factor_h
+    
+    # Compute actual divergence (for diagnostics)
+    div_actual = alpha_divergence(post_L, post_h, prior_L, prior_h, alpha=alpha)
+    
+    # Trust quality: how much of the update was we able to apply
+    trust_quality = float(np.exp(-div_actual / max(max_divergence, 1e-10)))
+    
+    diagnostics = {
+        "beta": beta,
+        "divergence_full": div_full,
+        "divergence_actual": div_actual,
+        "trust_quality": trust_quality,
+        "alpha": alpha,
+        "max_divergence": max_divergence,
+    }
+    
+    return post_L, post_h, diagnostics
+
+
+def compute_odom_precision_from_covariance(
+    odom_cov: np.ndarray,
+    min_precision: float = 1e-8,
+    max_precision: float = 1e6,
+) -> np.ndarray:
+    """
+    Convert odometry covariance to precision matrix with bounds.
+    
+    The odom covariance encodes sensor confidence:
+        - Low variance (0.001 for XY) → high precision → strong influence
+        - High variance (1e6 for Z) → low precision → weak influence
+    
+    This function inverts the covariance to get precision, with safeguards:
+        - Clamp diagonal to [1/max_precision, 1/min_precision] before inversion
+        - This prevents numerical issues from huge variances (1e6) or tiny variances
+    
+    Args:
+        odom_cov: 6x6 odometry covariance matrix
+        min_precision: Minimum precision (prevents infinite variance from dominating)
+        max_precision: Maximum precision (prevents tiny variance from over-weighting)
+    
+    Returns:
+        6x6 precision matrix (information form Λ)
+    
+    Note:
+        For M3DGR odom, Z/roll/pitch have variance ~1e6, giving precision ~1e-6.
+        This means Z/roll/pitch contribute almost nothing to updates - which is correct!
+    """
+    odom_cov = np.asarray(odom_cov, dtype=float)
+    
+    if odom_cov.shape != (6, 6):
+        raise ValueError(f"Expected 6x6 covariance, got {odom_cov.shape}")
+    
+    # Clamp diagonal to valid range before inversion
+    cov_clamped = odom_cov.copy()
+    diag = np.diag(cov_clamped)
+    
+    # Variance bounds: [1/max_precision, 1/min_precision]
+    min_var = 1.0 / max_precision
+    max_var = 1.0 / min_precision
+    diag_clamped = np.clip(diag, min_var, max_var)
+    
+    # Replace diagonal with clamped values
+    np.fill_diagonal(cov_clamped, diag_clamped)
+    
+    # Ensure positive definiteness with regularization
+    cov_clamped = 0.5 * (cov_clamped + cov_clamped.T)  # Symmetrize
+    eigvals = np.linalg.eigvalsh(cov_clamped)
+    if eigvals.min() < 1e-10:
+        cov_clamped += np.eye(6) * (1e-10 - eigvals.min())
+    
+    # Invert to get precision
+    try:
+        L_chol = np.linalg.cholesky(cov_clamped)
+        precision = np.linalg.solve(L_chol, np.eye(6))
+        precision = precision @ precision.T
+    except np.linalg.LinAlgError:
+        precision = np.linalg.pinv(cov_clamped)
+    
+    return precision

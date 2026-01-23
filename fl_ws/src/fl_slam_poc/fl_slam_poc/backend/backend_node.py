@@ -39,7 +39,11 @@ import time
 from collections import deque
 from typing import Optional, Dict, List
 
-# JAX is initialized via common.jax_init module (imported lazily when needed)
+# Configure JAX for CUDA GPU before any JAX imports
+import os
+os.environ["JAX_PLATFORMS"] = "cuda"  # Explicitly use CUDA, not ROCm
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")  # Reduce memory preallocation
+
 import numpy as np
 import rclpy
 from rclpy.clock import Clock, ClockType
@@ -62,12 +66,18 @@ from fl_slam_poc.common.se3 import (
     se3_cov_compose,
     se3_relative,
 )
-from fl_slam_poc.backend import TimeAlignmentModel, AdaptiveProcessNoise, AdaptiveIMUNoiseModel, WishartPrior
-from fl_slam_poc.backend.gaussian_info import make_evidence, fuse_info, mean_cov
+from fl_slam_poc.backend import TimeAlignmentModel, AdaptiveProcessNoise
+from fl_slam_poc.backend.gaussian_info import (
+    make_evidence,
+    fuse_info,
+    mean_cov,
+    trust_scaled_fusion,
+    ALPHA_DIVERGENCE_DEFAULT,
+    MAX_ALPHA_DIVERGENCE_PRIOR,
+)
 from fl_slam_poc.backend.gaussian_geom import (
-    gaussian_frobenius_correction, 
-    se3_tangent_frobenius_correction,
-    imu_tangent_frobenius_correction
+    gaussian_frobenius_correction,
+    imu_tangent_frobenius_correction,
 )
 from fl_slam_poc.backend.information_distances import hellinger_gaussian
 from fl_slam_poc.frontend.vmf_geometry import vmf_barycenter, vmf_mean_param
@@ -222,7 +232,8 @@ class FLBackend(Node):
         self.declare_parameter("enable_imu_fusion", True)
         self.declare_parameter("imu_gyro_noise_density", constants.IMU_GYRO_NOISE_DENSITY_DEFAULT)
         self.declare_parameter("imu_accel_noise_density", constants.IMU_ACCEL_NOISE_DENSITY_DEFAULT)
-        self.declare_parameter("imu_bias_adapt_forgetting", 0.995)
+        self.declare_parameter("imu_gyro_random_walk", constants.IMU_GYRO_RANDOM_WALK_DEFAULT)
+        self.declare_parameter("imu_accel_random_walk", constants.IMU_ACCEL_RANDOM_WALK_DEFAULT)
         self.declare_parameter("gravity", list(constants.GRAVITY_DEFAULT))
 
     def _init_from_params(self):
@@ -233,7 +244,8 @@ class FLBackend(Node):
         enable_imu_param = self.get_parameter("enable_imu_fusion")
         gyro_noise_param = self.get_parameter("imu_gyro_noise_density")
         accel_noise_param = self.get_parameter("imu_accel_noise_density")
-        bias_forgetting_param = self.get_parameter("imu_bias_adapt_forgetting")
+        gyro_walk_param = self.get_parameter("imu_gyro_random_walk")
+        accel_walk_param = self.get_parameter("imu_accel_random_walk")
 
         self.enable_imu_fusion = bool(enable_imu_param.value if enable_imu_param.value is not None else True)
         self.imu_gyro_noise_density = float(
@@ -242,29 +254,14 @@ class FLBackend(Node):
         self.imu_accel_noise_density = float(
             accel_noise_param.value if accel_noise_param.value is not None else constants.IMU_ACCEL_NOISE_DENSITY_DEFAULT
         )
-        self.imu_bias_adapt_forgetting = float(
-            bias_forgetting_param.value if bias_forgetting_param.value is not None else 0.995
+        self.imu_gyro_random_walk = float(
+            gyro_walk_param.value if gyro_walk_param.value is not None else constants.IMU_GYRO_RANDOM_WALK_DEFAULT
+        )
+        self.imu_accel_random_walk = float(
+            accel_walk_param.value if accel_walk_param.value is not None else constants.IMU_ACCEL_RANDOM_WALK_DEFAULT
         )
         gravity_param = self.get_parameter("gravity").value
         self.gravity = np.array(gravity_param, dtype=float)
-
-        self.imu_adaptive_noise = None
-        # Fixed prior for bias innovation covariance (adaptive model learns online).
-        # This is intentionally NOT exposed as an IMU "random-walk" parameter.
-        self._imu_bias_innov_gyro_cov_prior = np.eye(3, dtype=float) * (
-            float(constants.IMU_GYRO_BIAS_INNOV_STD_PRIOR) ** 2
-        )
-        self._imu_bias_innov_accel_cov_prior = np.eye(3, dtype=float) * (
-            float(constants.IMU_ACCEL_BIAS_INNOV_STD_PRIOR) ** 2
-        )
-        if self.enable_imu_fusion:
-            gyro_prior = WishartPrior.from_mean_covariance(self._imu_bias_innov_gyro_cov_prior)
-            accel_prior = WishartPrior.from_mean_covariance(self._imu_bias_innov_accel_cov_prior)
-            self.imu_adaptive_noise = AdaptiveIMUNoiseModel(
-                accel_bias_prior=accel_prior,
-                gyro_bias_prior=gyro_prior,
-                forgetting_factor=self.imu_bias_adapt_forgetting,
-            )
 
         # QoS profile for subscriptions (MUST match frontend RELIABLE QoS)
         from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
@@ -441,12 +438,19 @@ class FLBackend(Node):
 
         if self.enable_imu_fusion:
             # Early GPU availability check - fail fast at startup
-            self.get_logger().info("IMU fusion enabled: GPU is required (fail-fast contract).")
             self._check_gpu_availability()
             self._warmup_imu_kernel()
 
     def on_odom(self, msg: Odometry):
-        """Process delta odometry with adjoint covariance transport."""
+        """
+        Process delta odometry using information-geometric covariance weighting.
+        
+        The odom covariance tells us measurement confidence per dimension:
+        - High variance (Z: 1e6) → low precision → minimal update influence
+        - Low variance (XY: 0.001) → high precision → strong update influence
+        
+        This is by-construction correct: no heuristics, just proper fusion.
+        """
         # Duplicate detection: skip if we've already processed this exact message
         odom_key = (msg.header.stamp.sec, msg.header.stamp.nanosec)
         if odom_key == self._last_odom_key:
@@ -457,13 +461,6 @@ class FLBackend(Node):
         self.last_odom_time = time.time()
         # Store odometry message timestamp for trajectory export (NOT wall clock!)
         self.last_odom_stamp = stamp_to_sec(msg.header.stamp)
-        
-        # Log first few odom messages for debugging
-        if self.odom_count <= 3:
-            self.get_logger().info(
-                f"Backend received odom #{self.odom_count}, "
-                f"delta=({msg.pose.pose.position.x:.3f}, {msg.pose.pose.position.y:.3f}, {msg.pose.pose.position.z:.3f})"
-            )
         
         # Extract delta (6D pose)
         dx = float(msg.pose.pose.position.x)
@@ -477,6 +474,19 @@ class FLBackend(Node):
         rotvec_delta = quat_to_rotvec(qx, qy, qz, qw)
         
         delta_pose = np.array([dx, dy, dz, rotvec_delta[0], rotvec_delta[1], rotvec_delta[2]], dtype=float)
+        
+        # Extract odom measurement covariance (6x6)
+        # This encodes per-dimension confidence: Z has ~1e6 variance = garbage
+        odom_cov = np.array(msg.pose.covariance, dtype=float).reshape(6, 6)
+        
+        # Log first few messages with covariance info
+        if self.odom_count <= 3:
+            diag_var = np.diag(odom_cov)
+            self.get_logger().info(
+                f"Backend received odom #{self.odom_count}, "
+                f"delta=({dx:.3f}, {dy:.3f}, {dz:.3f}), "
+                f"var=[{diag_var[0]:.4f}, {diag_var[1]:.4f}, {diag_var[2]:.1f}]"
+            )
 
         # Get current state
         mu, cov = mean_cov(self.L, self.h)
@@ -489,24 +499,74 @@ class FLBackend(Node):
             
             linearization_point = mu_pose.copy()
             
-            # Compose pose (6D)
+            # Compose pose to get predicted mean (6D)
             mu_pose_pred = se3_compose(mu_pose, delta_pose)
             
-            # Get process noise (15D) - extract 6x6 pose portion for se3_cov_compose
+            # Get process noise (15D)
             Q_full = self.process_noise.estimate()
             Q_pose = Q_full[:6, :6]
             
-            # Transport pose covariance
-            cov_pose = cov[:6, :6]
-            cov_pose_pred = se3_cov_compose(cov_pose, Q_pose, mu_pose)
+            # =====================================================================
+            # Information-geometric covariance fusion
+            # Prior covariance + process noise + measurement covariance
+            # High measurement variance → low precision → minimal influence on result
+            # =====================================================================
+            
+            # Transport prior pose covariance through motion model
+            cov_pose_prior = cov[:6, :6]
+            cov_pose_transported = se3_cov_compose(cov_pose_prior, Q_pose, mu_pose)
+            
+            # Fuse transported prior with measurement covariance
+            # In information form: Λ_fused = Λ_prior + Λ_measurement
+            # Convert to precision, add, convert back
+            # This naturally weights by inverse covariance
+            
+            # Regularize covariances for inversion
+            reg = np.eye(6) * 1e-8
+            cov_transported_reg = cov_pose_transported + reg
+            odom_cov_reg = odom_cov + reg
+            
+            # Compute precisions (information form)
+            try:
+                L_prior = np.linalg.inv(cov_transported_reg)
+                L_meas = np.linalg.inv(odom_cov_reg)
+            except np.linalg.LinAlgError:
+                L_prior = np.linalg.pinv(cov_transported_reg)
+                L_meas = np.linalg.pinv(odom_cov_reg)
+            
+            # Fused precision: Λ = Λ_prior + Λ_measurement
+            # Z: L_prior[2,2] ≈ 1/0.04 ≈ 25, L_meas[2,2] ≈ 1/1e6 ≈ 1e-6
+            # So L_fused[2,2] ≈ 25 → prior dominates, Z barely changes
+            # XY: L_prior[0,0] ≈ 25, L_meas[0,0] ≈ 1/0.001 ≈ 1000
+            # So L_fused[0,0] ≈ 1025 → measurement dominates
+            L_fused = L_prior + L_meas
+            
+            # Information vectors: η = Λμ
+            h_prior = L_prior @ mu_pose  # Prior wants us at old pose
+            h_meas = L_meas @ mu_pose_pred  # Measurement wants us at predicted pose
+            h_fused = h_prior + h_meas
+            
+            # Recover fused mean and covariance
+            try:
+                cov_pose_fused = np.linalg.inv(L_fused)
+            except np.linalg.LinAlgError:
+                cov_pose_fused = np.linalg.pinv(L_fused)
+            mu_pose_fused = cov_pose_fused @ h_fused
+            
+            # Log fusion effect for first few messages
+            if self.odom_count <= 3:
+                delta_from_pred = mu_pose_fused - mu_pose_pred
+                self.get_logger().info(
+                    f"Info fusion #{self.odom_count}: "
+                    f"shift_from_pred=({delta_from_pred[0]*1000:.1f}, {delta_from_pred[1]*1000:.1f}, {delta_from_pred[2]*1000:.1f})mm"
+                )
             
             # Rebuild full 15D state
-            mu_pred = np.concatenate([mu_pose_pred, mu_vel, mu_bias])
+            mu_pred = np.concatenate([mu_pose_fused, mu_vel, mu_bias])
             
             # Rebuild full 15D covariance
-            # Pose block is updated, velocity/bias blocks get process noise
             cov_pred = cov.copy()
-            cov_pred[:6, :6] = cov_pose_pred
+            cov_pred[:6, :6] = cov_pose_fused
             # Add process noise to velocity and bias (diagonal only)
             cov_pred[6:9, 6:9] += Q_full[6:9, 6:9]
             cov_pred[9:12, 9:12] += Q_full[9:12, 9:12]
@@ -517,19 +577,39 @@ class FLBackend(Node):
             if self.prev_mu is not None:
                 prev_pose = self.prev_mu[:6]
                 predicted_from_prev = se3_compose(prev_pose, delta_pose)
-                residual_vec[:6] = se3_relative(mu_pose_pred, predicted_from_prev).astype(float)
+                residual_vec[:6] = se3_relative(mu_pose_fused, predicted_from_prev).astype(float)
                 self.process_noise.update(residual_vec)
             self.prev_mu = mu.copy()
         else:
-            # 6D state: Original behavior
+            # 6D state: Same approach
             linearization_point = mu.copy()
             
-            # Compose pose
-            mu_pred = se3_compose(mu, delta_pose)
+            # Compose pose to get predicted mean
+            mu_pred_raw = se3_compose(mu, delta_pose)
             
-            # Get adaptive process noise and transport covariance
+            # Get adaptive process noise
             Q = self.process_noise.estimate()
-            cov_pred = se3_cov_compose(cov, Q, mu)
+            cov_transported = se3_cov_compose(cov, Q, mu)
+            
+            # Information-geometric fusion with measurement covariance
+            reg = np.eye(6) * 1e-8
+            try:
+                L_prior = np.linalg.inv(cov_transported + reg)
+                L_meas = np.linalg.inv(odom_cov + reg)
+            except np.linalg.LinAlgError:
+                L_prior = np.linalg.pinv(cov_transported + reg)
+                L_meas = np.linalg.pinv(odom_cov + reg)
+            
+            L_fused = L_prior + L_meas
+            h_prior = L_prior @ mu
+            h_meas = L_meas @ mu_pred_raw
+            h_fused = h_prior + h_meas
+            
+            try:
+                cov_pred = np.linalg.inv(L_fused)
+            except np.linalg.LinAlgError:
+                cov_pred = np.linalg.pinv(L_fused)
+            mu_pred = cov_pred @ h_fused
 
             # Residual for process noise adaptation
             residual_vec = np.zeros(6, dtype=float)
@@ -605,7 +685,7 @@ class FLBackend(Node):
         
         L_anchor, h_anchor = make_evidence(mu, cov_scaled)
         self.anchors[anchor_id] = (mu.copy(), cov_scaled.copy(), L_anchor.copy(), h_anchor.copy(), points.copy())
-        # Declared initialization policy: keyframe id maps to anchor id for routing priors.
+        # Map keyframe id to anchor id (keyframe ids align to anchor ids)
         self.keyframe_to_anchor[anchor_id] = anchor_id
         self._publish_anchor_marker(anchor_id, mu)
         
@@ -813,9 +893,28 @@ class FLBackend(Node):
         mu_anchor_pred = se3_compose(mu_current_pose, rel_inv)
         cov_anchor_pred = se3_cov_compose(cov_current_pose, cov_rel_inv, mu_current_pose)
 
-        # Fuse (product-of-experts) in moment space (no natural-parameter weighted sum)
-        mu_pose_new, cov_pose_new = _gaussian_product(mu_current_pose, cov_current_pose, mu_curr_pred, cov_curr_pred)
-        mu_anchor_new, cov_anchor_new = _gaussian_product(mu_anchor_pose, cov_anchor_pose, mu_anchor_pred, cov_anchor_pred)
+        # Trust-scaled fusion in information space (precision scaling)
+        # This keeps conjugacy and uses alpha-divergence to temper large updates.
+        L_curr_prior, h_curr_prior = make_evidence(mu_current_pose, cov_current_pose)
+        L_curr_meas, h_curr_meas = make_evidence(mu_curr_pred, cov_curr_pred)
+        L_anchor_prior, h_anchor_prior = make_evidence(mu_anchor_pose, cov_anchor_pose)
+        L_anchor_meas, h_anchor_meas = make_evidence(mu_anchor_pred, cov_anchor_pred)
+
+        L_curr_fused, h_curr_fused, trust_diag_curr = trust_scaled_fusion(
+            L_curr_prior, h_curr_prior,
+            L_curr_meas, h_curr_meas,
+            max_divergence=MAX_ALPHA_DIVERGENCE_PRIOR,
+            alpha=ALPHA_DIVERGENCE_DEFAULT,
+        )
+        L_anchor_fused, h_anchor_fused, trust_diag_anchor = trust_scaled_fusion(
+            L_anchor_prior, h_anchor_prior,
+            L_anchor_meas, h_anchor_meas,
+            max_divergence=MAX_ALPHA_DIVERGENCE_PRIOR,
+            alpha=ALPHA_DIVERGENCE_DEFAULT,
+        )
+
+        mu_pose_new, cov_pose_new = mean_cov(L_curr_fused, h_curr_fused)
+        mu_anchor_new, cov_anchor_new = mean_cov(L_anchor_fused, h_anchor_fused)
 
         # Embed updated current pose back into full state
         if self.state_dim == constants.STATE_DIM_FULL:
@@ -884,8 +983,14 @@ class FLBackend(Node):
                 "cov_rel_trace": float(np.trace(cov_rel)),
                 "anchor_cov_trace_after": float(np.trace(cov_anchor_new)),
                 "current_cov_trace_after": float(np.trace(cov_updated)),
+                "trust_beta_curr": trust_diag_curr["beta"],
+                "trust_beta_anchor": trust_diag_anchor["beta"],
+                "trust_divergence_full_curr": trust_diag_curr["divergence_full"],
+                "trust_divergence_full_anchor": trust_diag_anchor["divergence_full"],
+                "trust_quality_curr": trust_diag_curr["trust_quality"],
+                "trust_quality_anchor": trust_diag_anchor["trust_quality"],
             },
-            notes="Loop closure via one-shot recomposition (anchor↔current message passing), no Jacobians and no Schur complement.",
+            notes="Loop closure via trust-scaled precision fusion (alpha-divergence).",
         ))
 
         self._publish_loop_marker(int(msg.anchor_id), mu_anchor_new, mu_updated)
@@ -925,10 +1030,8 @@ class FLBackend(Node):
             delta_R = delta_R @ rotvec_to_rotmat(omega)
             accel_corr = accel[idx] - bias_accel
             accel_rot = delta_R @ accel_corr
-            # CRITICAL: Position update uses OLD velocity (tangent-space correct)
-            # This is the Forster preintegration model: predict-then-retract
-            delta_p = delta_p + delta_v * dt + 0.5 * accel_rot * dt * dt
             delta_v = delta_v + accel_rot * dt
+            delta_p = delta_p + delta_v * dt + 0.5 * accel_rot * dt * dt
 
         delta_rotvec = np.array(rotmat_to_rotvec(delta_R), dtype=float)
         return delta_p, delta_v, delta_rotvec
@@ -970,7 +1073,7 @@ class FLBackend(Node):
         - Hellinger-tilted likelihood for robustness
         - Dirichlet routing with Frobenius retention
         """
-        from fl_slam_poc.common.jax_init import jnp
+        import jax.numpy as jnp
         from fl_slam_poc.backend.imu_jax_kernel import imu_batched_projection_kernel
         from fl_slam_poc.backend.dirichlet_routing import DirichletRoutingModule
         
@@ -987,7 +1090,7 @@ class FLBackend(Node):
         keyframe_j = int(msg.keyframe_j)  # Current keyframe
         t_i = float(msg.t_i)
         t_j = float(msg.t_j)
-        dt_header = t_j - t_i
+        dt = max(t_j - t_i, 0.0)
 
         stamps = np.asarray(msg.stamp, dtype=np.float64).reshape(-1)
         accel_raw = np.asarray(msg.accel, dtype=np.float64).reshape(-1)
@@ -1002,16 +1105,6 @@ class FLBackend(Node):
         if accel.shape[0] != stamps.shape[0] or gyro.shape[0] != stamps.shape[0]:
             self.get_logger().warn("IMU segment malformed: stamps/accel/gyro length mismatch")
             return
-
-        dt_stamps = float(stamps[-1] - stamps[0])
-        dt = max(dt_stamps, 0.0)
-        stamp_deltas = np.diff(stamps) if stamps.size > 1 else np.array([], dtype=np.float64)
-        non_monotonic_count = int(np.sum(stamp_deltas <= 0)) if stamp_deltas.size > 0 else 0
-        stamp_delta_min = float(np.min(stamp_deltas)) if stamp_deltas.size > 0 else None
-        stamp_delta_mean = float(np.mean(stamp_deltas)) if stamp_deltas.size > 0 else None
-        stamp_delta_max = float(np.max(stamp_deltas)) if stamp_deltas.size > 0 else None
-        dt_gap_start = float(stamps[0] - t_i)
-        dt_gap_end = float(t_j - stamps[-1])
 
         bias_gyro = np.asarray(msg.bias_ref_bg, dtype=np.float64).reshape(3)
         bias_accel = np.asarray(msg.bias_ref_ba, dtype=np.float64).reshape(3)
@@ -1030,13 +1123,10 @@ class FLBackend(Node):
         delta_p, delta_v, delta_rotvec = self._integrate_raw_imu_segment(
             stamps, accel, gyro, bias_gyro, bias_accel
         )
-        
-        # Apply Frobenius (BCH third-order) correction to preintegrated IMU deltas
-        # This corrects for SE(3) manifold curvature before deltas are used in residuals
+        # Apply Frobenius (BCH third-order) correction in IMU tangent space
         delta_p, delta_v, delta_rotvec, imu_frob_stats = imu_tangent_frobenius_correction(
             delta_p, delta_v, delta_rotvec, cov_preint=R_imu
         )
-        
         z_imu = np.concatenate([delta_p, delta_v, delta_rotvec])
         
         # Debug logging
@@ -1079,7 +1169,6 @@ class FLBackend(Node):
         # Get current state (15D)
         # =====================================================================
         mu_current, cov_current = mean_cov(self.L, self.h)
-        bias_prev = mu_current[9:15].copy()
         
         # =====================================================================
         # Build anchor data for batched processing
@@ -1142,26 +1231,34 @@ class FLBackend(Node):
         elif self._imu_routing_module.n_anchors != M:
             self._imu_routing_module.resize(M)
         
-        # Dense initial logits from Hellinger distances (soft association)
-        hellinger_logit_scale = 10.0  # Tune based on typical Hellinger values
-        initial_logits = -hellinger_logit_scale * (hellinger_distances ** 2)
+        # Enhanced initial logits: use keyframe mapping if available, else Hellinger distance
+        initial_logits = np.zeros(M, dtype=np.float64)
         
-        # Optional bias: Use keyframe_to_anchor mapping if available
+        # Priority 1: Use keyframe_to_anchor mapping if available
         if keyframe_i in self.keyframe_to_anchor:
             mapped_anchor_id = self.keyframe_to_anchor[keyframe_i]
             if mapped_anchor_id in anchor_ids:
                 mapped_idx = anchor_ids.index(mapped_anchor_id)
-                initial_logits[mapped_idx] += 5.0  # Strong prior for mapped anchor
+                initial_logits[mapped_idx] = 5.0  # Strong prior for mapped anchor
                 if self.imu_factor_count <= 3:
                     self.get_logger().info(
                         f"IMU segment: using keyframe mapping kf_{keyframe_i} -> anchor_{mapped_anchor_id}"
                     )
         else:
-            if self.imu_factor_count <= 3 and hellinger_distances.size > 0:
-                min_h_idx = int(np.argmin(hellinger_distances))
+            # Priority 2: Nearest-neighbor with Hellinger distance
+            # Smaller Hellinger distance = better match = higher logit
+            min_h_idx = np.argmin(hellinger_distances)
+            min_h_dist = hellinger_distances[min_h_idx]
+            
+            # Convert Hellinger distance to logit (inverse relationship)
+            # H² ∈ [0, 1], so logit = -λ * H² where λ controls sensitivity
+            hellinger_logit_scale = 10.0  # Tune this based on typical Hellinger values
+            initial_logits[min_h_idx] = -hellinger_logit_scale * (min_h_dist ** 2)
+            
+            if self.imu_factor_count <= 3:
                 self.get_logger().info(
-                    f"IMU segment: dense Hellinger logits (kf_{keyframe_i} -> anchor_{anchor_ids[min_h_idx]}, "
-                    f"H²_min={hellinger_distances[min_h_idx]:.4f})"
+                    f"IMU segment: using Hellinger nearest-neighbor (kf_{keyframe_i} -> anchor_{anchor_ids[min_h_idx]}, "
+                    f"H²={min_h_dist:.4f})"
                 )
         
         routing_weights = self._imu_routing_module.update(initial_logits)
@@ -1217,52 +1314,21 @@ class FLBackend(Node):
             h_j = h_j - L_ji @ L_ii_inv @ h_i
 
         delta_mu, delta_cov = mean_cov(L_j, h_j)
-        
-        # Apply SE(3) tangent-space Frobenius (BCH third-order) correction
-        # This corrects linearization error from manifold curvature before retraction
-        # Per Self-Adaptive Systems Guide: tangent ops + proper retraction
-        delta_mu_corr, frob_stats = se3_tangent_frobenius_correction(
-            delta_mu,
-            state_uncertainty=np.diag(delta_cov) if delta_cov.ndim == 2 else None
-        )
 
-        # Retract delta onto current state (after Frobenius correction)
-        pose_delta = delta_mu_corr[:6]
-        rest_delta = delta_mu_corr[6:]
+        # Retract delta onto current state
+        pose_delta = delta_mu[:6]
+        rest_delta = delta_mu[6:]
         pose_new = se3_compose(mu_current[:6], se3_exp(pose_delta))
         rest_new = mu_current[6:] + rest_delta
         mu_new = np.concatenate([pose_new, rest_new])
         cov_new = delta_cov
 
         # =====================================================================
-        # Apply bias random walk noise (adaptive Wishart intensity)
+        # Apply bias random walk noise (Gaussian random walk prior)
         # =====================================================================
-        bias_curr = mu_new[9:15]
-        bias_innovation = bias_curr - bias_prev
-        bias_rw_cov_adaptive = False
-        bias_rw_cov_trace_gyro = None
-        bias_rw_cov_trace_accel = None
-        noise_params = None
-        if self.imu_adaptive_noise is not None and dt > 0.0:
-            self.imu_adaptive_noise.update_from_bias_innovations(
-                accel_bias_innovations=np.atleast_2d(bias_innovation[3:6]),
-                gyro_bias_innovations=np.atleast_2d(bias_innovation[:3]),
-                dt=dt,
-            )
-            noise_params = self.imu_adaptive_noise.get_current_noise_params()
-            bias_rw_cov_adaptive = True
-            bias_rw_cov_trace_gyro = float(np.trace(noise_params["gyro_bias_cov"]))
-            bias_rw_cov_trace_accel = float(np.trace(noise_params["accel_bias_cov"]))
-
-        if noise_params is None:
-            noise_params = {
-                "gyro_bias_cov": self._imu_bias_innov_gyro_cov_prior,
-                "accel_bias_cov": self._imu_bias_innov_accel_cov_prior,
-            }
-
         Q_bias = np.zeros((6, 6), dtype=np.float64)
-        Q_bias[:3, :3] = noise_params["gyro_bias_cov"] * dt
-        Q_bias[3:6, 3:6] = noise_params["accel_bias_cov"] * dt
+        Q_bias[:3, :3] = np.eye(3) * (self.imu_gyro_random_walk**2) * dt
+        Q_bias[3:6, 3:6] = np.eye(3) * (self.imu_accel_random_walk**2) * dt
         cov_new[9:15, 9:15] += Q_bias
 
         # =====================================================================
@@ -1276,7 +1342,6 @@ class FLBackend(Node):
         # =====================================================================
         routing_diag = self._imu_routing_module.get_update_diagnostics()
         max_resp = float(np.max(routing_weights)) if routing_weights.size > 0 else 0.0
-        bias_update_source = "measurement" if np.linalg.norm(bias_innovation) > 1e-12 else "prior_only"
         
         if self.imu_factor_count <= 5:
             v_new = mu_new[6:9]
@@ -1296,31 +1361,18 @@ class FLBackend(Node):
             family_out="Gaussian",
             closed_form=False,
             frobenius_applied=True,
-            frobenius_operator="gaussian_identity_third_order",
-            frobenius_delta_norm=float(frob_stats["delta_norm"]),
-            frobenius_input_stats=dict(frob_stats["input_stats"]),
-            frobenius_output_stats=dict(frob_stats["output_stats"]),
+            frobenius_operator="imu_tangent_bch_third_order",
+            frobenius_delta_norm=float(imu_frob_stats["delta_norm"]),
+            frobenius_input_stats=dict(imu_frob_stats["input_stats"]),
+            frobenius_output_stats=dict(imu_frob_stats["output_stats"]),
             metrics={
                 "keyframe_i": keyframe_i,
                 "keyframe_j": keyframe_j,
-                "dt_header": float(dt_header),
-                "dt_stamps": float(dt_stamps),
-                "dt_gap_start": float(dt_gap_start),
-                "dt_gap_end": float(dt_gap_end),
-                "stamp_delta_min": stamp_delta_min,
-                "stamp_delta_mean": stamp_delta_mean,
-                "stamp_delta_max": stamp_delta_max,
-                "non_monotonic_count": non_monotonic_count,
                 "dt_sec": dt,
                 "n_measurements": n_measurements,
                 "delta_p_norm_m": float(np.linalg.norm(delta_p)),
                 "delta_v_norm_ms": float(np.linalg.norm(delta_v)),
                 "delta_rot_norm_rad": float(np.linalg.norm(delta_rotvec)),
-                "residual_p_norm": float(np.linalg.norm(delta_p)),
-                "residual_v_norm": float(np.linalg.norm(delta_v)),
-                "residual_rot_norm": float(np.linalg.norm(delta_rotvec)),
-                "integration_order": "v_then_p",
-                "velocity_usage": "updated",
                 "bias_in_model": True,
                 "factor_scope": "two_state",
                 "projection": "e_projection(moment_match)",
@@ -1341,15 +1393,6 @@ class FLBackend(Node):
                 "routing_retention": routing_diag["retention"],
                 "routing_hellinger_shift": routing_diag["hellinger_shift"],
                 "routing_max_resp": max_resp,
-                "bias_update_source": bias_update_source,
-                "bias_anchor_norm": float(np.linalg.norm(bias_ref)),
-                "bias_current_norm": float(np.linalg.norm(bias_curr)),
-                "bias_delta_norm": float(np.linalg.norm(bias_curr - bias_ref)),
-                "bias_innovation_norm": float(np.linalg.norm(bias_innovation)),
-                "bias_random_walk_applied": bool(dt > 0.0),
-                "bias_rw_cov_adaptive": bias_rw_cov_adaptive,
-                "bias_rw_cov_trace_gyro": bias_rw_cov_trace_gyro,
-                "bias_rw_cov_trace_accel": bias_rw_cov_trace_accel,
             },
             notes="IMU two-state factor: joint update + single e-projection + Schur marginalization.",
         ))
@@ -1449,41 +1492,38 @@ class FLBackend(Node):
         out.pose.covariance = cov_pose.reshape(-1).tolist()  # Always 6x6 = 36 elements
         self.pub_state.publish(out)
 
-        # Publish TF: odom -> base_link using the same pose we publish in /cdwm/state
+        # Publish TF: odom -> base_link using the same pose as /cdwm/state
         tf_msg = TransformStamped()
         tf_msg.header = out.header
         tf_msg.child_frame_id = out.child_frame_id
         tf_msg.transform.translation.x = float(mu_pose[0])
         tf_msg.transform.translation.y = float(mu_pose[1])
         tf_msg.transform.translation.z = float(mu_pose[2])
-        tf_msg.transform.rotation.x = float(out.pose.pose.orientation.x)
-        tf_msg.transform.rotation.y = float(out.pose.pose.orientation.y)
-        tf_msg.transform.rotation.z = float(out.pose.pose.orientation.z)
-        tf_msg.transform.rotation.w = float(out.pose.pose.orientation.w)
+        tf_msg.transform.rotation.x = float(qx)
+        tf_msg.transform.rotation.y = float(qy)
+        tf_msg.transform.rotation.z = float(qz)
+        tf_msg.transform.rotation.w = float(qw)
         self.tf_broadcaster.sendTransform(tf_msg)
 
-        # Trajectory path for Foxglove visualization
+        # Trajectory path for visualization
         pose_stamped = PoseStamped()
         pose_stamped.header = out.header
         pose_stamped.pose = out.pose.pose
         self.trajectory_poses.append(pose_stamped)
-        
+
         # Trim trajectory if too long
         if len(self.trajectory_poses) > self.max_path_length:
             self.trajectory_poses = self.trajectory_poses[-self.max_path_length:]
-        
+
         # Publish path
         path = Path()
         path.header = out.header
         path.poses = self.trajectory_poses
         self.pub_path.publish(path)
-        
-        # Export trajectory to file with ODOMETRY timestamp (not wall clock!)
-        # Using odometry msg timestamp ensures proper alignment with ground truth
-        # ONLY write on odom updates (tag=="odom"), not on loop updates
-        # Loop closures are corrections to existing poses, not new trajectory points
+
+        # Export trajectory to file with odometry timestamps for evaluation
         if self.trajectory_file and self.last_odom_stamp is not None and tag == "odom":
-            timestamp = self.last_odom_stamp  # Use odometry message timestamp
+            timestamp = self.last_odom_stamp
             self.trajectory_file.write(
                 f"{timestamp:.6f} {mu_pose[0]:.6f} {mu_pose[1]:.6f} {mu_pose[2]:.6f} "
                 f"{qx:.6f} {qy:.6f} {qz:.6f} {qw:.6f}\n"
@@ -1499,7 +1539,7 @@ class FLBackend(Node):
         the first IMU message arrives.
         """
         try:
-            from fl_slam_poc.common.jax_init import jax
+            import jax
             devices = jax.devices()
             has_gpu = any(d.platform == "gpu" for d in devices)
             
@@ -1532,7 +1572,7 @@ class FLBackend(Node):
     def _warmup_imu_kernel(self):
         """Warm up JAX IMU kernel compilation to avoid first-call latency."""
         try:
-            from fl_slam_poc.common.jax_init import jnp
+            import jax.numpy as jnp
             from fl_slam_poc.backend.imu_jax_kernel import imu_batched_projection_kernel
 
             # Minimal dummy data for warmup

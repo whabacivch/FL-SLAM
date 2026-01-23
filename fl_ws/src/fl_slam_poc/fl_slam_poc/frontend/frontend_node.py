@@ -149,6 +149,7 @@ class Frontend(Node):
         self.declare_parameter("imu_topic", constants.IMU_TOPIC_DEFAULT)
         self.declare_parameter("imu_gyro_noise_density", constants.IMU_GYRO_NOISE_DENSITY_DEFAULT)
         self.declare_parameter("imu_accel_noise_density", constants.IMU_ACCEL_NOISE_DENSITY_DEFAULT)
+        self.declare_parameter("imu_accel_scale", constants.IMU_ACCEL_SCALE_DEFAULT)
         self.declare_parameter("keyframe_translation_threshold", 0.5)
         self.declare_parameter("keyframe_rotation_threshold", 0.26)
         self.declare_parameter("gravity", list(constants.GRAVITY_DEFAULT))
@@ -215,6 +216,7 @@ class Frontend(Node):
             # IMU
             "enable_imu": bool(self.get_parameter("enable_imu").value),
             "imu_topic": str(self.get_parameter("imu_topic").value),
+            "imu_accel_scale": float(self.get_parameter("imu_accel_scale").value),
             # 3D Point Cloud Mode
             "use_3d_pointcloud": bool(self.get_parameter("use_3d_pointcloud").value),
             "enable_pointcloud": bool(self.get_parameter("enable_pointcloud").value),

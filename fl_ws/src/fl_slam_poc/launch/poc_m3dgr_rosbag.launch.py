@@ -66,6 +66,7 @@ def launch_setup(context, *args, **kwargs):
     imu_topic = LaunchConfiguration("imu_topic")
     imu_gyro_noise_density = LaunchConfiguration("imu_gyro_noise_density")
     imu_accel_noise_density = LaunchConfiguration("imu_accel_noise_density")
+    imu_accel_scale = LaunchConfiguration("imu_accel_scale")
     keyframe_translation_threshold = LaunchConfiguration("keyframe_translation_threshold")
     keyframe_rotation_threshold = LaunchConfiguration("keyframe_rotation_threshold")
 
@@ -150,6 +151,7 @@ def launch_setup(context, *args, **kwargs):
                         "imu_topic": imu_topic,
                         "imu_gyro_noise_density": imu_gyro_noise_density,
                         "imu_accel_noise_density": imu_accel_noise_density,
+                        "imu_accel_scale": imu_accel_scale,
                         "keyframe_translation_threshold": keyframe_translation_threshold,
                         "keyframe_rotation_threshold": keyframe_rotation_threshold,
                         "gravity": gravity_value,
@@ -269,6 +271,8 @@ def generate_launch_description():
         # M3DGR (Xsens-class IMU parameters; random-walk terms are intentionally NOT used).
         DeclareLaunchArgument("imu_gyro_noise_density", default_value="1.7e-4"),
         DeclareLaunchArgument("imu_accel_noise_density", default_value="1.9e-4"),
+        # Livox Mid-360 IMU (ICM40609) outputs acceleration in g's, need to scale to m/s².
+        DeclareLaunchArgument("imu_accel_scale", default_value="9.81"),
         DeclareLaunchArgument("keyframe_translation_threshold", default_value="0.5"),
         DeclareLaunchArgument("keyframe_rotation_threshold", default_value="0.26"),
         DeclareLaunchArgument("gravity_x", default_value="0.0"),

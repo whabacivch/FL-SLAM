@@ -112,6 +112,9 @@ class SensorIO:
         self.depth_intrinsics = None
         self._last_msg_keys = {}
         
+        # IMU acceleration scale (Livox outputs in g's, needs *9.81 for m/s²)
+        self.imu_accel_scale = config.get("imu_accel_scale", 9.81)
+        
         # 3D point cloud mode
         self.use_3d_pointcloud = config.get("use_3d_pointcloud", False)
         self.enable_pointcloud = config.get("enable_pointcloud", False)
@@ -591,11 +594,12 @@ class SensorIO:
             return
 
         stamp = stamp_to_sec(msg.header.stamp)
+        # Apply acceleration scale (Livox IMU outputs in g's, need m/s²)
         accel = np.array([
             msg.linear_acceleration.x,
             msg.linear_acceleration.y,
             msg.linear_acceleration.z
-        ], dtype=float)
+        ], dtype=float) * self.imu_accel_scale
         gyro = np.array([
             msg.angular_velocity.x,
             msg.angular_velocity.y,
@@ -605,13 +609,16 @@ class SensorIO:
         self.last_imu_frame_id = msg.header.frame_id
         self.imu_buffer.append((stamp, accel, gyro))
 
-        # Debug: Log first IMU received
+        # Debug: Log first IMU received (show both raw and scaled)
         if not hasattr(self, '_first_imu_logged'):
             self._first_imu_logged = True
+            accel_raw = np.array([msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z])
             self.node.get_logger().info(
                 f"SensorIO: First IMU received, frame_id={msg.header.frame_id}, "
-                f"accel=({accel[0]:.2f}, {accel[1]:.2f}, {accel[2]:.2f}), "
-                f"gyro=({gyro[0]:.4f}, {gyro[1]:.4f}, {gyro[2]:.4f})"
+                f"accel_raw=({accel_raw[0]:.3f}, {accel_raw[1]:.3f}, {accel_raw[2]:.3f}) [g], "
+                f"accel_scaled=({accel[0]:.2f}, {accel[1]:.2f}, {accel[2]:.2f}) [m/s²], "
+                f"gyro=({gyro[0]:.4f}, {gyro[1]:.4f}, {gyro[2]:.4f}) [rad/s], "
+                f"scale={self.imu_accel_scale}"
             )
 
         # Call external callback if set
