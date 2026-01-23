@@ -4,7 +4,7 @@ This module provides validation functions to enforce contracts at module boundar
 detect hardcoded fake values, and catch common bugs early.
 """
 import numpy as np
-from typing import Any, Optional
+from typing import Any
 
 from fl_slam_poc.common.constants import NUMERICAL_EPSILON
 

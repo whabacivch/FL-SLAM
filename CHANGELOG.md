@@ -5,6 +5,52 @@ Project: Frobenius-Legendre SLAM POC (Impact Project_v1)
 This file tracks all significant changes, design decisions, and implementation milestones for the FL-SLAM project.
 
 
+## 2026-01-23: Prospector Lint Cleanup (Phases 1-4) ✅
+
+### Summary
+
+Systematic cleanup of unused imports, dead code removal, and code quality improvements based on prospector static analysis. Also fixed unused variables to be properly utilized.
+
+### Changes
+
+**Phase 1 - Dead Import Removal:**
+- `frontend_node.py`: Removed `time`, `Odometry`, `SensorStatus`, `make_evidence`, `vmf_make_evidence`, `validate_timestamp`
+- `backend_node.py`: Removed `TransformStamped`, `get_state_at_stamp`, `publish_anchor_marker`, `OpReport`, `stamp_to_sec`
+- `dirichlet_router.py`: Removed `jax`, `jit`, `cholesky`, `solve_triangular` (kept only `jnp`)
+- `imu_kernel.py`: Removed unused `se3_minus`
+- `publish.py`: Removed `json`, `Node`, `PointCloud2`, `PointField`, `TransformStamped`
+- `icp.py`: Removed `Tuple`, `skew`
+- `pointcloud_gpu.py`: Removed `Tuple`
+- `vmf.py`: Removed `iv` (kept only `ive` for numerical stability)
+- `status.py`: Removed `Node`
+- `config.py`: Removed `os`
+- `information_distances.py`: Removed `Any`
+- `validation.py`: Removed `Optional`
+- `tools/*.py`: Removed unused `sys`, `Any`, `serialize_message`
+
+**Phase 2 - Trivial Fixes:**
+- Fixed extra trailing newline in `se3_numpy.py`
+- Fixed f-strings without interpolation in `backend_node.py`, `evaluate_slam.py`
+
+**Phase 3 - dtype_map Fix:**
+- `sensor_io.py`: `pointcloud2_to_array()` now uses `dtype_map` to dynamically determine field data types from PointCloud2 metadata instead of hardcoding float32
+
+**Phase 4 - anchor_id Fix:**
+- `publish.py`: `publish_map()` now tracks points per anchor using `anchor_id` and includes per-anchor statistics in log output
+
+**Phase 4 - Encoding Fix:**
+- Added `encoding='utf-8'` to all `open()` calls in `align_ground_truth.py` and `evaluate_slam.py`
+
+### Rationale
+
+Static analysis revealed significant dead code from prior refactoring. Removing unused imports:
+- Reduces cognitive load when reading code
+- Eliminates false import error warnings
+- Documents actual dependencies accurately
+- Improves startup time marginally
+
+The `dtype_map` fix ensures PointCloud2 parsing works correctly with non-float32 data (e.g., float64 or int types), which was a latent bug.
+
 ## 2026-01-23: Rename tb3_odom_bridge → odom_bridge ✅
 
 ### Summary
@@ -85,6 +131,16 @@ Eliminated duplicated helper implementations identified by `docs/DUPLICATION_AUD
 - `fl_ws/src/fl_slam_poc/fl_slam_poc/frontend/sensors/tb3_odom_bridge.py`
 - `fl_ws/src/fl_slam_poc/fl_slam_poc/frontend/frontend_node.py`
   - Refactored to use the shared helpers (no behavior change intended).
+
+## 2026-01-23: Dataflow + Self-Adaptive Compliance Review ✅
+
+### Summary
+
+Added an audit document mapping the current end-to-end runtime dataflow and comparing current behavior against the normative constraints in `docs/Self-Adaptive Systems Guide.md`, highlighting remaining deviations (notably hard-gate factor drops and missing certified-operator contracts).
+
+### Changes
+
+- `docs/DATAFLOW_AND_SELF_ADAPTIVE_COMPLIANCE_2026-01-23.md`
 
 ## 2026-01-23: Canonical Topic/Schema Documentation Hardening ✅
 

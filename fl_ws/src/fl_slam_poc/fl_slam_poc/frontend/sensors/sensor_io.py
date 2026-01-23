@@ -41,27 +41,38 @@ def pointcloud2_to_array(msg: PointCloud2) -> np.ndarray:
 
     Handles common point cloud formats (XYZ, XYZRGB, etc.)
     Returns array of shape (N, 3) containing [x, y, z] coordinates.
+    
+    Dynamically handles field data types (float32, float64, int32, etc.)
+    based on the PointCloud2 field metadata.
     """
-    # Get field offsets
+    # Get field info
     field_names = [f.name for f in msg.fields]
-    field_offsets = {f.name: f.offset for f in msg.fields}
+    field_map = {f.name: f for f in msg.fields}
 
     # Check for XYZ fields
     if 'x' not in field_names or 'y' not in field_names or 'z' not in field_names:
         raise ValueError("PointCloud2 message missing x, y, or z fields")
 
-    # Get data type info
+    # Data type mapping from PointField constants to numpy dtypes
     dtype_map = {
-        PointField.FLOAT32: np.float32,
-        PointField.FLOAT64: np.float64,
-        PointField.INT32: np.int32,
-        PointField.UINT32: np.uint32,
+        PointField.FLOAT32: (np.float32, 4),
+        PointField.FLOAT64: (np.float64, 8),
+        PointField.INT32: (np.int32, 4),
+        PointField.UINT32: (np.uint32, 4),
+        PointField.INT16: (np.int16, 2),
+        PointField.UINT16: (np.uint16, 2),
+        PointField.INT8: (np.int8, 1),
+        PointField.UINT8: (np.uint8, 1),
     }
 
-    # Assume float32 for XYZ (most common)
-    x_offset = field_offsets['x']
-    y_offset = field_offsets['y']
-    z_offset = field_offsets['z']
+    # Get field info for x, y, z
+    x_field = field_map['x']
+    y_field = field_map['y']
+    z_field = field_map['z']
+
+    # Determine dtype (use x field's type, assuming x/y/z have same type)
+    x_dtype_info = dtype_map.get(x_field.datatype, (np.float32, 4))
+    dtype, byte_size = x_dtype_info
 
     point_step = msg.point_step
     n_points = msg.width * msg.height
@@ -69,12 +80,12 @@ def pointcloud2_to_array(msg: PointCloud2) -> np.ndarray:
     if n_points == 0:
         return np.empty((0, 3), dtype=np.float32)
 
-    # Parse raw data
+    # Parse raw data using the correct dtype
     data = np.frombuffer(msg.data, dtype=np.uint8).reshape(-1, point_step)
 
-    x = data[:, x_offset:x_offset+4].view(np.float32).flatten()
-    y = data[:, y_offset:y_offset+4].view(np.float32).flatten()
-    z = data[:, z_offset:z_offset+4].view(np.float32).flatten()
+    x = data[:, x_field.offset:x_field.offset+byte_size].view(dtype).flatten()
+    y = data[:, y_field.offset:y_field.offset+byte_size].view(dtype).flatten()
+    z = data[:, z_field.offset:z_field.offset+byte_size].view(dtype).flatten()
 
     points = np.stack([x, y, z], axis=1)
 

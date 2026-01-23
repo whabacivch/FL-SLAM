@@ -10,7 +10,6 @@ import json
 import time
 from typing import TYPE_CHECKING
 
-from rclpy.node import Node
 from std_msgs.msg import String
 
 if TYPE_CHECKING:

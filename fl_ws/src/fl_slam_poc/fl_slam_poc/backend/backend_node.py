@@ -40,7 +40,7 @@ import numpy as np
 import rclpy
 from rclpy.clock import Clock, ClockType
 import tf2_ros
-from geometry_msgs.msg import PoseStamped, TransformStamped
+from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry, Path
 from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2, PointField
@@ -54,7 +54,6 @@ from fl_slam_poc.backend.factors.odom import process_odom
 from fl_slam_poc.backend.factors.loop import process_loop
 from fl_slam_poc.backend.state import (
     create_anchor,
-    get_state_at_stamp,
     parse_rgbd_evidence,
     process_rgbd_evidence,
 )
@@ -63,16 +62,13 @@ from fl_slam_poc.backend.config import validate_backend_params
 from fl_slam_poc.backend.diagnostics import (
     check_gpu_availability,
     check_status,
-    publish_anchor_marker,
     publish_loop_marker,
     publish_map,
     publish_report,
     publish_state,
     warmup_imu_kernel,
 )
-from fl_slam_poc.common.op_report import OpReport
 from fl_slam_poc.common import constants
-from fl_slam_poc.common.utils import stamp_to_sec
 from fl_slam_poc.common.param_models import BackendParams
 from fl_slam_poc.msg import AnchorCreate, IMUSegment, LoopFactor
 
@@ -221,11 +217,11 @@ class FLBackend(Node):
                 np.array([constants.STATE_PRIOR_ACCEL_BIAS_STD**2] * 3),   # Accel bias [12:15]
             ])
             cov0 = np.diag(cov0_diag)
-            self.get_logger().info(f"Backend: 15D state enabled (pose + velocity + biases)")
+            self.get_logger().info("Backend: 15D state enabled (pose + velocity + biases)")
         else:
             mu0 = np.zeros(6)
             cov0 = np.diag([0.2**2, 0.2**2, 0.2**2, 0.1**2, 0.1**2, 0.1**2])
-            self.get_logger().info(f"Backend: 6D state (pose only, IMU fusion disabled)")
+            self.get_logger().info("Backend: 6D state (pose only, IMU fusion disabled)")
         self.L, self.h = make_evidence(mu0, cov0)
 
         # Adaptive process noise (matches state dimension)

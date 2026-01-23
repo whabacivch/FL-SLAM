@@ -12,7 +12,7 @@ import sys
 def align_timestamps(gt_file, est_file, output_file):
     # Read ground truth
     gt_lines = []
-    with open(gt_file, 'r') as f:
+    with open(gt_file, 'r', encoding='utf-8') as f:
         for line in f:
             if line.startswith('#'):
                 continue
@@ -22,7 +22,7 @@ def align_timestamps(gt_file, est_file, output_file):
     
     # Read estimated trajectory
     est_lines = []
-    with open(est_file, 'r') as f:
+    with open(est_file, 'r', encoding='utf-8') as f:
         for line in f:
             if line.startswith('#'):
                 continue
@@ -39,7 +39,7 @@ def align_timestamps(gt_file, est_file, output_file):
     print(f"Time offset: {time_offset:.6f} seconds")
     
     # Align ground truth timestamps
-    with open(output_file, 'w') as f:
+    with open(output_file, 'w', encoding='utf-8') as f:
         f.write("# timestamp x y z qx qy qz qw\n")
         for gt_line in gt_lines:
             aligned_time = gt_line[0] - time_offset

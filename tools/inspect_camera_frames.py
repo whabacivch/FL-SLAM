@@ -14,7 +14,6 @@ import argparse
 import os
 import random
 import sqlite3
-import sys
 from typing import Any, Callable, Optional
 
 import rclpy

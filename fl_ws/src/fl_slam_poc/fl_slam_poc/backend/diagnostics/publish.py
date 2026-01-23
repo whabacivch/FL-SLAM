@@ -6,15 +6,12 @@ Handles all ROS 2 message publishing for state, map, markers, reports, and traje
 
 from __future__ import annotations
 
-import json
 import struct
 from typing import TYPE_CHECKING
 
 import numpy as np
-from geometry_msgs.msg import Point, PoseStamped, TransformStamped
+from geometry_msgs.msg import Point, PoseStamped
 from nav_msgs.msg import Odometry, Path
-from rclpy.node import Node
-from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -254,16 +251,21 @@ def publish_map(
     
     # Collect all points with colors
     points_with_color = []  # List of (x, y, z, r, g, b)
+    anchor_point_counts = {}  # Track points per anchor for logging
     
     # Layer 1: Sparse anchor point clouds (yellow)
-    for anchor_id, (mu_anchor, cov_anchor, L, h, points) in anchors.items():
+    for anchor_id, (mu_anchor, _, _, _, points) in anchors.items():
         if len(points) == 0:
+            anchor_point_counts[anchor_id] = 0
             continue
         
         # Transform points from anchor frame to global frame
         R = rotvec_to_rotmat(mu_anchor[3:6])
         t = mu_anchor[:3]
         points_transformed = (R @ points.T).T + t
+        
+        # Track points for this anchor
+        anchor_point_counts[anchor_id] = len(points_transformed)
         
         # Yellow color for sparse anchors
         for pt in points_transformed:
@@ -285,7 +287,13 @@ def publish_map(
         backend.get_logger().debug("No points to publish in map")
         return
     
-    backend.get_logger().info(f"Publishing map with {len(points_with_color)} points to /cdwm/map")
+    # Log with anchor breakdown
+    sparse_total = sum(anchor_point_counts.values())
+    backend.get_logger().info(
+        f"Publishing map: {len(points_with_color)} pts total "
+        f"(sparse: {sparse_total} from {len(anchor_point_counts)} anchors, "
+        f"dense: {len(dense_modules)} modules)"
+    )
     
     # Create PointCloud2 message with XYZRGB
     msg = PointCloud2()

@@ -20,9 +20,7 @@ Reference: Compositional Legendre framework, Hellinger hierarchical construction
 from typing import Dict
 
 from fl_slam_poc.common import constants
-from fl_slam_poc.common.jax_init import jax, jnp
-from jax import jit
-from jax.scipy.linalg import cholesky, solve_triangular
+from fl_slam_poc.common.jax_init import jnp
 
 
 # =============================================================================

@@ -20,7 +20,7 @@ Why these replace ad-hoc methods:
 
 import math
 import numpy as np
-from typing import Callable, Sequence, Any
+from typing import Callable, Sequence
 
 
 # =============================================================================

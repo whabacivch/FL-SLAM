@@ -20,7 +20,7 @@ Reference:
 
 import math
 import numpy as np
-from scipy.special import iv, ive  # Modified Bessel I_n
+from scipy.special import ive  # Modified Bessel I_n (exponentially scaled)
 from scipy.optimize import brentq
 from typing import Tuple, List
 

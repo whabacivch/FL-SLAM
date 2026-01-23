@@ -21,7 +21,7 @@ import os
 import sqlite3
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
 import numpy as np
 import rclpy

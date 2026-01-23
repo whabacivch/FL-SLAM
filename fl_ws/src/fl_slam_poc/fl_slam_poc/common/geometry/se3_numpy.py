@@ -494,5 +494,3 @@ def se3_log(T: np.ndarray) -> np.ndarray:
     
     v = V_inv @ t
     return np.concatenate([v, omega])
-
-

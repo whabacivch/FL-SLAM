@@ -25,7 +25,7 @@ from typing import Tuple
 # GPU availability check is deferred to backend_node._check_gpu_availability()
 # to avoid checking at module import time.
 
-from fl_slam_poc.common.geometry.se3_jax import so3_exp, so3_log, se3_plus, se3_minus
+from fl_slam_poc.common.geometry.se3_jax import so3_exp, so3_log, se3_plus
 from fl_slam_poc.common.constants import (
     COV_REGULARIZATION_MIN as COV_REGULARIZATION,
     MIN_MIXTURE_WEIGHT,

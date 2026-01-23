@@ -38,7 +38,7 @@ def load_trajectory(file_path):
 def load_op_reports(file_path):
     """Load OpReport JSON lines (strict)."""
     reports = []
-    with open(file_path, "r") as f:
+    with open(file_path, "r", encoding="utf-8") as f:
         for idx, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
@@ -174,7 +174,7 @@ def validate_trajectory(traj: trajectory.PoseTrajectory3D, name: str):
     dups = np.sum(diffs == 0)
     if dups > 0:
         print(f"    WARNING: {dups} duplicate timestamps ({100*dups/len(timestamps):.1f}%)")
-        print(f"    FAILED: Timestamps must be strictly monotonic (no duplicates)")
+        print("    FAILED: Timestamps must be strictly monotonic (no duplicates)")
         valid = False
     
     # Check coordinate ranges
@@ -195,7 +195,7 @@ def validate_trajectory(traj: trajectory.PoseTrajectory3D, name: str):
     print(f"    Avg rate: {len(timestamps)/max(duration,0.001):.1f} Hz")
     
     if valid:
-        print(f"    Status: VALID")
+        print("    Status: VALID")
         return
     raise ValueError(f"{name} trajectory validation failed.")
 
@@ -457,7 +457,7 @@ def plot_pose_graph(est_traj, output_path):
 
 def save_metrics_txt(ate_trans, ate_rot, rpe_results, output_path):
     """Save metrics in human-readable text format."""
-    with open(output_path, 'w') as f:
+    with open(output_path, 'w', encoding='utf-8') as f:
         f.write("FL-SLAM Evaluation Metrics\n")
         f.write("=" * 60 + "\n\n")
         
@@ -497,7 +497,7 @@ def save_metrics_txt(ate_trans, ate_rot, rpe_results, output_path):
 
 def save_metrics_csv(ate_trans, ate_rot, rpe_results, output_path):
     """Save all metrics to CSV for spreadsheet analysis."""
-    with open(output_path, 'w') as f:
+    with open(output_path, 'w', encoding='utf-8') as f:
         f.write("Metric,Type,Scale,RMSE,Mean,Median,Std,Min,Max\n")
         
         # ATE Translation
@@ -573,13 +573,13 @@ def main(gt_file, est_file, output_dir, op_report_path, require_imu=True):
     ate_trans, ate_rot, gt_aligned, est_aligned = compute_ate_full(gt_traj, est_traj)
     
     ate_t_stats = ate_trans.get_all_statistics()
-    print(f"   Translation ATE:")
+    print("   Translation ATE:")
     print(f"     RMSE: {ate_t_stats['rmse']:.4f} m")
     print(f"     Mean: {ate_t_stats['mean']:.4f} m")
     print(f"     Max:  {ate_t_stats['max']:.4f} m")
     
     ate_r_stats = ate_rot.get_all_statistics()
-    print(f"   Rotation ATE:")
+    print("   Rotation ATE:")
     print(f"     RMSE: {ate_r_stats['rmse']:.4f} deg")
     print(f"     Mean: {ate_r_stats['mean']:.4f} deg")
     print(f"     Max:  {ate_r_stats['max']:.4f} deg")
@@ -612,7 +612,7 @@ def main(gt_file, est_file, output_dir, op_report_path, require_imu=True):
     print("=" * 60)
     
     # Summary
-    print(f"\nSUMMARY:")
+    print("\nSUMMARY:")
     print(f"  ATE Translation RMSE: {ate_t_stats['rmse']:.4f} m")
     print(f"  ATE Rotation RMSE:    {ate_r_stats['rmse']:.4f} deg")
     if '1m' in rpe_results:

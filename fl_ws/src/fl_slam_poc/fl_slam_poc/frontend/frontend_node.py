@@ -29,24 +29,20 @@ Reference: Miyamoto et al. (2024), Combe (2022-2025), Barfoot (2017)
 """
 
 import json
-import time
 from typing import Optional
 
 import numpy as np
 import rclpy
-from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import LaserScan, PointCloud2
 from std_msgs.msg import String
 
 # Import modular helpers (orchestration only, call operators/models)
-from fl_slam_poc.frontend import SensorIO, StatusMonitor, SensorStatus
+from fl_slam_poc.frontend import SensorIO, StatusMonitor
 from fl_slam_poc.frontend import DescriptorBuilder, AnchorManager
 from fl_slam_poc.frontend import LoopProcessor
 from fl_slam_poc.backend import AdaptiveParameter, TimeAlignmentModel, StochasticBirthModel
-from fl_slam_poc.backend.fusion.gaussian_info import make_evidence
-from fl_slam_poc.common.geometry.vmf import vmf_make_evidence
 from fl_slam_poc.common import constants
 from fl_slam_poc.common.op_report import OpReport
 from fl_slam_poc.common.param_models import FrontendParams
@@ -54,7 +50,6 @@ from fl_slam_poc.common.geometry.se3_numpy import rotmat_to_quat, rotvec_to_rotm
 from fl_slam_poc.common.utils import stamp_to_sec
 from fl_slam_poc.common.validation import (
     ContractViolation,
-    validate_timestamp,
     detect_hardcoded_value,
 )
 from fl_slam_poc.msg import AnchorCreate, LoopFactor, IMUSegment

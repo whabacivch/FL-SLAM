@@ -3,7 +3,7 @@
 Inspect M3DGR /odom messages to determine if wheel-only or IMU-fused.
 """
 import rclpy
-from rclpy.serialization import serialize_message, deserialize_message
+from rclpy.serialization import deserialize_message
 from nav_msgs.msg import Odometry
 import sqlite3
 import numpy as np
