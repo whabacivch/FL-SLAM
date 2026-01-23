@@ -22,11 +22,24 @@ DEPTH_STRIDE_DEFAULT = 4  # Process every 4th pixel (balance speed vs density)
 # Epsilon for weight/probability comparisons
 WEIGHT_EPSILON = 1e-12  # Weights below this are considered zero
 
+# Numerical floor for responsibility normalization (domain projection, not gating)
+# When total responsibility mass is below this, use uniform to prevent division by zero.
+RESPONSIBILITY_MASS_FLOOR = 1e-12
+
 # Epsilon for covariance regularization
-COV_REGULARIZATION_MIN = 1e-9  # Minimum eigenvalue for positive definiteness
+# Standardized to 1e-8 for consistency across JAX kernels and NumPy code
+COV_REGULARIZATION_MIN = 1e-8  # Minimum eigenvalue for positive definiteness
 
 # Epsilon for numerical comparisons
 NUMERICAL_EPSILON = 1e-6  # General numerical tolerance
+
+# Epsilon for timestamp/temporal comparisons (seconds)
+# Used to determine if alignment is significant
+TIMESTAMP_EPSILON = 1e-9
+
+# Epsilon for Dirichlet parameter domain projection (alpha > EPS)
+# Stricter than general numerical epsilon to ensure interior of simplex
+DIRICHLET_INTERIOR_EPS = 1e-9
 
 # =============================================================================
 # Sensor Timeout Constants
@@ -45,8 +58,35 @@ SENSOR_STARTUP_GRACE_PERIOD = 10.0
 # Maximum length for feature/sensor data buffers
 FEATURE_BUFFER_MAX_LENGTH = 10
 
-# Maximum length for state history buffer
+# Maximum length for state history buffer (timestamp alignment window)
 STATE_BUFFER_MAX_LENGTH = 500
+
+# =============================================================================
+# Compute Budget Constants (Declared, not heuristic)
+# =============================================================================
+
+# RGB-D association scale prior (meters) for dense module fusion.
+# Interpreted as the typical spatial deviation between RGB-D evidence and its
+# anchor; used as the Gaussian distance scale in soft association (NOT a gate).
+DENSE_ASSOCIATION_RADIUS_DEFAULT = 0.5
+
+# Prior weight for creating a new dense module (new-component responsibility).
+# Interpreted as a prior mass (ESS) in the association mixture.
+DENSE_NEW_COMPONENT_WEIGHT_PRIOR = 1.0
+
+# Dense module compute budget (max modules retained)
+DENSE_MODULE_COMPUTE_BUDGET = 10000
+
+# Dense module culling fraction (budgeted recomposition)
+DENSE_MODULE_KEEP_FRACTION = 0.8
+
+# Pending factor buffer budgets (pre-anchor arrival buffering)
+LOOP_PENDING_BUFFER_BUDGET = 100
+IMU_PENDING_BUFFER_BUDGET = 100
+
+# Base module mass prior (ESS) used for atlas modules.
+# Represents the prior count before evidence fusion.
+MODULE_MASS_PRIOR = 1.0
 
 # Maximum trajectory path length for visualization
 TRAJECTORY_PATH_MAX_LENGTH = 1000
@@ -72,6 +112,16 @@ ICP_N_REF_DEFAULT = 100.0
 
 # ICP MSE sigma for quality weighting
 ICP_SIGMA_MSE_DEFAULT = 0.01
+
+# ICP covariance scales (prior ratios for translation/rotation).
+# These encode the prior relative scale of translational vs rotational residuals
+# in se(3) tangent space for typical ICP residual statistics.
+ICP_COV_TRANS_SCALE = 1.0
+ICP_COV_ROT_SCALE = 0.01
+
+# ICP covariance for degenerate cases (no valid points)
+# Prior scale used when no valid points are available (domain projection).
+ICP_COVARIANCE_PRIOR_DEGENERATE = 1.0
 
 # =============================================================================
 # Descriptor Constants
@@ -156,16 +206,6 @@ INIT_POS_COV = 0.2**2
 INIT_ROT_COV = 0.1**2
 
 # =============================================================================
-# Loop Closure Constants
-# =============================================================================
-
-# Minimum responsibility for creating an anchor
-ANCHOR_RESPONSIBILITY_MIN = 0.1
-
-# Minimum responsibility for publishing a loop factor
-LOOP_RESPONSIBILITY_MIN = 0.1
-
-# =============================================================================
 # Debug/Logging Constants
 # =============================================================================
 
@@ -226,6 +266,23 @@ POINTCLOUD_QUEUE_SIZE = 2
 POINTCLOUD_RATE_LIMIT_HZ = 30.0
 
 # =============================================================================
+# QoS (Quality of Service) Constants
+# =============================================================================
+
+# QoS depth for high-frequency sensor topics (IMU at 200Hz)
+QOS_DEPTH_SENSOR_HIGH_FREQ = 500  # ~2.5s buffer at 200Hz
+
+# QoS depth for medium-frequency topics (odom, LiDAR at ~20Hz)
+QOS_DEPTH_SENSOR_MED_FREQ = 100  # ~5s buffer at 20Hz
+
+# QoS depth for low-frequency topics (TF, state)
+QOS_DEPTH_LOW_FREQ = 100
+
+# Default QoS reliability for IMU (BEST_EFFORT for rosbag compatibility)
+# Options: "reliable", "best_effort", "system_default"
+QOS_IMU_RELIABILITY_DEFAULT = "best_effort"
+
+# =============================================================================
 # IMU Constants
 # =============================================================================
 
@@ -237,8 +294,7 @@ POINTCLOUD_RATE_LIMIT_HZ = 30.0
 IMU_GYRO_NOISE_DENSITY_DEFAULT = 1.7e-4     # rad/s/sqrt(Hz)
 IMU_ACCEL_NOISE_DENSITY_DEFAULT = 1.9e-4    # m/s^2/sqrt(Hz)
 
-# Legacy (deprecated): random-walk parameters are intentionally NOT used in the MVP pipeline.
-# Kept only for backward compatibility in standalone utilities/tests.
+# NOTE: Random-walk parameters are not used in the MVP pipeline (adaptive process noise instead).
 IMU_GYRO_RANDOM_WALK_DEFAULT = 1.0e-5       # rad/s^2/sqrt(Hz)
 IMU_ACCEL_RANDOM_WALK_DEFAULT = 1.0e-4      # m/s^3/sqrt(Hz)
 
@@ -289,6 +345,29 @@ STATE_DIM_VELOCITY = 3  # [vx, vy, vz]
 STATE_DIM_BIAS = 6      # [bg_x, bg_y, bg_z, ba_x, ba_y, ba_z]
 STATE_DIM_FULL = 15     # Pose + Velocity + Bias
 
-# IMU preintegration ordering (legacy IMUFactor.msg)
+# IMU preintegration ordering (Contract B)
 # Covariance is 9x9 in basis [delta_p(3), delta_v(3), delta_theta(3)]
 IMU_FACTOR_COV_DIM = 9
+
+# =============================================================================
+# IMU Routing Constants (Dirichlet Prior Parameters)
+# =============================================================================
+
+# Prior logit strength for known keyframe-to-anchor mapping.
+# Statistical interpretation: log-odds ratio for deterministic mapping vs uniform prior.
+# Equivalent to prior effective sample size ≈ exp(5.0)/sum(exp(logits)) ≈ 148 pseudo-observations.
+IMU_ROUTING_MAPPED_LOGIT = 5.0
+
+# Spatial scale parameter for distance-based logit prior (meters).
+# exp(-λ·d) gives Gaussian-like decay with scale √(1/λ); λ=2.0 → scale ≈ 0.7m.
+IMU_ROUTING_DISTANCE_SCALE = 2.0
+
+# =============================================================================
+# JAX Kernel Constants
+# =============================================================================
+
+# Minimum mixture weight to consider valid (prevents division by zero)
+MIN_MIXTURE_WEIGHT = 1e-15
+
+# Hellinger tilt weight for robustness to outliers
+HELLINGER_TILT_WEIGHT = 2.0

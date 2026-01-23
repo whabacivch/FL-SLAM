@@ -1,0 +1,102 @@
+# Config Manifest - Declares required features and dependencies for FL-SLAM datasets
+#
+# This file documents the expected configuration for each supported dataset.
+# It can be used at startup to validate that the config matches expectations.
+#
+# Schema:
+#   <dataset_name>:
+#     required_features:     List of node features that MUST be enabled
+#     optional_features:     List of features that enhance but aren't required
+#     required_topics:
+#       inputs:              Topics the system expects to receive from the bag
+#       internal:            Topics produced by utility nodes, consumed by frontend/backend
+#       outputs:             Topics produced by the system
+#     qos_requirements:      QoS settings that must match between publishers/subscribers
+#     launch_file:           The recommended launch file for this dataset
+#     notes:                 Any special considerations
+
+m3dgr:
+  description: "Multi-sensor Ground Robot 3D Dataset with Livox MID-360 LiDAR"
+  launch_file: "poc_m3dgr_rosbag.launch.py"
+  
+  required_features:
+    - livox_converter       # Converts CustomMsg → PointCloud2
+    - tb3_odom_bridge       # Converts absolute odom → delta odom
+    - frontend_node         # Processes sensors, creates anchors/loops
+    - backend_node          # State estimation and fusion
+  
+  optional_features:
+    - imu_fusion            # 15D state extension (enable_imu=true)
+    - image_decompress_cpp  # RGB-D image decompression
+    - publish_rgbd_evidence # Dense RGB-D evidence publishing
+  
+  required_topics:
+    inputs:
+      # From rosbag
+      - /odom                              # nav_msgs/Odometry (absolute)
+      - /livox/mid360/lidar                # livox_ros_driver2/CustomMsg
+      - /livox/mid360/imu                  # sensor_msgs/Imu (if imu_fusion enabled)
+      - /camera/color/image_raw/compressed        # sensor_msgs/CompressedImage (optional)
+      - /camera/aligned_depth_to_color/image_raw/compressedDepth  # (optional)
+    
+    internal:
+      # Produced by utility nodes, consumed by frontend/backend
+      - /sim/odom            # tb3_odom_bridge output (delta odom)
+      - /lidar/points        # livox_converter output (PointCloud2)
+      - /camera/image_raw    # image_decompress_cpp output (optional)
+      - /camera/depth/image_raw  # image_decompress_cpp output (optional)
+    
+    outputs:
+      # Frontend → Backend
+      - /sim/anchor_create   # fl_slam_poc/AnchorCreate
+      - /sim/loop_factor     # fl_slam_poc/LoopFactor
+      - /sim/imu_segment     # fl_slam_poc/IMUSegment (if imu_fusion enabled)
+      - /sim/rgbd_evidence   # std_msgs/String JSON (if publish_rgbd_evidence)
+      
+      # Backend outputs
+      - /cdwm/state          # nav_msgs/Odometry (posterior)
+      - /cdwm/trajectory     # nav_msgs/Path
+      - /cdwm/map            # sensor_msgs/PointCloud2
+      - /cdwm/backend_status # std_msgs/String (JSON)
+      - /cdwm/frontend_status # std_msgs/String (JSON)
+      - /cdwm/op_report      # std_msgs/String (JSON OpReports)
+  
+  qos_requirements:
+    # QoS must match between publishers and subscribers
+    /sim/odom:
+      reliability: reliable
+      depth: 100
+    /sim/anchor_create:
+      reliability: reliable
+      depth: 100
+    /sim/loop_factor:
+      reliability: reliable
+      depth: 100
+    /sim/imu_segment:
+      reliability: reliable
+      depth: 100
+    /livox/mid360/imu:
+      reliability: best_effort  # IMU uses best_effort for high rate
+      depth: 500
+  
+  notes:
+    - "M3DGR bags do NOT include /tf or /tf_static - extrinsics must be provided as parameters"
+    - "M3DGR bags do NOT include CameraInfo - intrinsics must be provided as parameters"
+    - "Livox MID-360 IMU outputs acceleration in g's - imu_accel_scale=9.81 is required"
+    - "The Livox CustomMsg format requires livox_converter to produce PointCloud2"
+
+# Placeholder for future datasets
+# turtlebot3:
+#   description: "TurtleBot3 dataset with LaserScan"
+#   launch_file: "poc_tb3_rosbag.launch.py"  # Not yet implemented
+#   status: "planned"
+#   notes:
+#     - "Support planned for future work"
+
+# r2b:
+#   description: "NVIDIA ROS2 Benchmark dataset"
+#   launch_file: "poc_r2b_rosbag.launch.py"  # Not yet implemented
+#   status: "planned"
+#   notes:
+#     - "Support planned for future work"
+#     - "This dataset has RealSense D455 with PointCloud2 directly"

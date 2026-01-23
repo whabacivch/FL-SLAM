@@ -169,7 +169,6 @@ graph TB
 **Shared Utilities (`common/`):**
 - `se3.py` - SE(3) transformation operations
 - `dirichlet_geom.py` - Dirichlet distribution geometry
-- `imu_preintegration.py` - IMU preintegration operators
 - `op_report.py` - Operation reporting (exactness, approximations, Frobenius corrections)
 
 ---
@@ -214,7 +213,6 @@ fl_ws/src/fl_slam_poc/
 │   ├── common/                # Shared utilities (pure Python, no ROS)
 │   │   ├── se3.py             # SE(3) operations
 │   │   ├── dirichlet_geom.py  # Dirichlet geometry
-│   │   ├── imu_preintegration.py # IMU preintegration
 │   │   ├── op_report.py       # Operation reporting
 │   │   └── constants.py       # Constants
 │   │
@@ -227,7 +225,6 @@ fl_ws/src/fl_slam_poc/
 │   └── poc_m3dgr_rosbag.launch.py  # M3DGR rosbag launch file
 │
 └── test/                      # Unit tests
-    ├── test_imu_preintegration.py
     ├── test_imu_fusion_contract_b.py
     ├── test_pointcloud_3d.py
     ├── test_rotation_conversions.py

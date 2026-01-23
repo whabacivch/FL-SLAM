@@ -1,10 +1,13 @@
+import os
+from typing import List
+
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction, TimerAction
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
-from typing import List
 
 
 def launch_setup(context, *args, **kwargs):
@@ -30,6 +33,9 @@ def launch_setup(context, *args, **kwargs):
     enable_frontend = LaunchConfiguration("enable_frontend")
     enable_backend = LaunchConfiguration("enable_backend")
     enable_odom_bridge = LaunchConfiguration("enable_odom_bridge")
+
+    config_base = LaunchConfiguration("config_base")
+    config_preset = LaunchConfiguration("config_preset")
 
     enable_livox_convert = LaunchConfiguration("enable_livox_convert")
     livox_input_topic = LaunchConfiguration("livox_input_topic")
@@ -60,6 +66,7 @@ def launch_setup(context, *args, **kwargs):
     camera_cy = LaunchConfiguration("camera_cy")
 
     sensor_qos_reliability = LaunchConfiguration("sensor_qos_reliability")
+    imu_qos_reliability = LaunchConfiguration("imu_qos_reliability")
 
     # IMU Integration
     enable_imu = LaunchConfiguration("enable_imu")
@@ -78,13 +85,15 @@ def launch_setup(context, *args, **kwargs):
                 name="livox_converter",
                 output="screen",
                 parameters=[
+                    config_base,
+                    config_preset,
                     {
                         "use_sim_time": use_sim_time,
                         "input_topic": livox_input_topic,
                         "input_msg_type": livox_input_msg_type,
                         "output_topic": pointcloud_topic,
                         "frame_id": pointcloud_frame_id,
-                    }
+                    },
                 ],
                 condition=IfCondition(enable_livox_convert),
             ),
@@ -96,6 +105,8 @@ def launch_setup(context, *args, **kwargs):
                 name="image_decompress_cpp",
                 output="screen",
                 parameters=[
+                    config_base,
+                    config_preset,
                     {
                         "use_sim_time": use_sim_time,
                         "rgb_compressed_topic": rgb_compressed_topic,
@@ -104,7 +115,7 @@ def launch_setup(context, *args, **kwargs):
                         "depth_output_topic": depth_topic,
                         "depth_scale_mm_to_m": True,
                         "qos_reliability": sensor_qos_reliability,
-                    }
+                    },
                 ],
                 condition=IfCondition(enable_decompress_cpp),
             ),
@@ -116,37 +127,29 @@ def launch_setup(context, *args, **kwargs):
                 name="fl_frontend",
                 output="screen",
                 parameters=[
+                    config_base,
+                    config_preset,
                     {
                         "use_sim_time": use_sim_time,
-                        # CRITICAL FIX: Frontend must use delta odom from odom bridge
-                        "odom_is_delta": True,  # Changed from False
-                        "odom_topic": "/sim/odom",  # Changed from odom_topic (/odom)
+                        "odom_topic": "/sim/odom",
                         "odom_frame": odom_frame,
                         "base_frame": base_frame,
-
-                        "use_3d_pointcloud": True,
-                        "enable_pointcloud": True,
                         "pointcloud_topic": pointcloud_topic,
-
                         "enable_image": enable_image,
                         "enable_depth": enable_depth,
                         "enable_camera_info": enable_camera_info,
                         "camera_topic": camera_topic,
                         "depth_topic": depth_topic,
                         "camera_info_topic": camera_info_topic,
-
                         "publish_rgbd_evidence": publish_rgbd_evidence,
                         "rgbd_evidence_topic": rgbd_evidence_topic,
                         "camera_fx": camera_fx,
                         "camera_fy": camera_fy,
                         "camera_cx": camera_cx,
                         "camera_cy": camera_cy,
-
                         "sensor_qos_reliability": sensor_qos_reliability,
-                        # Optional no-TF LiDAR extrinsic
+                        "imu_qos_reliability": imu_qos_reliability,
                         "lidar_base_extrinsic": lidar_base_extrinsic,
-
-                        # IMU Integration
                         "enable_imu": enable_imu,
                         "imu_topic": imu_topic,
                         "imu_gyro_noise_density": imu_gyro_noise_density,
@@ -155,10 +158,7 @@ def launch_setup(context, *args, **kwargs):
                         "keyframe_translation_threshold": keyframe_translation_threshold,
                         "keyframe_rotation_threshold": keyframe_rotation_threshold,
                         "gravity": gravity_value,
-
-                        # Reduced birth intensity to prevent too many anchors diluting responsibilities
-                        "birth_intensity": 5.0,
-                    }
+                    },
                 ],
                 condition=IfCondition(enable_frontend),
             ),
@@ -170,6 +170,8 @@ def launch_setup(context, *args, **kwargs):
                 name="tb3_odom_bridge",
                 output="screen",
                 parameters=[
+                    config_base,
+                    config_preset,
                     {
                         "use_sim_time": use_sim_time,
                         "input_topic": odom_topic,
@@ -179,7 +181,7 @@ def launch_setup(context, *args, **kwargs):
                         # Use "reliable" to avoid race condition with dual subscriptions
                         "qos_reliability": "reliable",
                         "validate_frames": False,  # Disable frame validation for rosbag compatibility
-                    }
+                    },
                 ],
                 condition=IfCondition(enable_odom_bridge),
             ),
@@ -197,16 +199,16 @@ def launch_setup(context, *args, **kwargs):
                     "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
                 },
                 parameters=[
+                    config_base,
+                    config_preset,
                     {
                         "use_sim_time": use_sim_time,
                         "odom_frame": odom_frame,
                         "rgbd_evidence_topic": rgbd_evidence_topic,
                         "trajectory_export_path": "/tmp/fl_slam_trajectory.tum",
-
-                        # IMU Integration parameters
                         "enable_imu_fusion": enable_imu,
                         "gravity": gravity_value,
-                    }
+                    },
                 ],
                 condition=IfCondition(enable_backend),
             ),
@@ -226,6 +228,9 @@ def launch_setup(context, *args, **kwargs):
 
 
 def generate_launch_description():
+    pkg_share = get_package_share_directory("fl_slam_poc")
+    config_base_default = os.path.join(pkg_share, "config", "fl_slam_poc_base.yaml")
+    config_preset_default = os.path.join(pkg_share, "config", "presets", "m3dgr.yaml")
     return LaunchDescription([
         # Declare all launch arguments first
         DeclareLaunchArgument("use_sim_time", default_value="true"),
@@ -235,6 +240,8 @@ def generate_launch_description():
         DeclareLaunchArgument("enable_frontend", default_value="true"),
         DeclareLaunchArgument("enable_backend", default_value="true"),
         DeclareLaunchArgument("enable_odom_bridge", default_value="true"),
+        DeclareLaunchArgument("config_base", default_value=config_base_default),
+        DeclareLaunchArgument("config_preset", default_value=config_preset_default),
         DeclareLaunchArgument("enable_livox_convert", default_value="true"),
         DeclareLaunchArgument("livox_input_topic", default_value="/livox/mid360/lidar"),
         DeclareLaunchArgument("pointcloud_topic", default_value="/lidar/points"),
@@ -265,6 +272,7 @@ def generate_launch_description():
         DeclareLaunchArgument("camera_cx", default_value="326.35"),
         DeclareLaunchArgument("camera_cy", default_value="244.68"),
         DeclareLaunchArgument("sensor_qos_reliability", default_value="reliable"),
+        DeclareLaunchArgument("imu_qos_reliability", default_value="best_effort"),
         DeclareLaunchArgument("enable_imu", default_value="true"),
         # M3DGR: primary IMU topic should be Livox MID-360 IMU.
         DeclareLaunchArgument("imu_topic", default_value="/livox/mid360/imu"),
@@ -277,7 +285,7 @@ def generate_launch_description():
         DeclareLaunchArgument("keyframe_rotation_threshold", default_value="0.26"),
         DeclareLaunchArgument("gravity_x", default_value="0.0"),
         DeclareLaunchArgument("gravity_y", default_value="0.0"),
-        DeclareLaunchArgument("gravity_z", default_value="-9.8051"),
+        DeclareLaunchArgument("gravity_z", default_value="-9.81"),
         # Use OpaqueFunction to evaluate context and create nodes
         OpaqueFunction(function=launch_setup),
     ])

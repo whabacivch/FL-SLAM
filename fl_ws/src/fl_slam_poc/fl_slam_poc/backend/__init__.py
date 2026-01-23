@@ -4,9 +4,9 @@ Backend package for FL-SLAM.
 Information-geometric fusion and state estimation.
 
 Subpackages (flattened):
-- gaussian_info/gaussian_geom/information_distances
+- fusion/gaussian_info/gaussian_geom/information_distances
 - adaptive/birth/nig/process_noise/timestamp/weights
-- dirichlet_routing
+- routing/dirichlet_router
 """
 
 from __future__ import annotations
@@ -14,17 +14,18 @@ from __future__ import annotations
 from importlib import import_module
 from typing import Any
 
-from fl_slam_poc.backend.adaptive import AdaptiveParameter, OnlineStats
-from fl_slam_poc.backend.timestamp import TimeAlignmentModel
-from fl_slam_poc.backend.birth import StochasticBirthModel
-from fl_slam_poc.backend.process_noise import AdaptiveProcessNoise, AdaptiveIMUNoiseModel, WishartPrior
-from fl_slam_poc.backend.nig import (
+from fl_slam_poc.backend.models import (
+    AdaptiveParameter,
+    OnlineStats,
+    TimeAlignmentModel,
+    StochasticBirthModel,
+    AdaptiveProcessNoise,
     NIGModel,
     NIG_PRIOR_KAPPA,
     NIG_PRIOR_ALPHA,
     NIG_PRIOR_BETA,
 )
-from fl_slam_poc.backend.weights import combine_independent_weights
+from fl_slam_poc.backend.fusion import combine_independent_weights
 
 __all__ = [
     # Parameters
@@ -33,8 +34,6 @@ __all__ = [
     "TimeAlignmentModel",
     "StochasticBirthModel",
     "AdaptiveProcessNoise",
-    "AdaptiveIMUNoiseModel",
-    "WishartPrior",
     "NIGModel",
     "NIG_PRIOR_KAPPA",
     "NIG_PRIOR_ALPHA",
@@ -45,7 +44,7 @@ __all__ = [
 ]
 
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
-    "DirichletRoutingModule": ("fl_slam_poc.backend.dirichlet_routing", "DirichletRoutingModule"),
+    "DirichletRoutingModule": ("fl_slam_poc.backend.routing.dirichlet_router", "DirichletRoutingModule"),
 }
 
 

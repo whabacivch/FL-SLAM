@@ -53,8 +53,10 @@ If you want a weaker check (anchors-only), run:
 ## Launch Entry Point
 
 Rosbag launch file:
-- MVP: `fl_ws/src/fl_slam_poc/launch/poc_m3dgr_rosbag.launch.py`
-- Alternative (Phase 2): `phase2/fl_ws/src/fl_slam_poc/launch/poc_tb3_rosbag.launch.py`
+- **MVP**: `fl_ws/src/fl_slam_poc/launch/poc_m3dgr_rosbag.launch.py`
+
+> **Note:** Alternative dataset launch files (TurtleBot3, r2b) are planned for future work.
+> Currently, only the M3DGR pipeline is fully supported.
 
 ## Troubleshooting
 

@@ -1,0 +1,69 @@
+# Pre-commit configuration for FL-SLAM POC
+# Install: pip install pre-commit && pre-commit install
+# Run manually: pre-commit run --all-files
+
+repos:
+  # General hooks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^(archive/|fl_ws/build/|fl_ws/install/|fl_ws/log/)
+      - id: end-of-file-fixer
+        exclude: ^(archive/|fl_ws/build/|fl_ws/install/|fl_ws/log/)
+      - id: check-yaml
+        args: [--unsafe]  # Allow custom YAML tags (ROS uses them)
+        exclude: ^(archive/|fl_ws/build/|fl_ws/install/|fl_ws/log/)
+      - id: check-added-large-files
+        args: [--maxkb=1000]
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: debug-statements
+        exclude: ^(archive/|fl_ws/build/|fl_ws/install/|fl_ws/log/)
+
+  # Python code formatting with Black
+  - repo: https://github.com/psf/black
+    rev: 24.2.0
+    hooks:
+      - id: black
+        language_version: python3
+        exclude: ^(archive/|fl_ws/build/|fl_ws/install/|fl_ws/log/)
+
+  # Python linting and import sorting with Ruff
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.2.2
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+        exclude: ^(archive/|fl_ws/build/|fl_ws/install/|fl_ws/log/)
+      - id: ruff-format
+        exclude: ^(archive/|fl_ws/build/|fl_ws/install/|fl_ws/log/)
+
+  # Type checking with mypy (optional, can be slow)
+  # Uncomment to enable:
+  # - repo: https://github.com/pre-commit/mirrors-mypy
+  #   rev: v1.8.0
+  #   hooks:
+  #     - id: mypy
+  #       additional_dependencies: [types-PyYAML, pydantic]
+  #       exclude: ^(archive/|fl_ws/build/|fl_ws/install/|fl_ws/log/)
+  #       args: [--ignore-missing-imports]
+
+  # Markdown formatting
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: v0.39.0
+    hooks:
+      - id: markdownlint
+        args: [--fix, --disable, MD013, MD033, MD041, --]
+        exclude: ^(archive/|fl_ws/build/|fl_ws/install/|fl_ws/log/|CHANGELOG\.md)
+
+# CI configuration
+ci:
+  autofix_commit_msg: |
+    [pre-commit.ci] auto fixes from pre-commit hooks
+  autofix_prs: true
+  autoupdate_branch: ''
+  autoupdate_commit_msg: '[pre-commit.ci] pre-commit autoupdate'
+  autoupdate_schedule: weekly
+  skip: []
+  submodules: false

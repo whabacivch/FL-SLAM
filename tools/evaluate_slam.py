@@ -14,7 +14,7 @@ Compares estimated trajectory against ground truth using:
 
 Uses evo library for standard SLAM metrics.
 """
-import sys
+import argparse
 import os
 from pathlib import Path
 import matplotlib
@@ -36,45 +36,112 @@ def load_trajectory(file_path):
 
 
 def load_op_reports(file_path):
-    """Load OpReport JSON lines."""
+    """Load OpReport JSON lines (strict)."""
     reports = []
     with open(file_path, "r") as f:
-        for line in f:
+        for idx, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
-                continue
+                raise ValueError(f"Empty OpReport line at {idx} (expected JSON object).")
             try:
                 reports.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid OpReport JSON at line {idx}: {exc}") from exc
+    if not reports:
+        raise ValueError(f"No OpReports found in {file_path}.")
     return reports
 
 
 def validate_op_reports(op_report_path, require_imu=True):
-    """Validate IMU and Frobenius diagnostic signals from OpReports."""
+    """Validate OpReports for runtime health and audit compliance."""
     if not op_report_path or not os.path.exists(op_report_path):
-        if require_imu:
-            raise FileNotFoundError(f"OpReport file not found: {op_report_path}")
-        print("  WARNING: OpReport file missing, skipping IMU/Frobenius checks.")
-        return
+        raise FileNotFoundError(f"OpReport file not found: {op_report_path}")
 
     reports = load_op_reports(op_report_path)
-    imu_reports = [r for r in reports if r.get("name") == "IMUFactorUpdate"]
-    if require_imu and not imu_reports:
-        raise ValueError("No IMUFactorUpdate OpReports found (IMU may not be running).")
+
+    required_reports = [
+        "GaussianPredictSE3",
+        "AnchorCreate",
+        "LoopFactorPublished",
+        "LoopFactorRecomposition",
+    ]
+    if require_imu:
+        required_reports.append("IMUFactorUpdate")
+
+    forbidden_reports = [
+        "PointCloudTransformMissing",
+        "PointCloudExtrinsicInvalid",
+        "PointCloudConversionFailed",
+        "ScanPointsMissing",
+        "LoopFactorUnavailable",
+        "DenseModuleKeepFractionProjection",
+    ]
+
+    warning_reports = [
+        "ICPEvidenceUnavailable",
+        "LoopResponsibilityDomainProjection",
+        "DenseAssociationDomainProjection",
+        "LoopBudgetProjection",
+        "AnchorBudgetProjection",
+    ]
+
+    required_metrics = {
+        "GaussianPredictSE3": ["state_dim", "linearization_point", "process_noise_trace"],
+        "AnchorCreate": ["anchor_id", "dt_sec", "timestamp_weight"],
+        "LoopFactorPublished": ["anchor_id", "weight", "mse", "iterations", "converged", "point_source"],
+        "LoopFactorRecomposition": ["anchor_id", "weight", "innovation_norm"],
+        "IMUFactorUpdate": [
+            "dt_header",
+            "dt_stamps",
+            "dt_gap_start",
+            "dt_gap_end",
+            "bias_rw_cov_adaptive",
+            "bias_rw_cov_trace_gyro",
+            "bias_rw_cov_trace_accel",
+        ],
+    }
 
     def _require_keys(obj, keys, label):
         missing = [k for k in keys if k not in obj or obj[k] is None]
         if missing:
             raise ValueError(f"Missing {label} keys: {missing}")
 
-    for report in imu_reports:
-        _require_keys(report, ["frobenius_applied", "frobenius_operator", "frobenius_delta_norm"], "frobenius")
-        metrics = report.get("metrics", {})
-        _require_keys(metrics, ["dt_header", "dt_stamps", "dt_gap_start", "dt_gap_end"], "timebase")
-        _require_keys(metrics, ["bias_rw_cov_adaptive", "bias_rw_cov_trace_gyro", "bias_rw_cov_trace_accel"], "adaptive_bias")
+    # Base schema validation
+    for report in reports:
+        _require_keys(
+            report,
+            ["name", "exact", "approximation_triggers", "family_in", "family_out",
+             "closed_form", "domain_projection", "metrics", "timestamp"],
+            "op_report",
+        )
 
-    print(f"  OpReport checks passed: {len(imu_reports)} IMUFactorUpdate entries.")
+    # Required report presence
+    for name in required_reports:
+        if not any(r.get("name") == name for r in reports):
+            raise ValueError(f"Missing required OpReport: {name}")
+
+    # Required metric keys
+    for report in reports:
+        name = report.get("name")
+        if name in required_metrics:
+            metrics = report.get("metrics", {})
+            _require_keys(metrics, required_metrics[name], f"{name}.metrics")
+
+    # Forbidden report detection
+    forbidden_hits = [r for r in reports if r.get("name") in forbidden_reports]
+    if forbidden_hits:
+        names = sorted({r.get("name") for r in forbidden_hits})
+        raise ValueError(f"Forbidden OpReports present: {names}")
+
+    # Warning summary
+    warning_hits = [r for r in reports if r.get("name") in warning_reports]
+    if warning_hits:
+        counts = {}
+        for r in warning_hits:
+            counts[r.get("name")] = counts.get(r.get("name"), 0) + 1
+        print(f"  WARNING: Degraded OpReports detected: {counts}")
+
+    print(f"  OpReport checks passed: {len(reports)} total reports.")
 
 
 def validate_trajectory(traj, name):
@@ -129,10 +196,8 @@ def validate_trajectory(traj, name):
     
     if valid:
         print(f"    Status: VALID")
-    else:
-        print(f"    Status: ISSUES DETECTED (see warnings above)")
-    
-    return valid
+        return
+    raise ValueError(f"{name} trajectory validation failed.")
 
 
 def compute_ate_full(gt_traj, est_traj):
@@ -304,12 +369,14 @@ def plot_trajectory_heatmap(gt_traj, est_traj, ate_metric, output_path):
     print(f"  Error heatmap saved: {output_path}")
 
 
-def plot_error_over_time(ate_metric, output_path):
+def plot_error_over_time(ate_metric, timestamps, output_path):
     """Plot translation error over time + histogram."""
     errors = ate_metric.error
-    
-    # Create time axis matching the error array length
-    timestamps = np.arange(len(errors)) * 0.025  # Approximate time spacing
+    timestamps = np.asarray(timestamps)
+    if timestamps.shape[0] != errors.shape[0]:
+        n = min(timestamps.shape[0], errors.shape[0])
+        timestamps = timestamps[:n]
+        errors = errors[:n]
     
     fig, axes = plt.subplots(2, 1, figsize=(12, 8))
     
@@ -476,7 +543,7 @@ def save_metrics_csv(ate_trans, ate_rot, rpe_results, output_path):
     print(f"  Metrics (csv) saved: {output_path}")
 
 
-def main(gt_file, est_file, output_dir, op_report_path=None):
+def main(gt_file, est_file, output_dir, op_report_path, require_imu=True):
     """Run full evaluation pipeline."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -494,22 +561,15 @@ def main(gt_file, est_file, output_dir, op_report_path=None):
     
     # Validate trajectories
     print("\n2. Validating trajectories...")
-    gt_valid = validate_trajectory(gt_traj, "Ground Truth")
-    est_valid = validate_trajectory(est_traj, "Estimated")
-    
-    if not est_valid:
-        print("\n   WARNING: Estimated trajectory has issues - results may be unreliable!")
+    validate_trajectory(gt_traj, "Ground Truth")
+    validate_trajectory(est_traj, "Estimated")
     
     # OpReport validation (IMU + Frobenius diagnostics)
-    if op_report_path:
-        print("\n3. Validating OpReports (IMU + Frobenius)...")
-        validate_op_reports(op_report_path, require_imu=True)
-    else:
-        print("\n3. OpReport validation skipped (no op_report.jsonl provided)")
+    print("\n3. Validating OpReports (runtime health + audit)...")
+    validate_op_reports(op_report_path, require_imu=require_imu)
 
     # Compute ATE (translation + rotation)
-    step_num = 4 if op_report_path else 3
-    print(f"\n{step_num}. Computing Absolute Trajectory Error (ATE)...")
+    print("\n4. Computing Absolute Trajectory Error (ATE)...")
     ate_trans, ate_rot, gt_aligned, est_aligned = compute_ate_full(gt_traj, est_traj)
     
     ate_t_stats = ate_trans.get_all_statistics()
@@ -525,8 +585,7 @@ def main(gt_file, est_file, output_dir, op_report_path=None):
     print(f"     Max:  {ate_r_stats['max']:.4f} deg")
     
     # Compute multi-scale RPE
-    step_num = 5 if op_report_path else 4
-    print(f"\n{step_num}. Computing Relative Pose Error (RPE) at multiple scales...")
+    print("\n5. Computing Relative Pose Error (RPE) at multiple scales...")
     rpe_results = compute_rpe_multi_scale(gt_traj, est_traj)
     
     for scale, rpe_dict in rpe_results.items():
@@ -537,16 +596,14 @@ def main(gt_file, est_file, output_dir, op_report_path=None):
         print(f"     Rotation RMSE:    {rpe_r_stats['rmse']:.4f} deg/{scale}")
     
     # Generate plots
-    step_num = 6 if op_report_path else 5
-    print(f"\n{step_num}. Generating plots...")
+    print("\n6. Generating plots...")
     plot_trajectories(gt_aligned, est_aligned, output_dir / "trajectory_comparison.png")
     plot_trajectory_heatmap(gt_aligned, est_aligned, ate_trans, output_dir / "trajectory_heatmap.png")
-    plot_error_over_time(ate_trans, output_dir / "error_analysis.png")
+    plot_error_over_time(ate_trans, est_aligned.timestamps, output_dir / "error_analysis.png")
     plot_pose_graph(est_aligned, output_dir / "pose_graph.png")
     
     # Save metrics
-    step_num = 7 if op_report_path else 6
-    print(f"\n{step_num}. Saving metrics...")
+    print("\n7. Saving metrics...")
     save_metrics_txt(ate_trans, ate_rot, rpe_results, output_dir / "metrics.txt")
     save_metrics_csv(ate_trans, ate_rot, rpe_results, output_dir / "metrics.csv")
     
@@ -565,8 +622,18 @@ def main(gt_file, est_file, output_dir, op_report_path=None):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) not in (4, 5):
-        print("Usage: evaluate_slam.py <ground_truth.tum> <estimated.tum> <output_dir> [op_report.jsonl]")
-        sys.exit(1)
-    op_report_path = sys.argv[4] if len(sys.argv) == 5 else None
-    main(sys.argv[1], sys.argv[2], sys.argv[3], op_report_path)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("ground_truth", help="Aligned ground truth TUM file")
+    ap.add_argument("estimated", help="Estimated TUM file")
+    ap.add_argument("output_dir", help="Output directory")
+    ap.add_argument("op_report", help="OpReport JSONL file")
+    ap.add_argument("--no-imu", action="store_true", help="Disable IMU OpReport requirements")
+    args = ap.parse_args()
+
+    main(
+        args.ground_truth,
+        args.estimated,
+        args.output_dir,
+        args.op_report,
+        require_imu=not args.no_imu,
+    )

@@ -123,17 +123,14 @@ Everything that produces interval factors (wheel odom, IMU) should be scheduled 
 
 **Invariants preserved:** Pure I/O layer, no math/inference in `SensorIO`; buffering only, no gating.
 
-#### 1.2 IMU Preintegration Operator ✅ COMPLETED
-
-**Files:**
-- `fl_ws/src/fl_slam_poc/fl_slam_poc/common/imu_preintegration.py` (moved from `operators/` during flattening)
+#### 1.2 IMU Preintegration Operator ✅ COMPLETED (Removed)
 
 **Implementation Status:**
-- ✅ `IMUPreintegrator` class exists for preintegration utilities
-- ✅ Used in Contract B architecture: raw IMU segments published, backend re-integrates in-kernel
+- ✅ Contract B architecture uses raw IMU segments; backend re-integrates in-kernel
+- ✅ Preintegration utilities removed to avoid conflicting sources of truth
 - ✅ Reference: Forster et al., "On-Manifold Preintegration for Real-Time Visual-Inertial Odometry" (TRO 2017)
 
-**Note**: Contract B architecture uses raw IMU segments rather than preintegrated factors. Preintegration utilities remain available for reference/utilities.
+**Note**: Preintegration utilities were removed from the repo to prevent duplicate IMU integration paths.
 
 #### 1.3 IMU Segment Message ✅ COMPLETED
 

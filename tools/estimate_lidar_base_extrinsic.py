@@ -43,8 +43,8 @@ from rclpy.serialization import deserialize_message
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 
-from fl_slam_poc.common.se3 import quat_to_rotvec, rotvec_to_rotmat, rotmat_to_rotvec, se3_compose, se3_inverse
-from fl_slam_poc.frontend.icp import icp_3d
+from fl_slam_poc.common.geometry.se3_numpy import quat_to_rotvec, rotvec_to_rotmat, rotmat_to_rotvec, se3_compose, se3_inverse
+from fl_slam_poc.frontend.scan.icp import icp_3d
 
 
 def _resolve_db3_path(bag_path: str) -> str:

@@ -64,10 +64,11 @@ This is **information form addition** (exact, closed-form, associative).
   - `vmf_make_evidence()`, `vmf_mean_param()`: Parameter conversions
 
 ### Multi-Modal Fusion Operators
-- **File (Phase 2)**: `phase2/fl_ws/src/fl_slam_poc/fl_slam_poc/backend/fusion/multimodal_fusion.py`
+- **File**: `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/fusion/gaussian_info.py` (core operators)
 - **Functions**:
-  - `laser_2d_to_3d_constraint()`: Lift laser 2D to 3D with weak Z prior
-  - `fuse_laser_rgbd()`: Exact information form fusion
+  - `fuse_info()`: Exact information form fusion (additive)
+  - `make_evidence()`: Convert moment to information form
+  - `embed_info_form()`: Lift low-dimensional evidence to full state
 
 ### Module Classes
 - **File**: `nodes/fl_backend_node.py`
@@ -132,27 +133,27 @@ cd "/home/will/Documents/Coding/Phantom Fellowship MIT/Impact Project_v1"
 source /opt/ros/jazzy/setup.bash
 source fl_ws/install/setup.bash
 
-## Phase 2 note
-Alternative launch files are stored under `phase2/` and are not installed by the MVP package by default.
-See: `phase2/fl_ws/src/fl_slam_poc/launch/poc_tb3_rosbag.launch.py`
-
-ros2 launch fl_slam_poc poc_tb3_rosbag.launch.py \
-  bag:=rosbags/tb3_slam3d_small_ros2 \
+# MVP launch file (M3DGR dataset with Livox conversion)
+ros2 launch fl_slam_poc poc_m3dgr_rosbag.launch.py \
+  bag:=rosbags/m3dgr/Dynamic01_ros2 \
   play_bag:=true \
   enable_decompress_cpp:=true \
   enable_image:=true \
   enable_depth:=true
 ```
 
-### Without RGB-D (Laser-Only)
+### Without RGB-D (LiDAR-Only)
 ```bash
-ros2 launch fl_slam_poc poc_tb3_rosbag.launch.py \
-  bag:=rosbags/tb3_slam3d_small_ros2 \
+ros2 launch fl_slam_poc poc_m3dgr_rosbag.launch.py \
+  bag:=rosbags/m3dgr/Dynamic01_ros2 \
   play_bag:=true \
   enable_decompress_cpp:=false \
   enable_image:=false \
   enable_depth:=false
 ```
+
+> **Note:** Alternative dataset launch files (TurtleBot3, r2b) are planned for future work.
+> Currently, only the M3DGR pipeline is fully supported via `poc_m3dgr_rosbag.launch.py`.
 
 ## Information Geometry Compliance
 

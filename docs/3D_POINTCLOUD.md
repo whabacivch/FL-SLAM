@@ -86,23 +86,28 @@ Optional (recommended when RGB-D is available): include camera appearance + dept
 
 ## Launch Files
 
-### 3D Rosbag Playback
+### M3DGR 3D Pipeline (MVP)
+
+The M3DGR dataset is the primary supported dataset with full 3D point cloud processing:
 
 ```bash
-# Phase 2 note: this launch file lives under `phase2/` and is not installed by the MVP package by default.
-# See: `phase2/fl_ws/src/fl_slam_poc/launch/poc_3d_rosbag.launch.py`
+# Build and source
+cd fl_ws && colcon build --packages-select fl_slam_poc && source install/setup.bash
+
+# Run with M3DGR rosbag (3D mode enabled by default)
+ros2 launch fl_slam_poc poc_m3dgr_rosbag.launch.py \
+  bag:=rosbags/m3dgr/Dynamic01_ros2 \
+  play_bag:=true
 ```
 
-### Enable 3D in Existing Launch
-
-```bash
-# Phase 2 note: this launch file lives under `phase2/` and is not installed by the MVP package by default.
-# See: `phase2/fl_ws/src/fl_slam_poc/launch/poc_tb3_rosbag.launch.py`
-```
+The launch file automatically:
+- Converts Livox CustomMsg to PointCloud2 via `livox_converter`
+- Enables 3D point cloud processing in the frontend
+- Configures proper LiDAR extrinsics for MID-360
 
 ## Compatible Datasets
 
-### NVIDIA r2b Dataset
+### NVIDIA r2b Dataset (Future Work)
 
 The ROS2 Benchmark dataset contains RealSense D455 data with point clouds:
 
@@ -110,8 +115,8 @@ The ROS2 Benchmark dataset contains RealSense D455 data with point clouds:
 # Download dataset
 ./tools/download_r2b_dataset.sh
 
-# Test with FL-SLAM
-# Phase 2 note: see `phase2/fl_ws/src/fl_slam_poc/launch/poc_3d_rosbag.launch.py`
+# Note: r2b dataset support is planned for future work.
+# Currently requires manual launch configuration.
 ```
 
 ### Custom Rosbags
@@ -252,11 +257,13 @@ pytest src/fl_slam_poc/test/test_pointcloud_3d.py -v
 ### Integration Test
 
 ```bash
-# Download test data
-./tools/download_r2b_dataset.sh
+# Run integration tests with M3DGR (MVP dataset)
+bash tools/run_and_evaluate.sh
 
-# Phase 2 note: the 3D alternative launch file lives under `phase2/` and is not installed by the MVP package.
-# See: `phase2/fl_ws/src/fl_slam_poc/launch/poc_3d_rosbag.launch.py`
+# Or manually test with your own rosbag containing PointCloud2 messages
+ros2 launch fl_slam_poc poc_m3dgr_rosbag.launch.py \
+  bag:=/path/to/your/rosbag \
+  play_bag:=true
 ```
 
 ## Troubleshooting

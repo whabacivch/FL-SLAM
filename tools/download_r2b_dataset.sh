@@ -47,11 +47,12 @@ Dataset Contents:
   - /camera/depth/points         (PointCloud2)
   - /camera/color/camera_info    (Camera intrinsics)
 
-To use with FL-SLAM:
-  ros2 launch fl_slam_poc poc_3d_rosbag.launch.py \
+To use with FL-SLAM (note: may require additional configuration):
+  ros2 launch fl_slam_poc poc_m3dgr_rosbag.launch.py \
     bag:=${DEST_DIR}/r2b_storage \
     play_bag:=true \
-    pointcloud_topic:=/camera/depth/points
+    pointcloud_topic:=/camera/depth/points \
+    enable_livox_convert:=false
 USAGE
   exit 0
 fi
@@ -149,9 +150,10 @@ if [[ -d "${DEST_DIR}/${R2B_DIR_NAME}" ]]; then
   echo "  ros2 bag info ${DEST_DIR}/${R2B_DIR_NAME}"
   echo ""
   echo "To test with FL-SLAM (3D mode):"
-  echo "  ros2 launch fl_slam_poc poc_3d_rosbag.launch.py \\"
+  echo "  ros2 launch fl_slam_poc poc_m3dgr_rosbag.launch.py \\"
   echo "    bag:=${DEST_DIR}/${R2B_DIR_NAME} \\"
-  echo "    play_bag:=true"
+  echo "    play_bag:=true \\"
+  echo "    enable_livox_convert:=false"
   echo ""
 else
   echo "ERROR: Extraction failed or dataset not in expected location."

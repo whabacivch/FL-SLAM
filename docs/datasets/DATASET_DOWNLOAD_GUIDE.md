@@ -175,16 +175,16 @@ bash tools/inspect_rosbag_topics.sh rosbags/newer_college/01_short_experiment.ba
 Once you have Newer College `01_short_experiment`:
 
 ```bash
-# 3D Mode (PointCloud2)
-POINTCLOUD_TOPIC=/os1_cloud_node/points \
-ODOM_TOPIC=/integrated/odom \
-## Phase 2 note
-Alternative launch files are stored under `phase2/` and are not installed by the MVP package by default.
-See: `phase2/fl_ws/src/fl_slam_poc/launch/poc_3d_rosbag.launch.py`
+# Note: Newer College dataset requires custom launch configuration.
+# The MVP launch file (poc_m3dgr_rosbag.launch.py) is configured for M3DGR dataset.
+# For other datasets, you may need to adjust topic names and parameters.
 
-ros2 launch fl_slam_poc poc_3d_rosbag.launch.py play_bag:=true
-
-# Or create a custom launch config
+# Example (adjust topics for your dataset):
+ros2 launch fl_slam_poc poc_m3dgr_rosbag.launch.py \
+  bag:=rosbags/newer_college/01_short_experiment \
+  play_bag:=true \
+  pointcloud_topic:=/os1_cloud_node/points \
+  odom_topic:=/integrated/odom
 ```
 
 ---
@@ -215,14 +215,17 @@ gdown --folder https://drive.google.com/drive/folders/[FOLDER_ID]
 ---
 
 **Next Steps:**
-1. **Download M3DGR `Outdoor01` sequence** (6.1GB, easiest to start)
-   - Rosbag: https://1drv.ms/u/c/2b4bfc0edf421186/EYYRQt8O_EsggCstEAAAAAABZ7QHYpH3MyAxb6aOaAbdcQ?e=qNkjBh
-   - GT: https://1drv.ms/t/c/2b4bfc0edf421186/EYYRQt8O_EsggCtLEAAAAAABkYZk3nHvsmV_KQ1o5-6fdw?e=BfWfty
-   - Save both to: `rosbags/m3dgr/`
-2. Run `bash tools/inspect_rosbag_topics.sh rosbags/m3dgr/Outdoor01.bag`
-3. Configure `poc_3d_rosbag.launch.py` with correct topic names:
-   - `pointcloud_topic=/lidar/points` (PointCloud2)
-   - `odom_topic=/odom`
-4. For M3DGR sequences that publish Livox `CustomMsg` (not PointCloud2), prefer the MVP launch:
-   - `ros2 launch fl_slam_poc poc_m3dgr_rosbag.launch.py` (runs Livox CustomMsg → PointCloud2 conversion to `/lidar/points`)
-   - Phase 2 `poc_3d_rosbag.launch.py` expects a `sensor_msgs/PointCloud2` topic directly
+1. **Download M3DGR `Dynamic01` sequence** (recommended for MVP)
+   - See `docs/datasets/M3DGR_STATUS.md` for download links
+   - Save to: `rosbags/m3dgr/Dynamic01_ros2/`
+2. Run the inspection tool: `python3 tools/inspect_rosbag_deep.py rosbags/m3dgr/Dynamic01_ros2`
+3. Run the MVP pipeline:
+   ```bash
+   ros2 launch fl_slam_poc poc_m3dgr_rosbag.launch.py \
+     bag:=rosbags/m3dgr/Dynamic01_ros2 \
+     play_bag:=true
+   ```
+4. The `poc_m3dgr_rosbag.launch.py` launch file handles:
+   - Livox `CustomMsg` → `PointCloud2` conversion via `livox_converter`
+   - Proper LiDAR extrinsic configuration
+   - 3D point cloud processing enabled by default

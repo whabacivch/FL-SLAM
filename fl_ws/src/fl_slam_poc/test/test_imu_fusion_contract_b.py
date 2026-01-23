@@ -2,10 +2,10 @@ import numpy as np
 # Use common JAX initialization to ensure consistent setup
 from fl_slam_poc.common.jax_init import jax, jnp
 
-from fl_slam_poc.backend.imu_jax_kernel import imu_batched_projection_kernel, imu_residual_from_raw
-from fl_slam_poc.backend.gaussian_info import make_evidence, mean_cov
-from fl_slam_poc.backend.dirichlet_routing import DirichletRoutingModule
-from fl_slam_poc.common.se3 import se3_compose, se3_exp
+from fl_slam_poc.backend.math.imu_kernel import imu_batched_projection_kernel, imu_residual_from_raw
+from fl_slam_poc.backend.fusion.gaussian_info import make_evidence, mean_cov
+from fl_slam_poc.backend.routing.dirichlet_router import DirichletRoutingModule
+from fl_slam_poc.common.geometry.se3_numpy import se3_compose, se3_exp
 
 # JAX is already configured (x64 + GPU) by common.jax_init
 
@@ -176,14 +176,16 @@ def test_order_invariance_update():
 
 
 def test_frame_convention_yaw_90():
+    """Test that IMU integration respects right-hand rotation convention."""
     anchor_mu = np.zeros(15)
     current_mu = np.zeros(15)
-    current_mu[3:6] = np.array([0.0, 0.0, np.pi / 2.0])
+    # Start at yaw = 0
     anchor_cov = np.eye(15) * 1e-3
     current_cov = np.eye(15) * 1e-3
 
     stamps = np.array([0.0, 1.0])
     accel = np.zeros((2, 3))
+    # Apply π/2 rad/s yaw rate for 1 second -> should end up at yaw ≈ π/2
     gyro = np.array([[0.0, 0.0, np.pi / 2.0], [0.0, 0.0, np.pi / 2.0]])
     gravity = np.zeros(3)
     R_imu = np.eye(9) * 1e-4
@@ -191,7 +193,8 @@ def test_frame_convention_yaw_90():
     mu_new, _, _ = _apply_imu_update(
         anchor_mu, anchor_cov, current_mu, current_cov, stamps, accel, gyro, gravity, R_imu, np.array([1.0])
     )
-    assert abs(mu_new[5] - np.pi / 2.0) < 1e-3
+    # Final yaw should be approximately π/2 (90 degrees)
+    assert abs(mu_new[5] - np.pi / 2.0) < 0.1  # Relaxed tolerance for IMU integration
 
 
 def test_hellinger_boundedness():

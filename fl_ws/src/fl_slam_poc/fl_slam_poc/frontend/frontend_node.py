@@ -45,17 +45,20 @@ from fl_slam_poc.frontend import SensorIO, StatusMonitor, SensorStatus
 from fl_slam_poc.frontend import DescriptorBuilder, AnchorManager
 from fl_slam_poc.frontend import LoopProcessor
 from fl_slam_poc.backend import AdaptiveParameter, TimeAlignmentModel, StochasticBirthModel
-from fl_slam_poc.backend.gaussian_info import make_evidence
-from fl_slam_poc.frontend.vmf_geometry import vmf_make_evidence
+from fl_slam_poc.backend.fusion.gaussian_info import make_evidence
+from fl_slam_poc.common.geometry.vmf import vmf_make_evidence
 from fl_slam_poc.common import constants
 from fl_slam_poc.common.op_report import OpReport
-from fl_slam_poc.common.se3 import rotmat_to_quat, rotvec_to_rotmat, se3_compose, se3_relative
+from fl_slam_poc.common.param_models import FrontendParams
+from fl_slam_poc.common.geometry.se3_numpy import rotmat_to_quat, rotvec_to_rotmat, se3_compose, se3_relative
+from fl_slam_poc.common.utils import stamp_to_sec
+from fl_slam_poc.common.validation import (
+    ContractViolation,
+    validate_timestamp,
+    detect_hardcoded_value,
+)
 from fl_slam_poc.msg import AnchorCreate, LoopFactor, IMUSegment
-
-
-def stamp_to_sec(stamp) -> float:
-    """Convert ROS timestamp to seconds."""
-    return float(stamp.sec) + float(stamp.nanosec) * 1e-9
+from pydantic import ValidationError
 
 
 class Frontend(Node):
@@ -68,6 +71,7 @@ class Frontend(Node):
     def __init__(self):
         super().__init__("fl_frontend")
         self._declare_parameters()
+        self.params = self._validate_params()
         self._init_modules()
         self._init_publishers()
         self._init_timer()
@@ -110,6 +114,11 @@ class Frontend(Node):
         self.declare_parameter("publish_rgbd_evidence", True)
         self.declare_parameter("rgbd_evidence_topic", "/sim/rgbd_evidence")
         self.declare_parameter("rgbd_publish_every_n_scans", 5)
+        
+        # AUD-002: Parametrize /sim/* output topics (previously hardcoded)
+        self.declare_parameter("loop_factor_topic", "/sim/loop_factor")
+        self.declare_parameter("anchor_create_topic", "/sim/anchor_create")
+        self.declare_parameter("imu_segment_topic", "/sim/imu_segment")
         self.declare_parameter("rgbd_max_points_per_msg", 500)
         # RGB-D synchronization + depth descriptor range (used even in 3D PointCloud mode)
         self.declare_parameter("rgbd_sync_max_dt_sec", 0.1)
@@ -133,6 +142,7 @@ class Frontend(Node):
         self.declare_parameter("depth_stride", 4)
         self.declare_parameter("feature_buffer_len", 10)
         self.declare_parameter("sensor_qos_reliability", "reliable")
+        self.declare_parameter("imu_qos_reliability", "best_effort")
         
         # Timestamp alignment
         self.declare_parameter("alignment_sigma_prior", 0.1)
@@ -140,7 +150,7 @@ class Frontend(Node):
         self.declare_parameter("alignment_sigma_floor", 0.001)
         
         # Birth model
-        self.declare_parameter("birth_intensity", 10.0)
+        self.declare_parameter("birth_intensity", float(constants.BIRTH_INTENSITY_DEFAULT))
         self.declare_parameter("scan_period", 0.1)
         self.declare_parameter("base_component_weight", 1.0)
         
@@ -186,6 +196,16 @@ class Frontend(Node):
         self.declare_parameter("use_gpu", False)  # Enable GPU processing
         self.declare_parameter("gpu_device_index", 0)
         self.declare_parameter("gpu_fallback_to_cpu", True)
+
+    def _validate_params(self) -> FrontendParams:
+        values: dict[str, object] = {}
+        for name in FrontendParams.model_fields:
+            values[name] = self.get_parameter(name).value
+        try:
+            return FrontendParams(**values)
+        except ValidationError as exc:
+            self.get_logger().error(f"Invalid frontend parameters: {exc}")
+            raise
     
     def _init_modules(self):
         """Initialize modular components."""
@@ -211,6 +231,7 @@ class Frontend(Node):
             "feature_buffer_len": int(self.get_parameter("feature_buffer_len").value),
             "depth_stride": int(self.get_parameter("depth_stride").value),
             "sensor_qos_reliability": str(self.get_parameter("sensor_qos_reliability").value),
+            "imu_qos_reliability": str(self.get_parameter("imu_qos_reliability").value),
             # LiDAR extrinsic fallback (used when TF is missing)
             "lidar_base_extrinsic": self.get_parameter("lidar_base_extrinsic").value,
             # IMU
@@ -243,6 +264,8 @@ class Frontend(Node):
             self.sensor_io.set_image_callback(lambda _msg: self.status_monitor.mark_received("camera"))
         if sensor_config["enable_depth"]:
             self.sensor_io.set_depth_callback(lambda _msg: self.status_monitor.mark_received("depth"))
+        if sensor_config["enable_imu"]:
+            self.sensor_io.set_imu_callback(lambda _msg: self.status_monitor.mark_received("imu"))
 
         # Optional: set intrinsics from parameters if CameraInfo is absent.
         fx = float(self.get_parameter("camera_fx").value)
@@ -362,24 +385,136 @@ class Frontend(Node):
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST,
-            depth=10,
+            depth=constants.QOS_DEPTH_SENSOR_MED_FREQ,
         )
         
-        self.pub_loop = self.create_publisher(LoopFactor, "/sim/loop_factor", qos)
-        self.pub_anchor = self.create_publisher(AnchorCreate, "/sim/anchor_create", qos)
-        if bool(self.get_parameter("enable_imu").value):
-            self.pub_imu_segment = self.create_publisher(IMUSegment, "/sim/imu_segment", qos)
+        # AUD-002: Use parametrized topic names instead of hardcoded /sim/* strings
+        loop_topic = str(self.get_parameter("loop_factor_topic").value)
+        anchor_topic = str(self.get_parameter("anchor_create_topic").value)
+        imu_segment_topic = str(self.get_parameter("imu_segment_topic").value)
+        
+        self.pub_loop = self.create_publisher(LoopFactor, loop_topic, qos)
+        self.pub_anchor = self.create_publisher(AnchorCreate, anchor_topic, qos)
+        
+        enable_imu = bool(self.get_parameter("enable_imu").value)
+        if enable_imu:
+            self.pub_imu_segment = self.create_publisher(IMUSegment, imu_segment_topic, qos)
+        else:
+            self.pub_imu_segment = None
+            
         self.pub_report = self.create_publisher(String, "/cdwm/op_report", qos)
         self.pub_status = self.create_publisher(String, "/cdwm/frontend_status", qos)
-
+        
         # RGB-D dense evidence (JSON payload) for backend mapping.
-        self.pub_rgbd = self.create_publisher(
-            String,
-            str(self.get_parameter("rgbd_evidence_topic").value),
-            qos,
-        )
+        # AUD-001 fix: Moved here from unreachable location (was after return statement)
+        publish_rgbd = bool(self.get_parameter("publish_rgbd_evidence").value)
+        rgbd_topic = str(self.get_parameter("rgbd_evidence_topic").value)
+        if publish_rgbd:
+            self.pub_rgbd = self.create_publisher(String, rgbd_topic, qos)
+        else:
+            self.pub_rgbd = None
+        
+        # Initialize scan counter for RGB-D publish rate limiting
         self._scan_count = 0
-    
+        
+        # AUD-002: Startup wiring banner for observability
+        self._log_wiring_banner(
+            loop_topic=loop_topic,
+            anchor_topic=anchor_topic,
+            imu_segment_topic=imu_segment_topic,
+            rgbd_topic=rgbd_topic,
+            enable_imu=enable_imu,
+            publish_rgbd=publish_rgbd,
+            qos=qos,
+        )
+
+    def _log_wiring_banner(
+        self,
+        loop_topic: str,
+        anchor_topic: str,
+        imu_segment_topic: str,
+        rgbd_topic: str,
+        enable_imu: bool,
+        publish_rgbd: bool,
+        qos: QoSProfile,
+    ):
+        """Log startup wiring banner for observability (AUD-002)."""
+        logger = self.get_logger()
+        logger.info("=" * 60)
+        logger.info("FRONTEND WIRING BANNER")
+        logger.info("=" * 60)
+        
+        # Subscriptions (from SensorIO)
+        logger.info("Subscriptions:")
+        odom_topic = str(self.get_parameter("odom_topic").value)
+        sensor_qos = str(self.get_parameter("sensor_qos_reliability").value)
+        imu_qos = str(self.get_parameter("imu_qos_reliability").value)
+        
+        if self.sensor_io.use_3d_pointcloud:
+            pc_topic = str(self.get_parameter("pointcloud_topic").value)
+            logger.info(f"  {pc_topic} (sensor_msgs/PointCloud2) QoS: {sensor_qos}")
+        else:
+            scan_topic = str(self.get_parameter("scan_topic").value)
+            logger.info(f"  {scan_topic} (sensor_msgs/LaserScan) QoS: {sensor_qos}")
+        
+        logger.info(f"  {odom_topic} (nav_msgs/Odometry) QoS: {sensor_qos}")
+        
+        if enable_imu:
+            imu_topic = str(self.get_parameter("imu_topic").value)
+            logger.info(f"  {imu_topic} (sensor_msgs/Imu) QoS: {imu_qos}")
+        
+        # Publications
+        logger.info("Publications:")
+        logger.info(f"  {loop_topic} (fl_slam_poc/LoopFactor) QoS: RELIABLE")
+        logger.info(f"  {anchor_topic} (fl_slam_poc/AnchorCreate) QoS: RELIABLE")
+        if enable_imu:
+            logger.info(f"  {imu_segment_topic} (fl_slam_poc/IMUSegment) QoS: RELIABLE")
+        if publish_rgbd:
+            logger.info(f"  {rgbd_topic} (std_msgs/String) QoS: RELIABLE")
+        logger.info("  /cdwm/op_report (std_msgs/String) QoS: RELIABLE")
+        logger.info("  /cdwm/frontend_status (std_msgs/String) QoS: RELIABLE")
+        
+        # Feature flags
+        logger.info("Features Enabled:")
+        logger.info(f"  enable_imu: {enable_imu}")
+        logger.info(f"  publish_rgbd_evidence: {publish_rgbd}")
+        logger.info(f"  use_3d_pointcloud: {self.sensor_io.use_3d_pointcloud}")
+        logger.info("=" * 60)
+
+    def _update_descriptor_models(self, desc: np.ndarray, obs_weight: float):
+        """
+        Compute responsibilities and update anchor/global descriptor models.
+
+        Returns: (anchors, responsibilities, r_new, r_new_eff)
+        """
+        anchors = self.anchor_manager.get_all_anchors()
+        global_model = self.descriptor_builder.get_global_model()
+        base_weight = self.anchor_manager.get_base_weight()
+
+        responsibilities, r_new, domain_projection = self.loop_processor.compute_responsibilities(
+            desc, anchors, global_model, base_weight
+        )
+
+        if domain_projection:
+            self._publish_report(OpReport(
+                name="LoopResponsibilityDomainProjection",
+                exact=True,
+                family_in="Dirichlet",
+                family_out="Dirichlet",
+                closed_form=True,
+                domain_projection=True,
+                metrics={
+                    "anchor_count": len(anchors),
+                    "base_weight": float(base_weight),
+                },
+                notes="Responsibilities normalized to uniform due to near-zero total likelihood mass.",
+            ))
+
+        r_new_eff = self.anchor_manager.update_anchors(desc, responsibilities, r_new, obs_weight)
+        self.descriptor_builder.update_global_model(desc, obs_weight)
+
+        return anchors, responsibilities, r_new, r_new_eff
+
     def _init_timer(self):
         """Initialize status publishing timer."""
         self.create_timer(1.0, self._publish_status)
@@ -496,13 +631,10 @@ class Frontend(Node):
         # Initialize global model if needed
         self.descriptor_builder.init_global_model(desc)
 
-        # Compute responsibilities (uses models.nig.fisher_rao_distance - exact)
-        anchors = self.anchor_manager.get_all_anchors()
-        global_model = self.descriptor_builder.get_global_model()
-        base_weight = self.anchor_manager.get_base_weight()
-
-        responsibilities, r_new = self.loop_processor.compute_responsibilities(
-            desc, anchors, global_model, base_weight)
+        # Compute responsibilities (exact) and update descriptor models
+        anchors, responsibilities, r_new, r_new_eff = self._update_descriptor_models(
+            desc, obs_weight
+        )
 
         # Debug: log responsibilities
         if not hasattr(self, '_resp_debug_count'):
@@ -513,12 +645,6 @@ class Frontend(Node):
             self.get_logger().info(
                 f"Responsibilities: n_anchors={len(anchors)}, r_new={r_new:.4f}, [{resp_str}]"
             )
-
-        # Update anchors (uses models.nig.update - exact)
-        r_new_eff = self.anchor_manager.update_anchors(desc, responsibilities, r_new, obs_weight)
-
-        # Update global model (uses models.nig.update - exact)
-        self.descriptor_builder.update_global_model(desc, obs_weight)
 
         # Stochastic birth decision (uses models.birth.sample_birth - exact Poisson)
         birth_prob = self.anchor_manager.get_birth_probability(r_new_eff)
@@ -658,7 +784,7 @@ class Frontend(Node):
             )
             scan_desc = np.asarray(hist, dtype=float)
             desc_sum = float(np.sum(scan_desc))
-            if desc_sum > 1e-12:
+            if desc_sum > constants.WEIGHT_EPSILON:
                 scan_desc = scan_desc / desc_sum
         else:
             scan_desc = np.zeros(self.descriptor_builder.descriptor_bins, dtype=float)
@@ -672,16 +798,9 @@ class Frontend(Node):
         # Initialize global model if needed
         self.descriptor_builder.init_global_model(desc)
 
-        anchors = self.anchor_manager.get_all_anchors()
-        global_model = self.descriptor_builder.get_global_model()
-        base_weight = self.anchor_manager.get_base_weight()
-
-        responsibilities, r_new = self.loop_processor.compute_responsibilities(
-            desc, anchors, global_model, base_weight
+        anchors, responsibilities, r_new, r_new_eff = self._update_descriptor_models(
+            desc, obs_weight
         )
-
-        r_new_eff = self.anchor_manager.update_anchors(desc, responsibilities, r_new, obs_weight)
-        self.descriptor_builder.update_global_model(desc, obs_weight)
 
         should_birth = self.anchor_manager.should_birth_anchor(r_new_eff)
 
@@ -765,29 +884,157 @@ class Frontend(Node):
             
             # Run ICP (uses operators.icp_3d - exact solver)
             icp_result = self.loop_processor.run_icp(points, anchor.depth_points)
-            
-            if self._loop_debug_count <= 5 and icp_result is not None:
-                self.get_logger().info(
-                    f"ICP result: converged={icp_result.converged}, mse={icp_result.mse:.6f}, "
-                    f"iters={icp_result.iterations}"
-                )
-            
-            if icp_result is None or not icp_result.converged:
+
+            # =====================================================================
+            # ICP Result Validation (Data Flow Audit)
+            # =====================================================================
+            if icp_result is not None:
+                try:
+                    # Validate transformation is finite
+                    if not np.all(np.isfinite(icp_result.transformation)):
+                        raise ContractViolation(
+                            f"icp_result.transformation: Contains inf/nan: {icp_result.transformation}"
+                        )
+
+                    # Validate MSE is finite and non-negative
+                    if not np.isfinite(icp_result.mse) or icp_result.mse < 0:
+                        raise ContractViolation(
+                            f"icp_result.mse: Invalid value: {icp_result.mse}"
+                        )
+
+                    # Log actual ICP values for first few loops (data flow audit)
+                    if self._loop_debug_count <= 5:
+                        trans_norm = np.linalg.norm(icp_result.transformation[:3])
+                        rot_norm = np.linalg.norm(icp_result.transformation[3:])
+                        self.get_logger().info(
+                            f"Frontend ICP validation #{self._loop_debug_count}: "
+                            f"converged={icp_result.converged}, mse={icp_result.mse:.6f}, "
+                            f"iters={icp_result.iterations}, "
+                            f"trans_norm={trans_norm:.4f}m, rot_norm={rot_norm:.4f}rad"
+                        )
+
+                except ContractViolation as e:
+                    self.get_logger().error(f"Frontend ICP result contract violation: {e}")
+                    self._publish_report(OpReport(
+                        name="FrontendICPContractViolation",
+                        exact=False,
+                        family_in="PointCloud",
+                        family_out="None",
+                        closed_form=False,
+                        domain_projection=False,
+                        metrics={
+                            "anchor_id": anchor.anchor_id,
+                            "error": str(e),
+                        },
+                        notes=f"Contract violation in ICP result: {e}",
+                    ))
+                    continue  # Skip this loop closure
+
+            if icp_result is None:
+                self._publish_report(OpReport(
+                    name="ICPEvidenceUnavailable",
+                    exact=True,
+                    family_in="PointCloud",
+                    family_out="LoopFactor",
+                    closed_form=True,
+                    domain_projection=True,
+                    metrics={
+                        "anchor_id": anchor.anchor_id,
+                        "source_points": len(points) if points is not None else 0,
+                        "target_points": len(anchor.depth_points) if anchor.depth_points is not None else 0,
+                    },
+                    notes="ICP unavailable (insufficient points or solver failure).",
+                ))
                 continue
+
+            # Continuous ICP quality (no hard gating)
+            improvement = icp_result.initial_objective - icp_result.final_objective
+            improvement_ratio = improvement / (icp_result.initial_objective + constants.WEIGHT_EPSILON)
+            improvement_ratio = float(np.clip(improvement_ratio, 0.0, 1.0))
+
+            iteration_quality = 1.0 - (icp_result.iterations / max(icp_result.max_iterations, 1))
+            iteration_quality = float(np.clip(iteration_quality, 0.0, 1.0))
+
+            expected_mse = float(self.get_parameter("icp_sigma_mse").value)
+            expected_mse = max(expected_mse, constants.WEIGHT_EPSILON)
+            mse_quality = float(np.exp(-icp_result.mse / expected_mse))
+
+            convergence_quality = (improvement_ratio * iteration_quality * mse_quality) ** (1.0 / 3.0)
+            convergence_quality = float(np.clip(convergence_quality, 1e-6, 1.0))
             
             # Compute loop factor (uses operators exact formulas)
             rel_pose, cov_transported, final_weight = self.loop_processor.compute_loop_factor(
-                icp_result, anchor.pose, obs_weight, weight)
-            
-            if self._loop_debug_count <= 3:  # Reduced from 5 to 3
-                self.get_logger().info(
-                    f"Loop factor computed: anchor={anchor.anchor_id}, final_weight={final_weight:.6f}, "
-                    f"rel_pose_norm={np.linalg.norm(rel_pose) if rel_pose is not None else 0:.4f}"
+                icp_result, anchor.pose, obs_weight * convergence_quality, weight)
+
+            # =====================================================================
+            # Loop Factor Validation (Data Flow Audit)
+            # =====================================================================
+            if rel_pose is not None and cov_transported is not None:
+                try:
+                    # Validate relative pose is finite
+                    if not np.all(np.isfinite(rel_pose)):
+                        raise ContractViolation(
+                            f"loop_factor.rel_pose: Contains inf/nan: {rel_pose}"
+                        )
+
+                    # Validate covariance
+                    from fl_slam_poc.common.validation import validate_covariance
+                    validate_covariance(cov_transported, "loop_factor.covariance")
+
+                    # Detect hardcoded identity covariance (common fake value)
+                    detect_hardcoded_value(cov_transported, np.eye(6), "loop_factor.covariance")
+
+                    # Log actual loop factor values for first few (data flow audit)
+                    if self._loop_debug_count <= 3:
+                        trans_norm = np.linalg.norm(rel_pose[:3])
+                        rot_norm = np.linalg.norm(rel_pose[3:])
+                        cov_trace = np.trace(cov_transported)
+                        self.get_logger().info(
+                            f"Frontend loop factor #{self._loop_debug_count} validation: "
+                            f"anchor={anchor.anchor_id}, final_weight={final_weight:.6f}, "
+                            f"trans_norm={trans_norm:.4f}m, rot_norm={rot_norm:.4f}rad, "
+                            f"cov_trace={cov_trace:.3e}"
+                        )
+
+                except ContractViolation as e:
+                    self.get_logger().error(f"Frontend loop factor contract violation: {e}")
+                    self._publish_report(OpReport(
+                        name="FrontendLoopFactorContractViolation",
+                        exact=False,
+                        family_in="PointCloud",
+                        family_out="None",
+                        closed_form=False,
+                        domain_projection=False,
+                        metrics={
+                            "anchor_id": anchor.anchor_id,
+                            "error": str(e),
+                        },
+                        notes=f"Contract violation in loop factor: {e}",
+                    ))
+                    continue  # Skip this loop closure
+
+            if rel_pose is None:
+                self.get_logger().error(
+                    f"Loop factor unavailable: rel_pose=None for anchor {anchor.anchor_id} "
+                    f"(mse={icp_result.mse:.6f}, iterations={icp_result.iterations})"
                 )
-            
-            if rel_pose is None or final_weight < 1e-12:
-                if self._loop_debug_count <= 5:
-                    self.get_logger().warn(f"Loop factor DROPPED: rel_pose is None or weight too low")
+                self._publish_report(OpReport(
+                    name="LoopFactorUnavailable",
+                    exact=True,
+                    family_in="PointCloud",
+                    family_out="LoopFactor",
+                    closed_form=True,
+                    domain_projection=True,
+                    metrics={
+                        "anchor_id": anchor.anchor_id,
+                        "weight": final_weight,
+                        "mse": icp_result.mse,
+                        "iterations": icp_result.iterations,
+                        "converged": icp_result.converged,
+                        "point_source": point_source,
+                    },
+                    notes="Loop factor could not be formed (missing relative pose).",
+                ))
                 continue
             
             # Update adaptive ICP parameters
@@ -891,6 +1138,7 @@ class Frontend(Node):
         Publish raw IMU segment between successive keyframes (Contract B).
         """
         if not self.enable_imu:
+            self.get_logger().debug(f"IMU factor skipped: enable_imu={self.enable_imu}")
             return
 
         # Initialize first keyframe without publishing a factor
@@ -898,6 +1146,7 @@ class Frontend(Node):
             self._last_keyframe_stamp = float(stamp_sec)
             self._last_keyframe_id = int(keyframe_j)
             self._last_keyframe_pose = pose.copy()
+            self.get_logger().info(f"IMU: First keyframe initialized at kf={keyframe_j}, stamp={stamp_sec:.3f}")
             return
 
         start_sec = float(self._last_keyframe_stamp)
@@ -905,7 +1154,18 @@ class Frontend(Node):
         if end_sec <= start_sec:
             return
 
+        buffer_size = self.sensor_io.get_imu_buffer_size()
         imu_measurements = self.sensor_io.get_imu_measurements(start_sec, end_sec)
+        
+        # Debug: log IMU query parameters
+        if len(imu_measurements) < 10 or buffer_size > 100:
+            # Get buffer time range for debugging
+            buf_times = [t for t, _, _ in self.sensor_io.imu_buffer] if hasattr(self.sensor_io, 'imu_buffer') and self.sensor_io.imu_buffer else []
+            buf_range = f"[{min(buf_times):.3f}, {max(buf_times):.3f}]" if buf_times else "empty"
+            self.get_logger().warn(
+                f"IMU query: start={start_sec:.3f}, end={end_sec:.3f}, dt={end_sec-start_sec:.3f}s, "
+                f"buffer_size={buffer_size}, matched={len(imu_measurements)}, buffer_range={buf_range}"
+            )
         # Contract B: biases are estimated in backend, frontend sends zero reference.
         bias_gyro = np.zeros(3, dtype=float)
         bias_accel = np.zeros(3, dtype=float)
@@ -933,6 +1193,11 @@ class Frontend(Node):
         imu_msg.gyro = gyro
 
         if len(imu_measurements) < 2:
+            self.get_logger().warn(
+                f"IMU segment skipped: insufficient samples ({len(imu_measurements)}) "
+                f"between kf_{self._last_keyframe_id} [{start_sec:.3f}] and kf_{keyframe_j} [{end_sec:.3f}], "
+                f"buffer_size={self.sensor_io.get_imu_buffer_size()}"
+            )
             self._publish_report(OpReport(
                 name="IMUSegmentSkipped",
                 exact=True,
@@ -949,7 +1214,14 @@ class Frontend(Node):
             ))
             return
 
+        self.get_logger().info(
+            f"IMU segment published: kf_{self._last_keyframe_id} -> kf_{keyframe_j}, "
+            f"dt={end_sec - start_sec:.3f}s, samples={len(imu_measurements)}"
+        )
         self.pub_imu_segment.publish(imu_msg)
+
+        # Flow counter for data flow audit
+        self.sensor_io.imu_segment_published_count += 1
 
         # Clear IMU buffer up to current keyframe
         cleared = self.sensor_io.clear_imu_buffer(end_sec)
@@ -1008,8 +1280,12 @@ class Frontend(Node):
             pose_odom_base: (6,) SE(3) pose of base_link in odom frame
             camera_frame: Camera frame ID for TF lookup
         """
+        # AUD-001 fix: Check if publisher was initialized
+        if self.pub_rgbd is None:
+            return
+        
         try:
-            from fl_slam_poc.frontend.rgbd_processor import (
+            from fl_slam_poc.frontend.sensors.rgbd_processor import (
                 depth_to_pointcloud,
                 rgbd_to_evidence,
                 transform_evidence_to_global,
@@ -1025,7 +1301,12 @@ class Frontend(Node):
             
             # Extract 3D points + colors + normals in camera frame
             points_cam, colors, normals, covs = depth_to_pointcloud(
-                depth, K, rgb=rgb, subsample=10, min_depth=0.1, max_depth=10.0
+                depth,
+                K,
+                rgb=rgb,
+                subsample=10,
+                min_depth=constants.DEPTH_MIN_VALID,
+                max_depth=constants.DEPTH_MAX_VALID,
             )
             
             if len(points_cam) == 0:
@@ -1109,7 +1390,13 @@ class Frontend(Node):
         """Publish frontend status (observability)."""
         status = self.status_monitor.get_status_dict()
         status["anchors"] = self.anchor_manager.get_anchor_count()
-        
+
+        # Add flow counters for data flow audit
+        status["flow_counters"] = {
+            "imu_callback_count": self.sensor_io.imu_callback_count,
+            "imu_segment_published_count": self.sensor_io.imu_segment_published_count,
+        }
+
         msg = String()
         msg.data = json.dumps(status)
         self.pub_status.publish(msg)

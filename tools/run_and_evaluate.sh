@@ -123,13 +123,10 @@ ros2 launch fl_slam_poc poc_m3dgr_rosbag.launch.py \
   > "$LOG_FILE" 2>&1 &
 LAUNCH_PID=$!
 
-# Monitor progress by tailing log with filtered display
+# Monitor progress by tailing log (no warning suppression)
 tail -f "$LOG_FILE" 2>/dev/null | while IFS= read -r line; do
-    # Filter out noisy warnings for display (but keep in log file)
-    if [[ "$line" == *"not found:"* ]] || \
-       [[ "$line" == *"camera_color_optical_frame"* ]] || \
-       [[ "$line" == *"SENSOR STALE"* ]] || \
-       [[ "$line" == *"SENSOR MISSING"* ]]; then
+    # Filter out rerun_bridge setup noise only
+    if [[ "$line" == *"not found:"* ]]; then
       continue
     fi
     # Show progress updates (backend status)

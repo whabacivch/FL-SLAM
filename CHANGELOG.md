@@ -4,11 +4,112 @@ Project: Frobenius-Legendre SLAM POC (Impact Project_v1)
 
 This file tracks all significant changes, design decisions, and implementation milestones for the FL-SLAM project.
 
+## 2026-01-23: Pipeline “Hidden Behavior” Audit Report ✅
+
+### Summary
+
+Added an audit-only report to enumerate hidden/disabled codepaths, hardcoded topics, placeholder values, and docs/test drift that make end-to-end runtime behavior difficult to verify.
+
+### Changes
+
+- `docs/PIPELINE_AUDIT_2026-01-23.md`
+  - New audit document with issue IDs (AUD-001…AUD-008) and candidate fixes for explicit approval.
+
+## 2026-01-23: Duplication Audit (Functions/Helpers) ✅
+
+### Summary
+
+Added an audit-only report listing exact and near-duplicated functions/helpers across the codebase (especially `tools/` and frontend sensor utilities) to reduce copy/paste drift.
+
+### Changes
+
+- `docs/DUPLICATION_AUDIT_2026-01-23.md`
+  - New audit document with issue IDs (DUP-001…DUP-006) and candidate fixes for explicit approval.
+
+## 2026-01-23: Canonical Topic/Schema Documentation Hardening ✅
+
+### Summary
+
+Expanded the canonical bag/pipeline topic map to include the full MVP runtime topic graph, custom message schemas, and exact field/covariance/QoS handling for each relevant topic.
+
+### Changes
+
+- `docs/BAG_TOPICS_AND_USAGE.md`
+  - Added complete pipeline topic graph (bag → utilities → frontend → backend → outputs).
+  - Documented exact message schemas for `AnchorCreate`, `LoopFactor`, and `IMUSegment`.
+  - Documented standard ROS message field usage (including which covariance fields are used/ignored).
+  - Documented RGB-D evidence JSON payload schema and QoS defaults.
+
+## 2026-01-23: Invariant Compliance Budget + Gating Cleanup ✅
+
+### Summary
+
+Removed remaining evidence gates, surfaced backend compute budgets as explicit parameters/priors, and formalized dense-module culling as a Frobenius-corrected budgeted recomposition.
+
+### Changes
+
+- `fl_ws/src/fl_slam_poc/fl_slam_poc/frontend/loops/loop_processor.py`
+  - Removed loop factor weight gate; low-weight factors now pass through.
+- `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/factors/loop.py`
+  - Removed weight gate in loop processing.
+  - Logged loop-factor buffer budget exceedance while retaining evidence.
+- `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/factors/imu.py`
+  - Logged IMU buffer budget exceedance while retaining evidence.
+- `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/state/rgbd.py`
+  - Implemented budgeted recomposition by posterior mass with Frobenius correction.
+  - Replaced hard RGB-D association with soft responsibilities + new-component prior.
+- `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/backend_node.py`
+  - Added ROS parameters for dense association radius, module budgets, and buffer sizes.
+- `fl_ws/src/fl_slam_poc/fl_slam_poc/common/constants.py`
+  - Added compute budget constants, module mass prior, and ICP covariance priors.
+- `fl_ws/src/fl_slam_poc/fl_slam_poc/common/param_models.py`
+  - Added backend parameters for dense module and buffer budgets.
+- `fl_ws/src/fl_slam_poc/fl_slam_poc/frontend/scan/icp.py`
+  - Centralized SE(3) DOF constants via `constants.py`.
+
+## 2026-01-23: Backend Math Consolidation + IMU Kernel Ordering Fix ✅
+
+### Summary
+
+Removed conflicting JAX/SE(3) entrypoints and fixed a state-layout mismatch in the batched IMU projection kernel so the unit test executes end-to-end.
+
+### Changes
+
+- `fl_ws/src/fl_slam_poc/fl_slam_poc/common/geometry/se3_jax.py`
+  - Replaced the wrapper with the canonical JAX SE(3) implementation.
+- `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/backend_node.py`
+  - Removed hardcoded JAX env overrides; rely on `common/jax_init.py`.
+  - Removed unused local JAX→NumPy SE(3) wrapper functions.
+- `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/math/imu_kernel.py`
+  - Fixed IMU residual ordering to match the 15D state tangent layout.
+  - Embedded the 9D residual mean into a 15D delta with zero bias components before applying `se3_plus`.
+- `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/lie_jax.py`
+  - Deleted (superseded by `common/geometry/se3_jax.py`).
+
 ## 2026-01-22: α-Divergence Trust-Scaled Fusion for Loop Closures ✅
 
 ### Summary
 
 Implemented information-geometric trust region for loop closure fusion using α-divergence and power posteriors. This replaces the naive product-of-experts approach with a principled method that prevents catastrophic jumps from high-divergence updates while preserving conjugacy and associativity.
+
+## 2026-01-22: Invariant Compliance Cleanup (Part 1) ✅
+
+### Summary
+
+Aligned frontend/back-end configuration and evidence handling with order-invariance and self-adaptive principles. Removed hidden parameter mismatches, documented IMU routing priors, eliminated hard ICP gating in favor of continuous quality scaling, and logged domain projections explicitly.
+
+### Key Changes
+
+- Wired `imu_qos_reliability` end-to-end (launch → frontend → SensorIO).
+- Removed hardcoded `birth_intensity` override; frontend now uses `constants.BIRTH_INTENSITY_DEFAULT`.
+- Standardized launch gravity default to `-9.81` to match `constants.GRAVITY_DEFAULT`.
+- Centralized IMU routing priors (`IMU_ROUTING_MAPPED_LOGIT`, `IMU_ROUTING_DISTANCE_SCALE`) and applied in backend routing.
+- Replaced hard ICP convergence gate with continuous quality weighting; added OpReport for unavailable ICP evidence.
+- Added `RESPONSIBILITY_MASS_FLOOR` and logged domain projection when responsibilities are uniformized.
+- Removed unused responsibility gating constants; softened "robust gating" wording in Gaussian info utilities.
+- Removed archived IMU preintegration artifacts to eliminate duplicate IMU integration sources.
+- Consolidated epsilon floors and QoS depths to `constants.py` across frontend/back-end utilities.
+- Centralized RGB-D depth min/max defaults via `constants.DEPTH_MIN_VALID` and `constants.DEPTH_MAX_VALID`.
 
 ### Key Insight
 

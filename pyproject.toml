@@ -1,0 +1,181 @@
+[project]
+name = "fl-slam-poc"
+version = "0.1.0"
+description = "Frobenius-Legendre SLAM Proof of Concept"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Will Combe"}
+]
+keywords = ["slam", "robotics", "ros2", "information-geometry"]
+
+[project.optional-dependencies]
+dev = [
+    "black>=24.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.8.0",
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "pre-commit>=3.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+# =============================================================================
+# Black Configuration
+# =============================================================================
+[tool.black]
+line-length = 120
+target-version = ["py310", "py311", "py312"]
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+    # Defaults
+    \.git
+    | \.hg
+    | \.mypy_cache
+    | \.tox
+    | \.venv
+    | _build
+    | buck-out
+    | build
+    | dist
+    # Project-specific
+    | archive
+    | fl_ws/build
+    | fl_ws/install
+    | fl_ws/log
+)/
+'''
+
+# =============================================================================
+# Ruff Configuration
+# =============================================================================
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+exclude = [
+    ".git",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".venv",
+    "__pypackages__",
+    "_build",
+    "build",
+    "dist",
+    "archive",
+    "fl_ws/build",
+    "fl_ws/install",
+    "fl_ws/log",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # Pyflakes
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "UP",     # pyupgrade
+    "ARG",    # flake8-unused-arguments
+    "SIM",    # flake8-simplify
+]
+ignore = [
+    "E501",   # line too long (handled by black)
+    "B008",   # do not perform function calls in argument defaults
+    "B905",   # zip without strict
+    "C901",   # too complex
+    "ARG001", # unused function argument (common in ROS callbacks)
+    "ARG002", # unused method argument
+    "SIM108", # ternary operator (sometimes less clear)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]  # unused imports in __init__.py
+"test_*.py" = ["ARG001", "ARG002"]  # unused arguments in tests
+
+[tool.ruff.lint.isort]
+known-first-party = ["fl_slam_poc"]
+section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
+
+# =============================================================================
+# MyPy Configuration
+# =============================================================================
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false  # Gradual typing
+ignore_missing_imports = true  # ROS packages don't have stubs
+exclude = [
+    "archive/",
+    "fl_ws/build/",
+    "fl_ws/install/",
+    "fl_ws/log/",
+]
+
+[[tool.mypy.overrides]]
+module = [
+    "rclpy.*",
+    "sensor_msgs.*",
+    "nav_msgs.*",
+    "geometry_msgs.*",
+    "std_msgs.*",
+    "visualization_msgs.*",
+    "tf2_ros.*",
+    "cv_bridge.*",
+    "jax.*",
+    "jaxlib.*",
+    "open3d.*",
+    "cupy.*",
+]
+ignore_missing_imports = true
+
+# =============================================================================
+# Pytest Configuration
+# =============================================================================
+[tool.pytest.ini_options]
+testpaths = ["fl_ws/src/fl_slam_poc/test"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--tb=short",
+    "--strict-markers",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "gpu: marks tests that require GPU",
+    "integration: marks integration tests",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+
+# =============================================================================
+# Coverage Configuration
+# =============================================================================
+[tool.coverage.run]
+source = ["fl_ws/src/fl_slam_poc/fl_slam_poc"]
+omit = [
+    "*/test/*",
+    "*/__init__.py",
+]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
+show_missing = true

@@ -13,18 +13,8 @@ from scipy.special import digamma, gammaln, polygamma
 
 from fl_slam_poc.common.op_report import OpReport
 
-EPS = 1e-9  # numerical interior safeguard (domain constraint)
-
-
-def _vec_stats(vec: np.ndarray) -> dict:
-    v = np.asarray(vec, dtype=float).reshape(-1)
-    return {
-        "mean": float(np.mean(v)),
-        "std": float(np.std(v)),
-        "min": float(np.min(v)),
-        "max": float(np.max(v)),
-        "norm": float(np.linalg.norm(v)),
-    }
+from fl_slam_poc.common.utils import vec_stats
+from fl_slam_poc.common import constants
 
 
 def dirichlet_log_partition(alpha: np.ndarray) -> float:
@@ -120,7 +110,10 @@ def residual_f(alpha: np.ndarray, target_t: np.ndarray) -> np.ndarray:
     f_i(alpha) = digamma(alpha_i) - digamma(sum alpha) - target_t_i
     Root f(alpha) = 0 defines the information projection matching E[log p].
     """
-    a = np.maximum(np.asarray(alpha, dtype=float).reshape(-1), EPS)
+    a = np.maximum(
+        np.asarray(alpha, dtype=float).reshape(-1),
+        constants.DIRICHLET_INTERIOR_EPS
+    )
     s = float(np.sum(a))
     return (digamma(a) - digamma(s)) - target_t
 
@@ -142,8 +135,8 @@ def iproject_dirichlet_from_mixture(
     """
     target_t = target_E_log_p_from_mixture(alphas, weights)
     a = np.asarray(alpha_init, dtype=float).reshape(-1)
-    projection_hit = bool(np.any(a <= EPS))
-    a = np.maximum(a, EPS)
+    projection_hit = bool(np.any(a <= constants.DIRICHLET_INTERIOR_EPS))
+    a = np.maximum(a, constants.DIRICHLET_INTERIOR_EPS)
 
     report = OpReport(
         name="DirichletMixtureProjection",
@@ -163,8 +156,8 @@ def iproject_dirichlet_from_mixture(
     if use_third_order:
         zeros = np.zeros_like(a, dtype=float)
         report.frobenius_delta_norm = 0.0
-        report.frobenius_input_stats = {"alpha": _vec_stats(a), "delta": _vec_stats(zeros)}
-        report.frobenius_output_stats = {"delta_corr": _vec_stats(zeros)}
+        report.frobenius_input_stats = {"alpha": vec_stats(a), "delta": vec_stats(zeros)}
+        report.frobenius_output_stats = {"delta_corr": vec_stats(zeros)}
 
     for it in range(max_iter):
         f = residual_f(a, target_t)
@@ -181,16 +174,16 @@ def iproject_dirichlet_from_mixture(
             delta = third_order_correct(a, delta_raw)
             report.frobenius_delta_norm = float(np.linalg.norm(delta - delta_raw))
             report.frobenius_input_stats = {
-                "alpha": _vec_stats(a),
-                "delta": _vec_stats(delta_raw),
+                "alpha": vec_stats(a),
+                "delta": vec_stats(delta_raw),
             }
             report.frobenius_output_stats = {
-                "delta_corr": _vec_stats(delta),
+                "delta_corr": vec_stats(delta),
             }
 
         a_next = a + delta
-        if np.any(a_next <= EPS):
+        if np.any(a_next <= constants.DIRICHLET_INTERIOR_EPS):
             report.domain_projection = True
-        a = np.maximum(a_next, EPS)
+        a = np.maximum(a_next, constants.DIRICHLET_INTERIOR_EPS)
 
     return a, report

@@ -4,7 +4,7 @@ package_name = "fl_slam_poc"
 
 setup(
     name=package_name,
-    version="0.0.1",
+    version="0.0.2",
     packages=find_packages(exclude=["test"]),
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
@@ -19,6 +19,13 @@ setup(
             "share/" + package_name + "/config",
             [
                 "config/qos_override.yaml",
+                "config/fl_slam_poc_base.yaml",
+            ],
+        ),
+        (
+            "share/" + package_name + "/config/presets",
+            [
+                "config/presets/m3dgr.yaml",
             ],
         ),
     ],
@@ -35,8 +42,8 @@ setup(
             "frontend_node = fl_slam_poc.frontend.frontend_node:main",
             "backend_node = fl_slam_poc.backend.backend_node:main",
             # Utility nodes
-            "tb3_odom_bridge = fl_slam_poc.frontend.tb3_odom_bridge:main",
-            "livox_converter = fl_slam_poc.frontend.livox_converter:main",
+            "tb3_odom_bridge = fl_slam_poc.frontend.sensors.tb3_odom_bridge:main",
+            "livox_converter = fl_slam_poc.frontend.sensors.livox_converter:main",
         ],
     },
 )

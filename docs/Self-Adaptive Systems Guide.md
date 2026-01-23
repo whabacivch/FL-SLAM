@@ -338,7 +338,9 @@ def create_default_imu_adaptive_model(
 ### 1.3 Integration with `imu_jax_kernel.py`
 
 ```python
-# Modifications to imu_jax_kernel.py
+# Modifications to imu_jax_kernel.py (conceptual example)
+# NOTE: The runtime pipeline uses imu_jax_kernel directly; no standalone
+# IMUPreintegrator class exists in the codebase.
 
 class IMUPreintegrator:
     def __init__(self, adaptive_noise: AdaptiveIMUNoiseModel = None):

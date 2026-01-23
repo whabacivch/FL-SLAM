@@ -158,14 +158,10 @@ All tests pass: `25 passed` ✅
 
 ### Integration Tests
 
-**Rosbag Playback**:
+**Rosbag Playback (M3DGR Dataset)**:
 ```bash
-## Phase 2 note
-Alternative launch files are stored under `phase2/` and are not installed by the MVP package by default.
-See: `phase2/fl_ws/src/fl_slam_poc/launch/poc_tb3_rosbag.launch.py`
-
-ros2 launch fl_slam_poc poc_tb3_rosbag.launch.py \
-  bag:=rosbags/tb3_slam3d_small_ros2 \
+ros2 launch fl_slam_poc poc_m3dgr_rosbag.launch.py \
+  bag:=rosbags/m3dgr/Dynamic01_ros2 \
   play_bag:=true \
   publish_rgbd_evidence:=true
 ```
