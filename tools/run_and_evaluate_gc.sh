@@ -15,6 +15,7 @@ BAG_PATH="$PROJECT_ROOT/rosbags/m3dgr/Dynamic01_ros2"
 GT_FILE="$PROJECT_ROOT/rosbags/m3dgr/Dynamic01.txt"
 EST_FILE="/tmp/gc_slam_trajectory.tum"
 GT_ALIGNED="/tmp/m3dgr_ground_truth_aligned.tum"
+WIRING_SUMMARY="/tmp/gc_wiring_summary.json"
 RESULTS_DIR="$PROJECT_ROOT/results/gc_$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="$RESULTS_DIR/slam_run.log"
 VENV_PATH="${VENV_PATH:-$PROJECT_ROOT/.venv}"
@@ -104,7 +105,7 @@ echo -e "Bag:     ${CYAN}$(basename "$BAG_PATH")${NC}"
 echo -e "Results: ${CYAN}$RESULTS_DIR${NC}"
 
 # Clean previous
-rm -f "$EST_FILE" "$GT_ALIGNED"
+rm -f "$EST_FILE" "$GT_ALIGNED" "$WIRING_SUMMARY"
 mkdir -p "$RESULTS_DIR"
 
 # ============================================================================
@@ -210,6 +211,7 @@ echo ""
 ros2 launch fl_slam_poc gc_rosbag.launch.py \
   bag:="$BAG_PATH" \
   trajectory_export_path:="$EST_FILE" \
+  wiring_summary_path:="$WIRING_SUMMARY" \
   > "$LOG_FILE" 2>&1 &
 LAUNCH_PID=$!
 
@@ -322,6 +324,11 @@ python3 "$PROJECT_ROOT/tools/evaluate_slam.py" \
 cp "$EST_FILE" "$RESULTS_DIR/estimated_trajectory.tum"
 cp "$GT_ALIGNED" "$RESULTS_DIR/ground_truth_aligned.tum"
 
+# Copy wiring summary if available
+if [ -f "$WIRING_SUMMARY" ]; then
+    cp "$WIRING_SUMMARY" "$RESULTS_DIR/wiring_summary.json"
+fi
+
 print_ok "Evaluation complete"
 
 # ============================================================================
@@ -337,6 +344,44 @@ if [ -f "$RESULTS_DIR/metrics.txt" ]; then
     
     echo -e "  ${BOLD}ATE RMSE:${NC}  ${CYAN}$ATE${NC}"
     echo -e "  ${BOLD}RPE @ 1m:${NC}  ${CYAN}$RPE${NC}"
+fi
+
+# Display wiring summary if available
+if [ -f "$RESULTS_DIR/wiring_summary.json" ]; then
+    echo ""
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}  WIRING SUMMARY${NC}"
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    
+    # Parse JSON with Python
+    python3 - "$RESULTS_DIR/wiring_summary.json" <<'PYSCRIPT'
+import sys
+import json
+
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+
+proc = data.get("processed", {})
+dead = data.get("dead_ended", {})
+
+print(f"  PROCESSED:")
+print(f"    LiDAR scans:  {proc.get('lidar_scans', 0):>6}  → pipeline: {proc.get('pipeline_runs', 0):>6}")
+print(f"    Odom msgs:    {proc.get('odom_msgs', 0):>6}  [{'FUSED' if proc.get('odom_fused') else 'NOT FUSED'}]")
+print(f"    IMU msgs:     {proc.get('imu_msgs', 0):>6}  [{'FUSED' if proc.get('imu_fused') else 'NOT FUSED'}]")
+
+if dead:
+    print(f"  DEAD-ENDED:")
+    for topic, count in sorted(dead.items()):
+        topic_short = topic if len(topic) <= 40 else "..." + topic[-37:]
+        print(f"    {topic_short:<40} {count:>6} msgs")
+
+# Warnings
+if not proc.get('odom_fused') and proc.get('odom_msgs', 0) > 0:
+    print(f"  ⚠ Odom subscribed but NOT FUSED")
+if not proc.get('imu_fused') and proc.get('imu_msgs', 0) > 0:
+    print(f"  ⚠ IMU subscribed but NOT FUSED")
+PYSCRIPT
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 fi
 
 echo ""

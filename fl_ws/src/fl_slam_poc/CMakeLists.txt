@@ -40,8 +40,12 @@ install(TARGETS image_decompress_cpp
 install(PROGRAMS
   scripts/backend_node
   scripts/gc_backend_node
-  scripts/odom_bridge
+  scripts/gc_sensor_hub
   scripts/livox_converter
+  scripts/odom_normalizer
+  scripts/imu_normalizer
+  scripts/gc_dead_end_audit_node
+  scripts/wiring_auditor
   DESTINATION lib/${PROJECT_NAME}
 )
 

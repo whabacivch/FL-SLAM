@@ -4,6 +4,68 @@ Project: Frobenius-Legendre SLAM POC (Impact Project_v1)
 
 This file tracks all significant changes, design decisions, and implementation milestones for the FL-SLAM project.
 
+## 2026-01-24: Sensor Hub Architecture + Canonical Topic Naming
+
+### Summary
+
+Implemented a clean layered architecture for the GC SLAM frontend with canonical `/gc/sensors/*` topic naming to prevent accidental fusion of raw data.
+
+### Topic Naming Convention
+
+| Raw (from bag) | Canonical (for backend) |
+|----------------|------------------------|
+| `/livox/mid360/lidar` | `/gc/sensors/lidar_points` |
+| `/odom` | `/gc/sensors/odom` |
+| `/livox/mid360/imu` | `/gc/sensors/imu` |
+
+**Rule:** Backend subscribes ONLY to `/gc/sensors/*` - never to raw topics.
+
+### Files Created
+
+- `frontend/hub/__init__.py` - Hub module init
+- `frontend/hub/gc_sensor_hub.py` - Single-process sensor hub (placeholder for future consolidation)
+- `frontend/sensors/odom_normalizer.py` - Odom normalizer (passthrough with TODOs)
+- `frontend/sensors/imu_normalizer.py` - IMU normalizer (passthrough with TODOs)
+- `config/gc_unified.yaml` - Consolidated configuration file
+
+### Files Modified
+
+- `frontend/__init__.py` - Added exports for new modules
+- `frontend/sensors/__init__.py` - Added exports for normalizers
+- `frontend/sensors/livox_converter.py` - Output topic changed to `/gc/sensors/lidar_points`
+- `backend/backend_node.py` - Subscriptions changed to `/gc/sensors/*`
+- `launch/gc_rosbag.launch.py` - Added normalizer nodes, updated all topic wiring
+- `setup.py` - Added entry points for new nodes
+- `config/gc_backend.yaml` - Updated to canonical topics
+- `test/conftest.py` - Updated topic fixture
+- `docs/Fusion_issues.md` - Updated architecture diagram
+
+### Architecture Diagram
+
+See `docs/Fusion_issues.md` Section 1.1 for the updated Mermaid diagram.
+
+### Follow-up Fixes (Strictness + Runtime Correctness)
+
+- Fixed ROS2 QoS compatibility for canonical odom (`odom_normalizer` now publishes RELIABLE to match backend subscription).
+- Removed legacy `odom_bridge` to prevent accidental bypass/multipath.
+- Made `gc_sensor_hub` runnable by loading `config/gc_unified.yaml` and applying per-node parameter overrides before node initialization.
+- Dead-end audit now tolerates missing driver message types (e.g., `livox_ros_driver`) and reports them as unavailable instead of failing at startup.
+- IMU normalizer now warns on first invalid sample and fails fast on the second to avoid silent drops.
+
+---
+
+## 2026-01-24: GC Strictness + Wiring Auditability
+
+### Summary
+
+Tightened GC v2 “single-path” wiring so Livox conversion and backend/operator selections are explicit and auditable at runtime.
+
+### Key Changes
+
+1. **Runtime manifest backends map**: `RuntimeManifest` now reports an explicit `backends` selection map for “no multipaths” auditability.
+2. **Livox converter strict config**: removed `input_msg_type: "auto"` from GC config and made the GC rosbag launcher pass an explicit `livox_input_msg_type` (default `livox_ros_driver2/msg/CustomMsg`).
+3. **Dead-end audit node (topic accountability)**: added `gc_dead_end_audit_node` to subscribe to unused rosbag topics (explicit message types, fail-fast on missing required streams) and publish `/gc/dead_end_status`.
+
 ## 2026-01-23: Golden Child SLAM v2 Implementation ✅
 
 ### Summary

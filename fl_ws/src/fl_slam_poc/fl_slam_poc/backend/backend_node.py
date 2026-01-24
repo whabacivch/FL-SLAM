@@ -163,9 +163,10 @@ class GoldenChildBackend(Node):
         """Declare ROS parameters."""
         self.declare_parameter("odom_frame", "odom")
         self.declare_parameter("base_frame", "base_link")
-        self.declare_parameter("lidar_topic", "/livox/mid360/points")
-        self.declare_parameter("odom_topic", "/odom")
-        self.declare_parameter("imu_topic", "/livox/mid360/imu")
+        # Backend subscribes ONLY to /gc/sensors/* (canonical topics from sensor hub)
+        self.declare_parameter("lidar_topic", "/gc/sensors/lidar_points")
+        self.declare_parameter("odom_topic", "/gc/sensors/odom")
+        self.declare_parameter("imu_topic", "/gc/sensors/imu")
         self.declare_parameter("trajectory_export_path", "/tmp/gc_slam_trajectory.tum")
         self.declare_parameter("status_check_period_sec", 5.0)
         self.declare_parameter("forgetting_factor", 0.99)
@@ -361,9 +362,19 @@ class GoldenChildBackend(Node):
             n_points = 1
         
         # Compute dt since last scan
-        dt_raw = stamp_sec - self.last_scan_stamp if self.last_scan_stamp > 0 else (float(jnp.max(timestamps)) - float(jnp.min(timestamps)))
-        dt_sec = float(jnp.sqrt(jnp.array(dt_raw, dtype=jnp.float64) ** 2 + 1e-6))
-        self.last_scan_stamp = stamp_sec
+        # Derive scan bounds from per-point timestamps when available; always include header stamp.
+        stamp_j = jnp.array(stamp_sec, dtype=jnp.float64)
+        scan_start_time = float(jnp.minimum(stamp_j, jnp.min(timestamps)))
+        scan_end_time = float(jnp.maximum(stamp_j, jnp.max(timestamps)))
+
+        dt_raw = (
+            scan_end_time - self.last_scan_stamp
+            if self.last_scan_stamp > 0
+            else (scan_end_time - scan_start_time)
+        )
+        eps_dt = np.finfo(np.float64).eps
+        dt_sec = float(jnp.sqrt(jnp.array(dt_raw, dtype=jnp.float64) ** 2 + eps_dt))
+        self.last_scan_stamp = scan_end_time
         
         # Apply forgetting to map stats
         self.map_stats = apply_forgetting(self.map_stats, self.forgetting_factor)
@@ -378,8 +389,8 @@ class GoldenChildBackend(Node):
                     raw_points=points,
                     raw_timestamps=timestamps,
                     raw_weights=weights,
-                    scan_start_time=stamp_sec - 0.1,
-                    scan_end_time=stamp_sec,
+                    scan_start_time=scan_start_time,
+                    scan_end_time=scan_end_time,
                     dt_sec=dt_sec,
                     Q=self.Q,
                     bin_atlas=self.bin_atlas,

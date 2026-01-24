@@ -19,10 +19,12 @@ setup(
             "share/" + package_name + "/config",
             [
                 "config/gc_backend.yaml",
+                "config/gc_dead_end_audit.yaml",
+                "config/gc_unified.yaml",
             ],
         ),
     ],
-    install_requires=["setuptools", "numpy", "scipy", "jax"],
+    install_requires=["setuptools", "numpy", "scipy", "jax", "pyyaml"],
     zip_safe=True,
     maintainer="Will Haber",
     maintainer_email="whab13@mit.edu",
@@ -34,9 +36,15 @@ setup(
             # Golden Child backend (branch-free implementation)
             "gc_backend_node = fl_slam_poc.backend.backend_node:main",
             "backend_node = fl_slam_poc.backend.backend_node:main",
-            # Utility nodes
-            "odom_bridge = fl_slam_poc.frontend.sensors.odom_bridge:main",
+            # Sensor Hub (single process with all frontend nodes)
+            "gc_sensor_hub = fl_slam_poc.frontend.hub.gc_sensor_hub:main",
+            # Individual sensor nodes (can also run standalone)
             "livox_converter = fl_slam_poc.frontend.sensors.livox_converter:main",
+            "odom_normalizer = fl_slam_poc.frontend.sensors.odom_normalizer:main",
+            "imu_normalizer = fl_slam_poc.frontend.sensors.imu_normalizer:main",
+            # Audit / accountability
+            "gc_dead_end_audit_node = fl_slam_poc.frontend.audit.dead_end_audit_node:main",
+            "wiring_auditor = fl_slam_poc.frontend.audit.wiring_auditor:main",
         ],
     },
 )

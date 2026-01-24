@@ -10,6 +10,7 @@ Verifies that the implementation follows the spec invariants:
 Reference: docs/GOLDEN_CHILD_INTERFACE_SPEC.md
 """
 
+import os
 import pytest
 from fl_slam_poc.common.jax_init import jax, jnp
 from fl_slam_poc.common import constants
@@ -222,3 +223,63 @@ class TestCertificateStructure:
         
         magnitude = cert.total_trigger_magnitude()
         assert magnitude >= 0.3  # At least lift + psd delta
+
+
+class TestLivoxConverterStrictness:
+    """Verify Livox conversion wiring is explicit (no 'auto' multipath)."""
+
+    def test_gc_backend_yaml_has_no_auto_input_msg_type(self):
+        pkg_root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(pkg_root, "config", "gc_backend.yaml")
+        if not os.path.exists(path):
+            pytest.skip("gc_backend.yaml not found")
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+        assert 'input_msg_type: "auto"' not in text
+
+    def test_gc_rosbag_launch_passes_explicit_input_msg_type(self):
+        pkg_root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(pkg_root, "launch", "gc_rosbag.launch.py")
+        if not os.path.exists(path):
+            pytest.skip("gc_rosbag.launch.py not found")
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+        assert "livox_input_msg_type" in text
+        # gc_sensor_hub applies this explicitly to livox_converter (single-path).
+        assert '"livox_input_msg_type": LaunchConfiguration("livox_input_msg_type")' in text
+
+
+class TestSensorHubWiring:
+    """Verify GC launch uses the sensor hub layer for accountability."""
+
+    def test_gc_rosbag_launch_uses_gc_sensor_hub(self):
+        pkg_root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(pkg_root, "launch", "gc_rosbag.launch.py")
+        if not os.path.exists(path):
+            pytest.skip("gc_rosbag.launch.py not found")
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+        assert "gc_sensor_hub" in text
+        assert 'executable="gc_sensor_hub"' in text
+        assert "gc_unified.yaml" in text
+
+    def test_dead_end_audit_yaml_exists_and_has_topic_specs(self):
+        pkg_root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(pkg_root, "config", "gc_dead_end_audit.yaml")
+        if not os.path.exists(path):
+            pytest.skip("gc_dead_end_audit.yaml not found")
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+        assert "topic_specs:" in text
+        assert "/camera/imu|sensor_msgs/msg/Imu" in text
+        assert "/vrpn_client_node/UGV/pose|geometry_msgs/msg/PoseStamped" in text
+
+    def test_unified_yaml_contains_dead_end_audit_topic_specs(self):
+        pkg_root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(pkg_root, "config", "gc_unified.yaml")
+        if not os.path.exists(path):
+            pytest.skip("gc_unified.yaml not found")
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+        assert "dead_end_audit:" in text
+        assert "topic_specs:" in text

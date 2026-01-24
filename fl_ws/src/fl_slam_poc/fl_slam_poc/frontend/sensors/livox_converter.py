@@ -14,6 +14,8 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import Header
 import numpy as np
+from rclpy.parameter import Parameter
+from typing import Any, Optional, Dict
 
 
 def _try_import_msg(msg_type: str):
@@ -88,12 +90,15 @@ def _pointcloud2_fields_for_livox(has_time_offset: bool) -> tuple[list[PointFiel
 class LivoxConverterNode(Node):
     """Converts Livox CustomMsg to PointCloud2."""
 
-    def __init__(self):
-        super().__init__('livox_converter')
+    def __init__(self, parameter_overrides: Optional[Dict[str, Any]] = None):
+        overrides = None
+        if parameter_overrides:
+            overrides = [Parameter(k, value=v) for k, v in parameter_overrides.items()]
+        super().__init__('livox_converter', parameter_overrides=overrides)
         
         # Parameters
         self.declare_parameter("input_topic", "/livox/mid360/lidar")
-        self.declare_parameter("output_topic", "/lidar/points")
+        self.declare_parameter("output_topic", "/gc/sensors/lidar_points")
         # If empty, preserve msg.header.frame_id (recommended).
         self.declare_parameter("frame_id", "")
         # Message type selection (explicit, no fallback):

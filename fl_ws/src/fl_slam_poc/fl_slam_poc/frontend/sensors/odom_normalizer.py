@@ -1,0 +1,139 @@
+"""
+=============================================================================
+ODOM NORMALIZER - Odometry Preprocessing for Golden Child SLAM
+=============================================================================
+
+PLACEHOLDER / LANDING PAD FOR FUTURE DEVELOPMENT
+
+This node subscribes to raw odometry from the rosbag and publishes
+normalized odometry to the /gc/sensors/odom canonical topic.
+
+Current Implementation:
+    - Passes through odometry with frame normalization
+    - Validates covariance is present and non-degenerate
+
+Future Development (TODO):
+    - [ ] Covariance validation and repair
+    - [ ] Unit/scale normalization if needed
+    - [ ] Timestamp validation and monotonicity check
+    - [ ] Frame convention enforcement (REP-105)
+    - [ ] Fail-fast on invalid data
+
+Topic Flow:
+    /odom (raw from bag) → [this node] → /gc/sensors/odom (canonical)
+
+Reference: docs/GOLDEN_CHILD_INTERFACE_SPEC.md
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import rclpy
+from nav_msgs.msg import Odometry
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+from rclpy.parameter import Parameter
+from typing import Any, Optional, Dict
+
+
+class OdomNormalizerNode(Node):
+    """
+    Normalizes raw odometry for GC backend consumption.
+    
+    Subscribes to raw /odom and publishes to /gc/sensors/odom.
+    """
+
+    def __init__(self, parameter_overrides: Optional[Dict[str, Any]] = None) -> None:
+        overrides = None
+        if parameter_overrides:
+            overrides = [Parameter(k, value=v) for k, v in parameter_overrides.items()]
+        super().__init__("odom_normalizer", parameter_overrides=overrides)
+
+        # Parameters
+        self.declare_parameter("input_topic", "/odom")
+        self.declare_parameter("output_topic", "/gc/sensors/odom")
+        self.declare_parameter("output_frame", "odom")
+        self.declare_parameter("child_frame", "base_link")
+
+        input_topic = str(self.get_parameter("input_topic").value)
+        output_topic = str(self.get_parameter("output_topic").value)
+        self.output_frame = str(self.get_parameter("output_frame").value)
+        self.child_frame = str(self.get_parameter("child_frame").value)
+
+        # QoS:
+        # - Subscription from rosbag: RELIABLE (bags typically record with RELIABLE).
+        # - Publish to backend: RELIABLE to match GC backend odom subscription (fail-fast, no silent mismatch).
+        qos_sub = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+        )
+        qos_pub = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+        )
+
+        self.sub = self.create_subscription(
+            Odometry, input_topic, self._on_odom, qos_sub
+        )
+        self.pub = self.create_publisher(Odometry, output_topic, qos_pub)
+
+        self._msg_count = 0
+        self._logged_first = False
+
+        self.get_logger().info("=" * 60)
+        self.get_logger().info("ODOM NORMALIZER")
+        self.get_logger().info("=" * 60)
+        self.get_logger().info(f"  Input:  {input_topic} (raw)")
+        self.get_logger().info(f"  Output: {output_topic} (canonical)")
+        self.get_logger().info("=" * 60)
+
+    def _on_odom(self, msg: Odometry) -> None:
+        """Process and normalize incoming odometry."""
+        self._msg_count += 1
+
+        # =====================================================================
+        # TODO: Add validation logic here
+        # - Check covariance is positive semi-definite
+        # - Check timestamp monotonicity
+        # - Validate pose/twist values are finite
+        # =====================================================================
+
+        # Create normalized output message
+        out = Odometry()
+        out.header = msg.header
+        out.header.frame_id = self.output_frame
+        out.child_frame_id = self.child_frame
+        out.pose = msg.pose
+        out.twist = msg.twist
+
+        self.pub.publish(out)
+
+        # Log first message
+        if not self._logged_first:
+            self._logged_first = True
+            pos = msg.pose.pose.position
+            self.get_logger().info(
+                f"Odom normalizer: first msg at ({pos.x:.3f}, {pos.y:.3f}, {pos.z:.3f})"
+            )
+
+
+def main() -> None:
+    """Standalone entry point for odom_normalizer node."""
+    rclpy.init()
+    node = OdomNormalizerNode()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

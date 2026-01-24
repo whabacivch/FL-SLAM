@@ -154,12 +154,20 @@ def pose_update_frobenius_recompose(
         bch_correction=bch_correction,
     )
     
-    # Update belief with new linearization point
-    # Reset z_lin to zero (re-linearize at new pose)
-    z_lin_new = jnp.zeros(D_Z, dtype=jnp.float64)
-    
-    # h must be recomputed: h_new = L @ z_lin_new = 0
-    h_new = jnp.zeros(D_Z, dtype=jnp.float64)
+    # Update belief by shifting the chart origin in tangent space.
+    #
+    # Treat the recompose as a change-of-variables:
+    #   z' = z - shift, where shift applies only to the pose slice.
+    #
+    # For a Gaussian in information form (L, h) with mean mu = L^{-1} h:
+    #   mu' = mu - shift
+    #   h'  = L @ mu' = h - L @ shift
+    #
+    # This preserves non-pose state components (v/bias/dt/extrinsic) instead of
+    # implicitly zeroing them.
+    shift_z = jnp.zeros(D_Z, dtype=jnp.float64).at[SLICE_POSE].set(delta_pose_corrected_z)
+    z_lin_new = belief_post.z_lin - shift_z
+    h_new = belief_post.h - belief_post.L @ shift_z
     
     # Build certificate
     cert = CertBundle.create_approx(
@@ -179,7 +187,8 @@ def pose_update_frobenius_recompose(
     )
     
     # Update the certificate's frobenius field based on strength
-    cert.frobenius_applied = frobenius_strength > 1e-12
+    eps_frob = float(jnp.finfo(jnp.float64).eps)
+    cert.frobenius_applied = frobenius_strength > eps_frob
     
     belief_updated = BeliefGaussianInfo(
         chart_id=belief_post.chart_id,

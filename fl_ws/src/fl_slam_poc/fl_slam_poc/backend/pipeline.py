@@ -10,7 +10,7 @@ Reference: docs/GOLDEN_CHILD_INTERFACE_SPEC.md Section 7
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Dict
 
 from fl_slam_poc.common.jax_init import jax, jnp
 from fl_slam_poc.common import constants
@@ -503,6 +503,23 @@ class RuntimeManifest:
     c_dt: float = constants.GC_C_DT
     c_ex: float = constants.GC_C_EX
     c_frob: float = constants.GC_C_FROB
+
+    # Explicit backend/operator selections (single-path; no fallback).
+    # This is required for auditability of the "no multipaths" invariant.
+    backends: Dict[str, str] = None
+
+    def __post_init__(self):
+        if self.backends is None:
+            # Keep this list intentionally small and explicit: only things that
+            # materially affect runtime behavior and could otherwise drift.
+            self.backends = {
+                "core_array": "jax",
+                "se3": "fl_slam_poc.common.geometry.se3_jax",
+                "domain_projection_psd": "fl_slam_poc.common.primitives.domain_projection_psd",
+                "lifted_spd_solve": "fl_slam_poc.common.primitives.spd_cholesky_solve_lifted",
+                "lidar_converter": "fl_slam_poc.frontend.sensors.livox_converter",
+                "pointcloud_parser": "fl_slam_poc.backend.backend_node.parse_pointcloud2",
+            }
     
     def to_dict(self) -> dict:
         """Convert to dictionary for logging/publishing."""
@@ -529,4 +546,5 @@ class RuntimeManifest:
             "c_dt": self.c_dt,
             "c_ex": self.c_ex,
             "c_frob": self.c_frob,
+            "backends": dict(self.backends),
         }

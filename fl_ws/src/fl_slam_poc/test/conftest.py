@@ -72,17 +72,25 @@ def m3dgr_topic_config() -> Dict[str, str]:
     """
     Return the expected topic names for M3DGR dataset.
     
-    These are the parametrized topic names used in production (AUD-002 fix).
-    Tests can use this to verify topic wiring.
+    This fixture reflects the **GC v2 evaluation wiring** (gc_rosbag.launch.py).
+    
+    Topic naming convention:
+        Raw (from bag)              Canonical (for backend)
+        /livox/mid360/lidar     ->  /gc/sensors/lidar_points
+        /odom                   ->  /gc/sensors/odom
+        /livox/mid360/imu       ->  /gc/sensors/imu
+    
+    Backend subscribes ONLY to /gc/sensors/* (canonical topics).
     """
     return {
-        "odom_topic": "/sim/odom",
-        "loop_factor_topic": "/sim/loop_factor",
-        "anchor_create_topic": "/sim/anchor_create",
-        "imu_segment_topic": "/sim/imu_segment",
-        "rgbd_evidence_topic": "/sim/rgbd_evidence",
-        "pointcloud_topic": "/lidar/points",
-        "imu_topic": "/livox/mid360/imu",
+        # Raw topics from rosbag (input to sensor hub)
+        "livox_custommsg_topic": "/livox/mid360/lidar",
+        "raw_odom_topic": "/odom",
+        "raw_imu_topic": "/livox/mid360/imu",
+        # Canonical topics (output from sensor hub, input to backend)
+        "lidar_topic": "/gc/sensors/lidar_points",
+        "odom_topic": "/gc/sensors/odom",
+        "imu_topic": "/gc/sensors/imu",
     }
 
 

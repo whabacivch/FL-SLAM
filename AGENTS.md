@@ -4,10 +4,10 @@ These rules apply only to this project. Other projects have their own rules.
 
 ## Project Intent
 - Build a Frobenius–Legendre compositional inference backend for dynamic SLAM.
-- Preserve the design invariants in `archive/legacy_docs/Project_Implimentation_Guide.sty`.
+- Implement and verify **Golden Child SLAM v2** as a strict, branch-free, fixed-cost SLAM backend.
 
 ## Canonical References (Do Not Drift)
-- Design invariants/spec anchor: `archive/legacy_docs/Project_Implimentation_Guide.sty`
+- Golden Child strict interface/spec anchor: `docs/GOLDEN_CHILD_INTERFACE_SPEC.md`
 - Self-adaptive constraints: `docs/Self-Adaptive Systems Guide.md`
 - Math reference: `docs/Comprehensive Information Geometry.md`
 - Development log (required): `CHANGELOG.md`
@@ -15,9 +15,10 @@ These rules apply only to this project. Other projects have their own rules.
 ## Quickstart and Validation
 - Workspace: `fl_ws/` (ROS 2), package: `fl_ws/src/fl_slam_poc/`, tools: `tools/`
 - Build: `cd fl_ws && source /opt/ros/jazzy/setup.bash && colcon build --packages-select fl_slam_poc && source install/setup.bash`
-- MVP eval: `bash tools/run_and_evaluate.sh` (artifacts under `results/`)
+- GC eval (primary): `bash tools/run_and_evaluate_gc.sh` (artifacts under `results/`)
+- Legacy eval (if needed): `bash tools/run_and_evaluate.sh` (artifacts under `results/`)
 
-## Non-Negotiable Design Invariants
+## Non-Negotiable Invariants (GC v2)
 - Closed-form-first: prefer analytic operators; only use solvers when no closed-form exists.
 - Associative, order-robust fusion: when evidence is in-family and product-of-experts applies, fusion must be commutative/associative.
 - Soft association only: no heuristic gating; use responsibilities from a declared generative model.
@@ -25,6 +26,8 @@ These rules apply only to this project. Other projects have their own rules.
 - Local modularity: state is an atlas of local modules; updates stay local by construction.
 - Core must be Jacobian-free; Jacobians allowed only in sensor→evidence extraction and must be logged as `Linearization` (approx trigger) with Frobenius correction.
 - Self-adaptive rules are hard constraints: no hard gates; startup is not a mode; constants are priors/budgets; approximate operators return (result, certificate, expected_effect) with no accept/reject branching.
+- No hidden iteration: disallow data-dependent solver loops inside a single operator call (fixed-size loops only).
+- Fail-fast on contract violations: chart id mismatches, dimension mismatches, and missing configured backends/sensors are hard errors.
 
 ## No Fallbacks / No Multi-Paths (Required)
 
@@ -51,8 +54,9 @@ The root failure mode to prevent is: *multiple math paths silently coexist*, mak
 - `fl_slam_poc/frontend/`: sensor I/O + evidence extraction + utility nodes.
 - `fl_slam_poc/backend/`: inference + fusion + kernels.
 
-## Operator Taxonomy (Required Reporting)
-- Every operator emits an OpReport with: `exact`, `approximation_triggers`, `family_in/out`, `closed_form`, `solver_used`, `frobenius_applied`.
+## Operator Reporting (Required)
+- Every operator returns `(result, CertBundle, ExpectedEffect)` per `docs/GOLDEN_CHILD_INTERFACE_SPEC.md`.
+- `CertBundle` must report: `exact`, `approximation_triggers`, `family_in/out` (where applicable), `closed_form`, `solver_used`, `frobenius_applied`.
 - Enforcement rule: `approximation_triggers != ∅` ⇒ `frobenius_applied == True` (no exceptions).
 
 ## No Heuristics (Hard)
