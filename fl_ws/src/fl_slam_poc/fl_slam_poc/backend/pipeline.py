@@ -65,7 +65,6 @@ from fl_slam_poc.backend.operators.map_update import (
 )
 from fl_slam_poc.backend.operators.anchor_drift import anchor_drift_update
 from fl_slam_poc.backend.operators.hypothesis import hypothesis_barycenter_projection
-from fl_slam_poc.common.primitives import inv_mass, safe_normalize
 
 
 # =============================================================================
@@ -230,17 +229,14 @@ def process_scan_single_hypothesis(
     all_certs.append(deskew_cert)
     ut_cache = deskew_result.ut_cache
     
-    # Extract deskewed point data
-    deskewed_points = jnp.stack([p.p_mean for p in deskew_result.deskewed_points], axis=0)
-    deskewed_covs = jnp.stack([p.p_cov for p in deskew_result.deskewed_points], axis=0)
-    deskewed_weights = jnp.array([p.weight for p in deskew_result.deskewed_points])
+    # Extract deskewed point data (batched arrays; no Python container stacking)
+    deskewed_points = deskew_result.p_mean
+    deskewed_covs = deskew_result.p_cov
+    deskewed_weights = deskew_result.weights
     
-    # Compute point directions for binning
-    point_directions = jnp.zeros_like(deskewed_points)
-    for i in range(deskewed_points.shape[0]):
-        point_directions = point_directions.at[i].set(
-            safe_normalize(deskewed_points[i], config.eps_mass)[0]
-        )
+    # Compute point directions for binning (batched, no per-point host sync)
+    norms = jnp.linalg.norm(deskewed_points, axis=1, keepdims=True)
+    point_directions = deskewed_points / (norms + config.eps_mass)
     
     # =========================================================================
     # Step 4: BinSoftAssign
@@ -280,12 +276,9 @@ def process_scan_single_hypothesis(
         eps_psd=config.eps_psd,
     )
     
-    # Compute scan mean directions
-    mu_scan = jnp.zeros((config.B_BINS, 3), dtype=jnp.float64)
-    for b in range(config.B_BINS):
-        mu_scan = mu_scan.at[b].set(
-            safe_normalize(scan_bins.s_dir[b], config.eps_mass)[0]
-        )
+    # Compute scan mean directions (batched, no per-bin host sync)
+    s_norms = jnp.linalg.norm(scan_bins.s_dir, axis=1, keepdims=True)
+    mu_scan = scan_bins.s_dir / (s_norms + config.eps_mass)
     
     # =========================================================================
     # Step 7: WahbaSVD

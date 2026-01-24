@@ -10,7 +10,7 @@ Reference: docs/GOLDEN_CHILD_INTERFACE_SPEC.md Section 5.3
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple, List
+from typing import Tuple
 
 from fl_slam_poc.common.jax_init import jax, jnp
 from fl_slam_poc.common import constants
@@ -39,15 +39,6 @@ from fl_slam_poc.common.geometry import se3_jax
 
 
 @dataclass
-class DeskewedPoint:
-    """Single deskewed point with uncertainty."""
-    p_mean: jnp.ndarray  # (3,) mean position
-    p_cov: jnp.ndarray  # (3, 3) position covariance
-    time_sec: float
-    weight: float
-
-
-@dataclass
 class UTCache:
     """
     Cache of UT evaluations for reuse by LidarQuadraticEvidence.
@@ -66,7 +57,10 @@ class UTCache:
 @dataclass
 class DeskewResult:
     """Result of DeskewUTMomentMatch operator."""
-    deskewed_points: List[DeskewedPoint]
+    p_mean: jnp.ndarray  # (N, 3) deskewed point means
+    p_cov: jnp.ndarray  # (N, 3, 3) deskewed point covariances
+    timestamps: jnp.ndarray  # (N,) point timestamps (sec)
+    weights: jnp.ndarray  # (N,) point weights
     ut_cache: UTCache
     dt_effect: float  # Continuous excitation from time offset
     extrinsic_effect: float  # Continuous excitation from extrinsic
@@ -155,6 +149,82 @@ def _transform_point_by_pose(
     return R @ point + trans
 
 
+@jax.jit
+def _pose_z_to_se3_delta_batch(delta_pose_z: jnp.ndarray) -> jnp.ndarray:
+    """
+    Vectorized pose convention conversion (GC -> se3_jax ordering).
+
+    Input:  (K, 6) [rot(3), trans(3)]
+    Output: (K, 6) [trans(3), rot(3)]
+    """
+    delta_pose_z = jnp.asarray(delta_pose_z, dtype=jnp.float64)
+    rot = delta_pose_z[:, 0:3]
+    trans = delta_pose_z[:, 3:6]
+    return jnp.concatenate([trans, rot], axis=1)
+
+
+@jax.jit
+def _project_psd_batch_3x3(M: jnp.ndarray, eps_psd: float) -> jnp.ndarray:
+    """
+    Batch PSD projection for stacks of 3x3 matrices.
+
+    Always symmetrizes and eigen-clamps to >= eps_psd.
+    """
+    M = jnp.asarray(M, dtype=jnp.float64)
+    M_sym = 0.5 * (M + jnp.swapaxes(M, -1, -2))
+    eigvals, eigvecs = jax.vmap(jnp.linalg.eigh)(M_sym)
+    vals_clamped = jnp.maximum(eigvals, eps_psd)
+    # Reconstruct: V diag(vals) V^T
+    return jnp.einsum("nij,nj,nkj->nik", eigvecs, vals_clamped, eigvecs)
+
+
+@jax.jit
+def _deskew_points_ut_batch(
+    points: jnp.ndarray,
+    alphas: jnp.ndarray,
+    pose_sigma_se3: jnp.ndarray,
+    weights_mean: jnp.ndarray,
+    weights_cov: jnp.ndarray,
+    eps_psd: float,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Deskew all points via UT moment matching in a single batched computation.
+
+    Args:
+        points: (N, 3)
+        alphas: (N,) in [0, 1]
+        pose_sigma_se3: (S, 6) sigma-point pose increments in se3_jax ordering [trans, rot]
+        weights_mean: (S,)
+        weights_cov: (S,)
+        eps_psd: PSD clamp epsilon
+
+    Returns:
+        Tuple of (p_mean (N,3), p_cov_psd (N,3,3))
+    """
+    points = jnp.asarray(points, dtype=jnp.float64)
+    alphas = jnp.asarray(alphas, dtype=jnp.float64).reshape(-1)
+    pose_sigma_se3 = jnp.asarray(pose_sigma_se3, dtype=jnp.float64)
+    weights_mean = jnp.asarray(weights_mean, dtype=jnp.float64).reshape(-1)
+    weights_cov = jnp.asarray(weights_cov, dtype=jnp.float64).reshape(-1)
+
+    trans_sigma = pose_sigma_se3[:, 0:3]  # (S,3)
+    rot_sigma = pose_sigma_se3[:, 3:6]  # (S,3)
+
+    def _one_point(point: jnp.ndarray, alpha: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        rotvecs = alpha * rot_sigma  # (S,3)
+        trans = alpha * trans_sigma  # (S,3)
+        R = jax.vmap(se3_jax.so3_exp)(rotvecs)  # (S,3,3)
+        transformed = jnp.einsum("sij,j->si", R, point) + trans  # (S,3)
+        p_mean = jnp.sum(weights_mean[:, None] * transformed, axis=0)  # (3,)
+        delta = transformed - p_mean[None, :]  # (S,3)
+        p_cov = jnp.einsum("s,si,sj->ij", weights_cov, delta, delta)  # (3,3)
+        return p_mean, p_cov
+
+    p_mean, p_cov = jax.vmap(_one_point)(points, alphas)
+    p_cov_psd = _project_psd_batch_3x3(p_cov, eps_psd)
+    return p_mean, p_cov_psd
+
+
 # =============================================================================
 # Main Operator
 # =============================================================================
@@ -197,8 +267,6 @@ def deskew_ut_moment_match(
     timestamps = jnp.asarray(timestamps, dtype=jnp.float64)
     weights = jnp.asarray(weights, dtype=jnp.float64)
     
-    n_points = points.shape[0]
-    
     # Get mean and covariance from belief
     mean, cov, _ = belief_pred.to_moments(eps_lift)
     
@@ -215,17 +283,10 @@ def deskew_ut_moment_match(
     
     # Compute pose deltas for each sigma point at each time slice
     # Shape: (T_SLICES, SIGMA_POINTS, 6)
-    pose_deltas = jnp.zeros((T_SLICES, n_sigma, 6))
-    
-    # Extract pose slice from each sigma point
-    for s in range(n_sigma):
-        pose_s_z = sigma_points[s, SLICE_POSE]  # (6,) GC ordering: [rot, trans]
-        pose_s = pose_z_to_se3_delta(pose_s_z)  # (6,) se3_jax ordering: [trans, rot]
-        for t in range(T_SLICES):
-            # Interpolation factor for this time slice
-            alpha = (slice_times[t] - scan_start_time) / (scan_end_time - scan_start_time + 1e-12)
-            # Pose delta at this time (linear interpolation in tangent space)
-            pose_deltas = pose_deltas.at[t, s].set(alpha * pose_s)
+    pose_sigma_z = sigma_points[:, SLICE_POSE]  # (S,6) [rot, trans]
+    pose_sigma_se3 = _pose_z_to_se3_delta_batch(pose_sigma_z)  # (S,6) [trans, rot]
+    slice_alphas = (slice_times - scan_start_time) / (scan_end_time - scan_start_time + 1e-12)
+    pose_deltas = slice_alphas[:, None, None] * pose_sigma_se3[None, :, :]  # (T,S,6)
     
     # Compute excitation metrics from time offset and extrinsic contributions
     # Time offset is at index 15
@@ -246,60 +307,29 @@ def deskew_ut_moment_match(
         extrinsic_contributions=extrinsic_contributions,
     )
     
-    # Deskew each point using moment matching
-    deskewed_points = []
-    total_cov_trace = 0.0
-    
-    for i in range(n_points):
-        point = points[i]
-        time_i = float(timestamps[i])
-        weight_i = float(weights[i])
-        
-        # Find the closest time slice
-        alpha = (time_i - scan_start_time) / (scan_end_time - scan_start_time + 1e-12)
-        alpha = jnp.clip(alpha, 0.0, 1.0)
-        
-        # Interpolate pose for each sigma point at this time
-        transformed_points = jnp.zeros((n_sigma, 3))
-        for s in range(n_sigma):
-            # Interpolate pose delta for this sigma point
-            pose_s_z = sigma_points[s, SLICE_POSE]
-            pose_s = pose_z_to_se3_delta(pose_s_z)
-            pose_at_t = alpha * pose_s
-            
-            # Transform point
-            transformed_points = transformed_points.at[s].set(
-                _transform_point_by_pose(point, pose_at_t)
-            )
-        
-        # Moment matching: compute mean and covariance of transformed points
-        p_mean = jnp.sum(weights_mean[:, None] * transformed_points, axis=0)
-        
-        # Covariance
-        p_cov = jnp.zeros((3, 3))
-        for s in range(n_sigma):
-            delta = transformed_points[s] - p_mean
-            p_cov = p_cov + weights_cov[s] * jnp.outer(delta, delta)
-        
-        # Project covariance to PSD
-        p_cov_psd = domain_projection_psd(p_cov, eps_psd).M_psd
-        
-        deskewed_points.append(DeskewedPoint(
-            p_mean=p_mean,
-            p_cov=p_cov_psd,
-            time_sec=time_i,
-            weight=weight_i,
-        ))
-        
-        total_cov_trace += float(jnp.trace(p_cov_psd)) * weight_i
-    
-    # Normalize by total weight
-    total_weight = float(jnp.sum(weights))
-    predicted_cov_trace = total_cov_trace / (total_weight + constants.GC_EPS_MASS)
+    # Deskew all points using moment matching (batched, no per-point host sync)
+    alphas_pts = (timestamps - scan_start_time) / (scan_end_time - scan_start_time + 1e-12)
+    alphas_pts = jnp.clip(alphas_pts, 0.0, 1.0)
+    p_mean, p_cov_psd = _deskew_points_ut_batch(
+        points=points,
+        alphas=alphas_pts,
+        pose_sigma_se3=pose_sigma_se3,
+        weights_mean=weights_mean,
+        weights_cov=weights_cov,
+        eps_psd=eps_psd,
+    )
+
+    # Predicted covariance trace metric (weighted)
+    total_cov_trace = jnp.sum(jnp.trace(p_cov_psd, axis1=1, axis2=2) * weights)
+    total_weight = jnp.sum(weights)
+    predicted_cov_trace = float(total_cov_trace / (total_weight + constants.GC_EPS_MASS))
     
     # Build result
     result = DeskewResult(
-        deskewed_points=deskewed_points,
+        p_mean=p_mean,
+        p_cov=p_cov_psd,
+        timestamps=timestamps,
+        weights=weights,
         ut_cache=ut_cache,
         dt_effect=dt_effect,
         extrinsic_effect=extrinsic_effect,

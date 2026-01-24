@@ -39,7 +39,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict
 
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
@@ -134,7 +134,9 @@ def main() -> None:
     livox_msg_type = str(hub_node.get_parameter("livox_input_msg_type").value)
     hub_cfg.livox["input_msg_type"] = livox_msg_type
 
-    # Create all frontend nodes with parameter overrides applied *before* they read params.
+    # Create all frontend nodes with parameter overrides from config.
+    # NOTE: DeadEndAuditNode handles list param type issues internally
+    # (see ROS 2 Jazzy bug workaround in dead_end_audit_node.py).
     nodes = [
         hub_node,
         LivoxConverterNode(parameter_overrides=hub_cfg.livox),

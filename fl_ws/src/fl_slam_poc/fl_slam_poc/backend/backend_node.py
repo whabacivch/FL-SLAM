@@ -348,6 +348,7 @@ class GoldenChildBackend(Node):
         This is where the actual SLAM happens!
         """
         self.scan_count += 1
+        self.get_logger().info(f"on_lidar callback #{self.scan_count} received")
         stamp_sec = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         
         # Parse point cloud
@@ -545,12 +546,14 @@ class GoldenChildBackend(Node):
 def main():
     rclpy.init()
     node = GoldenChildBackend()
+    node.get_logger().info("Backend node created, entering spin loop...")
     
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
+        node.get_logger().info(f"Shutting down. Final counts: scans={node.scan_count}, odom={node.odom_count}, imu={node.imu_count}")
         node.destroy_node()
         rclpy.shutdown()
 

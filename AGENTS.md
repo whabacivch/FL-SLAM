@@ -6,6 +6,35 @@ These rules apply only to this project. Other projects have their own rules.
 - Build a Frobenius–Legendre compositional inference backend for dynamic SLAM.
 - Implement and verify **Golden Child SLAM v2** as a strict, branch-free, fixed-cost SLAM backend.
 
+## Target Endstate (GC v2 Full Implementation)
+
+The current pipeline is LiDAR-only with fixed noise parameters. The target endstate implements the full spec from `docs/GOLDEN_CHILD_INTERFACE_SPEC.md` including:
+
+### Adaptive Noise (Inverse-Wishart)
+- **Process noise Q**: Per-block Inverse-Wishart states (rot, trans, vel, biases, dt, extrinsic) with conjugate updates from innovation residuals.
+- **Measurement noise Σ**: IW states for gyro, accel, odom, and LiDAR measurement noise.
+- **Initialization**: Datasheet priors with low pseudocounts (ν = p + 0.5) for fast adaptation.
+  - IMU (ICM-40609): gyro σ² ≈ 8.7e-7 rad²/s², accel σ² ≈ 9.5e-5 m²/s⁴
+  - LiDAR (Mid-360): range σ ≈ 2cm, angular σ ≈ 0.15°, combined ~1e-3 m²/axis
+  - Odometry: use real 2D-aware covariances from `/odom` message (0.001 for x,y; 1e6 for z/roll/pitch)
+
+### Sensor Evidence (IMU + Odom)
+- **Accelerometer direction**: von Mises-Fisher (vMF) likelihood on S² with random concentration κ.
+- **Gyro integration**: Gaussian likelihood with IW-adaptive Σg.
+- **Odom partial observation**: Constrain `[x, y, yaw]` strongly, `[z, roll, pitch]` weakly; use message covariance or IW-adaptive.
+- **Time offset warp**: Soft membership kernel based on Δt uncertainty (no hard window boundaries).
+- **Per-scan evidence**: IMU + Odom + LiDAR evidence fused additively before fusion scale.
+
+### Likelihood-Based Evidence (Laplace/I-Projection)
+- **Replace UT regression**: Build explicit likelihood terms (vMF directional + Gaussian translational).
+- **Laplace approximation**: Compute (g, H) at z_lin via JAX autodiff or closed-form exponential family Hessians.
+- **Exponential family closed forms**: Gaussian H = Σ⁻¹, vMF H = κ(I - μμᵀ).
+
+### Invariants Preserved
+- No gating: κ adaptation is continuous via resultant statistics, not threshold-based.
+- No fixed constants: all noise parameters are IW random variables with weak priors.
+- Branch-free: IW updates happen every scan regardless of "convergence".
+
 ## Canonical References (Do Not Drift)
 - Golden Child strict interface/spec anchor: `docs/GOLDEN_CHILD_INTERFACE_SPEC.md`
 - Self-adaptive constraints: `docs/Self-Adaptive Systems Guide.md`
@@ -41,13 +70,15 @@ The root failure mode to prevent is: *multiple math paths silently coexist*, mak
 
 ## Frobenius Correction Policy (Mandatory When Applicable)
 - If any approximation is introduced, Frobenius third-order correction MUST be applied.
-  - Approximation triggers: linearization, mixture reduction, or out-of-family factor approximation.
+  - Approximation triggers: linearization, mixture reduction, or out-of-family likelihood approximation.
   - Implementation rule: `approximation_triggered => apply_frobenius_retraction`.
   - Log each trigger and correction with the affected module id and operator name.
 - If an operation is exact and in-family (e.g., Gaussian info fusion), correction is not applied.
 
 ## Evidence Fusion Rules
 - Fusion/projection use Bregman barycenters (closed-form when available; otherwise geometry-defined solvers only).
+- All sensor evidence is constructed via Laplace/I-projection at z_lin: compute (g, H) of joint NLL, project H to SPD.
+- Noise covariances (Σg, Σa, Σlidar) are IW random variables, not fixed constants; use IW posterior mean as plug-in estimate.
 
 ## Implementation Conventions (Project-Specific)
 - `fl_slam_poc/common/`: pure Python utilities (no ROS imports).

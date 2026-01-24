@@ -21,7 +21,6 @@ from fl_slam_poc.backend.operators.predict import (
 from fl_slam_poc.backend.operators.deskew import (
     deskew_ut_moment_match,
     DeskewResult,
-    DeskewedPoint,
     UTCache,
 )
 
@@ -90,7 +89,6 @@ __all__ = [
     # Deskew
     "deskew_ut_moment_match",
     "DeskewResult",
-    "DeskewedPoint",
     "UTCache",
     # Binning
     "bin_soft_assign",

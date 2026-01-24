@@ -6,6 +6,7 @@
 set -e
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export PROJECT_ROOT
 cd "$PROJECT_ROOT"
 
 # ============================================================================
@@ -18,7 +19,20 @@ GT_ALIGNED="/tmp/m3dgr_ground_truth_aligned.tum"
 WIRING_SUMMARY="/tmp/gc_wiring_summary.json"
 RESULTS_DIR="$PROJECT_ROOT/results/gc_$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="$RESULTS_DIR/slam_run.log"
-VENV_PATH="${VENV_PATH:-$PROJECT_ROOT/.venv}"
+# Detect venv path - try multiple locations
+if [ -n "$VENV_PATH" ] && [ -d "$VENV_PATH" ]; then
+    # Use explicitly set VENV_PATH if it exists
+    :
+elif [ -d "$PROJECT_ROOT/.venv" ]; then
+    # Use project-local venv if it exists
+    VENV_PATH="$PROJECT_ROOT/.venv"
+elif [ -d "$HOME/.venv" ]; then
+    # Fallback to home directory venv
+    VENV_PATH="$HOME/.venv"
+else
+    # Last resort: try to find any venv with JAX
+    VENV_PATH="$PROJECT_ROOT/.venv"
+fi
 
 # Terminal colors
 RED='\033[0;31m'
@@ -114,16 +128,37 @@ mkdir -p "$RESULTS_DIR"
 print_stage 0 4 "Preflight Checks"
 
 # Activate venv
-if [ -d "$VENV_PATH" ]; then
-    source "$VENV_PATH/bin/activate"
-    print_ok "Python venv activated"
+if [ -d "$VENV_PATH" ] && [ -x "$VENV_PATH/bin/python" ]; then
+    # Don't source `bin/activate` here.
+    # Some venvs can be moved/renamed; their activate script hardcodes the original path.
+    # Instead, "activate" by forcing the venv bin dir onto PATH and setting VIRTUAL_ENV.
+    export VIRTUAL_ENV="$VENV_PATH"
+    export PATH="$VENV_PATH/bin:$PATH"
+    hash -r 2>/dev/null || true
+    print_ok "Python venv selected: $VENV_PATH"
 else
-    print_fail "Venv not found: $VENV_PATH"
+    print_fail "Venv not found or invalid: $VENV_PATH"
+    echo "  Searched locations:"
+    echo "    - \$VENV_PATH: ${VENV_PATH:-<not set>}"
+    echo "    - \$PROJECT_ROOT/.venv: $PROJECT_ROOT/.venv"
+    echo "    - \$HOME/.venv: ${HOME}/.venv"
     exit 1
 fi
 
+# IMPORTANT: Always use the venv interpreter explicitly.
+# Rationale: calling `python3` may resolve to system Python even with a venv
+# activated, which can cause missing deps (e.g., JAX) and confusing behavior.
+PYTHON="$VENV_PATH/bin/python"
+if [ ! -x "$PYTHON" ]; then
+    print_fail "Venv python not found/executable: $PYTHON"
+    exit 1
+fi
+print_ok "Using python: $PYTHON"
+
 # Check JAX + Golden Child imports
-python3 - <<'PY'
+# Run with a clean PYTHONPATH so system Python packages can't shadow venv wheels
+# (common when ROS setup scripts have been sourced in the parent shell).
+env -u PYTHONPATH "$PYTHON" - <<'PY'
 import os, sys
 project_root = os.environ.get("PROJECT_ROOT", ".")
 pkg_root = os.path.join(project_root, "fl_ws", "src", "fl_slam_poc")
@@ -166,13 +201,16 @@ print_ok "All preflight checks passed"
 # ============================================================================
 # STAGE 1: BUILD
 # ============================================================================
-print_stage 1 4 "Build Package"
+print_stage 1 4 "Build Package (Fresh)"
 
 source /opt/ros/jazzy/setup.bash
 cd "$PROJECT_ROOT/fl_ws"
 
+# Ensure a fresh build for fl_slam_poc only (avoid stale installs)
+rm -rf "$PROJECT_ROOT/fl_ws/build/fl_slam_poc" "$PROJECT_ROOT/fl_ws/install/fl_slam_poc"
+
 BUILD_START=$(date +%s)
-colcon build --packages-select fl_slam_poc 2>&1 | while read line; do
+colcon build --packages-select fl_slam_poc --cmake-clean-cache 2>&1 | while read line; do
     NOW=$(date +%s)
     ELAPSED=$((NOW - BUILD_START))
     status_bar "BUILDING" "$ELAPSED" "$line"
@@ -296,7 +334,7 @@ print_stage 3 4 "Evaluate Trajectory"
 
 # Align ground truth
 echo "  Aligning ground truth..."
-python3 "$PROJECT_ROOT/tools/align_ground_truth.py" \
+env -u PYTHONPATH "$PYTHON" "$PROJECT_ROOT/tools/align_ground_truth.py" \
   "$GT_FILE" \
   "$EST_FILE" \
   "$GT_ALIGNED" 2>&1 | sed 's/^/    /'
@@ -313,7 +351,7 @@ OPREPORT
 # Run evaluation
 echo ""
 echo "  Computing metrics..."
-python3 "$PROJECT_ROOT/tools/evaluate_slam.py" \
+env -u PYTHONPATH "$PYTHON" "$PROJECT_ROOT/tools/evaluate_slam.py" \
   "$GT_ALIGNED" \
   "$EST_FILE" \
   "$RESULTS_DIR" \
@@ -354,7 +392,7 @@ if [ -f "$RESULTS_DIR/wiring_summary.json" ]; then
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     
     # Parse JSON with Python
-    python3 - "$RESULTS_DIR/wiring_summary.json" <<'PYSCRIPT'
+    env -u PYTHONPATH "$PYTHON" - "$RESULTS_DIR/wiring_summary.json" <<'PYSCRIPT'
 import sys
 import json
 

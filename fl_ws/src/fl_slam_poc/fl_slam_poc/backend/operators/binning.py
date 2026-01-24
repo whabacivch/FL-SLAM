@@ -22,8 +22,6 @@ from fl_slam_poc.common.certificates import (
 from fl_slam_poc.common.primitives import (
     domain_projection_psd,
     inv_mass,
-    softmax,
-    safe_normalize,
 )
 
 
@@ -113,25 +111,19 @@ def bin_soft_assign(
     bin_directions = jnp.asarray(bin_directions, dtype=jnp.float64)
     
     n_points = point_directions.shape[0]
-    n_bins = bin_directions.shape[0]
-    
-    # Compute similarities (dot products)
-    # Shape: (N, B)
+
+    # Compute similarities (dot products): (N, B)
     similarities = point_directions @ bin_directions.T
-    
-    # Apply softmax with temperature to each row
-    # Higher similarity -> higher probability
-    responsibilities = jnp.zeros((n_points, n_bins), dtype=jnp.float64)
-    max_resp = 0.0
-    total_entropy = 0.0
-    
-    for i in range(n_points):
-        resp_i = softmax(similarities[i], tau)
-        responsibilities = responsibilities.at[i].set(resp_i)
-        max_resp = jnp.maximum(max_resp, jnp.max(resp_i))
-        # Entropy per point (continuous measure of assignment quality)
-        total_entropy = total_entropy - jnp.sum(resp_i * jnp.log(resp_i + constants.GC_EPS_MASS))
-    
+
+    # Batched soft assignment (no per-point Python loop)
+    responsibilities = jax.nn.softmax(similarities / tau, axis=1)
+
+    # Entropy-based quality metrics (continuous, branch-free)
+    max_resp = jnp.max(responsibilities)
+    entropy_per_point = -jnp.sum(
+        responsibilities * jnp.log(responsibilities + constants.GC_EPS_MASS), axis=1
+    )
+    total_entropy = jnp.sum(entropy_per_point)
     avg_entropy = float(total_entropy / (n_points + constants.GC_EPS_MASS))
     
     # Build result
@@ -199,40 +191,21 @@ def scan_bin_moment_match(
     n_points = points.shape[0]
     n_bins = responsibilities.shape[1]
     
-    # Initialize accumulator arrays
-    N = jnp.zeros(n_bins, dtype=jnp.float64)
-    s_dir = jnp.zeros((n_bins, 3), dtype=jnp.float64)
-    sum_p = jnp.zeros((n_bins, 3), dtype=jnp.float64)
-    sum_ppT = jnp.zeros((n_bins, 3, 3), dtype=jnp.float64)
-    sum_cov = jnp.zeros((n_bins, 3, 3), dtype=jnp.float64)
-    
-    # Accumulate sufficient statistics
-    for i in range(n_points):
-        w_i = weights[i]
-        p_i = points[i]
-        cov_i = point_covariances[i]
-        
-        # Normalize point direction
-        d_i, _ = safe_normalize(p_i, eps_mass)
-        
-        for b in range(n_bins):
-            r_ib = responsibilities[i, b]
-            w_ib = w_i * r_ib  # Weighted responsibility
-            
-            # Mass
-            N = N.at[b].add(w_ib)
-            
-            # Directional resultant
-            s_dir = s_dir.at[b].add(w_ib * d_i)
-            
-            # Position sum
-            sum_p = sum_p.at[b].add(w_ib * p_i)
-            
-            # Position scatter
-            sum_ppT = sum_ppT.at[b].add(w_ib * jnp.outer(p_i, p_i))
-            
-            # Covariance sum (for uncertainty propagation)
-            sum_cov = sum_cov.at[b].add(w_ib * cov_i)
+    # Weighted responsibilities per bin: (N, B)
+    w_r = weights[:, None] * responsibilities
+
+    # Normalize point directions (batched, branch-free)
+    norms = jnp.linalg.norm(points, axis=1, keepdims=True)
+    d = points / (norms + eps_mass)  # (N,3)
+
+    # Sufficient statistics (batched; avoids O(N*B) Python loops)
+    N = jnp.sum(w_r, axis=0)  # (B,)
+    s_dir = w_r.T @ d  # (B,3)
+    sum_p = w_r.T @ points  # (B,3)
+
+    ppT = points[:, :, None] * points[:, None, :]  # (N,3,3)
+    sum_ppT = jnp.einsum("nb,nij->bij", w_r, ppT)  # (B,3,3)
+    sum_cov = jnp.einsum("nb,nij->bij", w_r, point_covariances)  # (B,3,3)
     
     # Compute derived quantities using InvMass (no N==0 branches)
     p_bar = jnp.zeros((n_bins, 3), dtype=jnp.float64)

@@ -4,6 +4,85 @@ Project: Frobenius-Legendre SLAM POC (Impact Project_v1)
 
 This file tracks all significant changes, design decisions, and implementation milestones for the FL-SLAM project.
 
+## 2026-01-24: Fixed ROS 2 Jazzy Empty-List Parameter Type Bug
+
+### Root Cause
+
+ROS 2 rclpy bug (ros2/rclpy #912, ros2/ros2 #1518): when `declare_parameters()` is called and a parameter override already exists, rclpy internally extracts `override.value` and re-infers its type. For empty lists `[]`, this produces `BYTE_ARRAY` instead of `STRING_ARRAY`, causing `InvalidParameterTypeException`.
+
+Previous fix attempts (passing typed Parameters, declaring with explicit types) failed because **both** happen in the buggy code path - rclpy ignores the original Parameter type and the declared type when an override value exists.
+
+### Fix
+
+DeadEndAuditNode now **bypasses the buggy code path entirely**:
+1. Filter `topic_specs` and `required_topics` OUT of `parameter_overrides` before `super().__init__()`
+2. Declare with explicit `STRING_ARRAY` types (no override exists, so no type re-inference)
+3. Apply values via `set_parameters()` AFTER declaration with explicitly typed Parameters
+
+This pattern is documented in the code for future maintainers.
+
+## 2026-01-24: Documentation Update for GC v2 Target Endstate
+
+### Summary
+
+Updated documentation to reflect the target endstate for GC v2 full implementation:
+
+- **AGENTS.md**: Added "Target Endstate" section describing adaptive noise (IW), IMU fusion (vMF), and likelihood-based evidence
+- **README.md**: Updated MVP status, Quick Start, and System Architecture sections to focus on GC v2
+- **ROADMAP.md**: Added "Immediate Priority: GC v2 Full Implementation" section with 5 phases
+
+Key target features documented:
+- Inverse-Wishart process/measurement noise with datasheet priors (ICM-40609 IMU, Mid-360 LiDAR)
+- vMF accelerometer direction + Gaussian gyro likelihoods for IMU fusion
+- Likelihood-based LiDAR evidence via Laplace/I-projection (replacing UT regression)
+- Continuous adaptation with no gating/branching
+
+## 2026-01-24: GC Eval Fresh Build
+
+### Summary
+
+Updated the GC evaluation script to force a fresh build of `fl_slam_poc` before running, preventing stale install artifacts from being used.
+
+## 2026-01-24: GC Eval Uses Venv Python Explicitly
+
+### Summary
+
+Updated the GC evaluation script to run preflight + eval steps with the venv’s `python` explicitly (not `python3`), preventing accidental use of system Python and missing-dependency failures (e.g., JAX).
+
+## 2026-01-24: GC Eval Sanitizes PYTHONPATH for Python Tools
+
+### Summary
+
+Run preflight + evaluation Python steps with `PYTHONPATH` unset so ROS/system Python paths can’t shadow venv wheels (fixes NumPy/matplotlib ABI mismatch failures).
+
+## 2026-01-24: Fix GC Backend Callback Starvation (Vectorized Deskew + Binning)
+
+### Summary
+
+Refactored the GC LiDAR compute path to remove per-point Python loops and per-point device→host sync (`float(jnp_scalar)`), which was stalling `on_lidar` long enough that the backend appeared to “not receive” messages (BEST_EFFORT drops while blocked).
+
+### Changes
+
+- `DeskewUTMomentMatch` now deskews all points in a single batched JAX computation and returns stacked arrays (no `List[DeskewedPoint]`, no `float(timestamps[i])` in a loop).
+- `BinSoftAssign` and `ScanBinMomentMatch` now compute responsibilities and sufficient statistics with batched JAX ops (no O(N*B) Python loops).
+- Pipeline directional normalization is now batched (no per-point `.at[i].set(...)` loops).
+
+### Verification
+
+- `bash tools/run_and_evaluate_gc.sh` shows non-zero LiDAR scans and pipeline runs in the wiring summary.
+
+## 2026-01-24: Dead-End Audit Param Types
+
+### Summary
+
+Declared dead-end audit list parameters with explicit `STRING_ARRAY` types to avoid ROS 2 empty-list inference crashes during parameter overrides.
+
+## 2026-01-24: Dead-End Audit Typed Overrides
+
+### Summary
+
+Pass typed `STRING_ARRAY` overrides from `gc_sensor_hub` into `DeadEndAuditNode` so ROS 2 never infers list params as `BYTE_ARRAY`.
+
 ## 2026-01-24: Sensor Hub Architecture + Canonical Topic Naming
 
 ### Summary

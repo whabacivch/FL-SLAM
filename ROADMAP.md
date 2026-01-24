@@ -1,9 +1,9 @@
 # FL-SLAM Roadmap (Impact Project v1)
 
-This roadmap is organized around the current **M3DGR rosbag MVP** pipeline and a clean separation between:
-- **MVP operational code**: required to run `tools/run_and_evaluate.sh`
-- **Near-term priorities**: Wheel odom separation, dense RGB-D in 3D mode, evaluation hardening
-- **Future/experimental code**: kept for later work, but not required for the MVP
+This roadmap is organized around the **Golden Child SLAM v2** implementation and a clean separation between:
+- **MVP operational code**: required to run `tools/run_and_evaluate_gc.sh`
+- **Immediate priorities**: Adaptive noise (IW), IMU fusion (vMF), factor-based evidence
+- **Future work**: Additional datasets, dense RGB-D, visual loop factors
 
 ---
 
@@ -26,6 +26,60 @@ This roadmap is organized around the current **M3DGR rosbag MVP** pipeline and a
 - **Adaptive Process Noise** (`fl_ws/src/fl_slam_poc/fl_slam_poc/backend/process_noise.py`): Inverse-Wishart model for online process noise estimation
 - **Adaptive Parameters** (`fl_ws/src/fl_slam_poc/fl_slam_poc/backend/adaptive.py`): Bayesian online parameter estimation with Normal priors
 - **Reference**: See `docs/Self-Adaptive Systems Guide.md` for full self-adaptive system specifications
+
+---
+
+## Immediate Priority: GC v2 Full Implementation
+
+**Goal:** Implement the full spec from `docs/GOLDEN_CHILD_INTERFACE_SPEC.md` including adaptive noise, IMU fusion, and factor-based evidence.
+
+### Phase 1: Inverse-Wishart Process Noise (Replace Fixed Q)
+- Replace `build_default_process_noise()` with `ProcessNoiseState` containing 7 per-block IW states
+- Initialize with datasheet priors and low pseudocounts (ν = p + 0.5) for fast adaptation
+- Datasheet values:
+  - IMU (ICM-40609): gyro σ² ≈ 8.7e-7 rad²/s², accel σ² ≈ 9.5e-5 m²/s⁴
+  - LiDAR (Mid-360): range σ ≈ 2cm, angular σ ≈ 0.15°, combined ~1e-3 m²/axis
+  - Odometry: use real 2D-aware covariances from `/odom` message
+- **Files**: `backend/operators/predict.py`, `backend/backend_node.py`
+
+### Phase 2: Sensor Evidence (IMU + Odom)
+- **IMU evidence**: Build `ImuEvidence` operator producing `(L_imu, h_imu)` from IMU buffer
+  - Accelerometer direction as vMF likelihood with κ from resultant statistics
+  - Gyro as Gaussian likelihood with IW-adaptive Σg
+  - Soft time-offset kernel (no hard scan boundaries)
+- **Odom evidence**: Build `OdomEvidence` operator producing `(L_odom, h_odom)`
+  - Partial observation: constrain `[x, y, yaw]` strongly, `[z, roll, pitch]` weakly
+  - Use message covariance when available, IW-adaptive otherwise
+  - Keep separate from IMU (fuse additively, don't pre-combine)
+- **Files**: new `backend/operators/imu_evidence.py`, new `backend/operators/odom_evidence.py`, `backend/pipeline.py`
+
+### Phase 3: IW Conjugate Updates + Measurement Noise
+- Compute innovation residuals after `PoseUpdateFrobeniusRecompose`
+- Per-block IW updates: `Psi += outer(residual_block)`, `nu += 1`
+- Add IW states for measurement noise (Σg, Σa, Σlidar)
+- Odometry covariance as hyper-evidence for trans/vel IW priors
+- **Files**: new `backend/operators/adaptive_noise.py`, `backend/pipeline.py`
+
+### Phase 4: Likelihood-Based LiDAR Evidence (Replace UT Regression)
+- Replace `lidar_quadratic_evidence` with explicit Laplace/I-projection
+- Build explicit likelihood terms: vMF directional + Gaussian translational per bin
+- Use JAX autodiff or closed-form exponential family Hessians
+  - Gaussian: H = Σ⁻¹
+  - vMF: H = κ(I - μμᵀ)
+- Project joint NLL Hessian to information form evidence (L, h)
+- Add LiDAR noise IW updates from residuals
+- **Files**: `backend/operators/lidar_evidence.py`
+
+### Phase 5: Integration and Validation
+- Full pipeline integration (updated 16-step sequence)
+- Certificate extensions for IW state summaries
+- M3DGR evaluation and metric comparison across phases
+- **Files**: `backend/pipeline.py`, `backend/certificates.py`
+
+### Key Invariants (Must Preserve)
+- No gating: all adaptations via continuous scaling
+- No fixed constants: all noise params are IW random variables with weak priors
+- Branch-free: IW updates happen every scan regardless of "convergence"
 
 ---
 
@@ -998,32 +1052,31 @@ pi_outlier = 0.1       # outlier mixture weight
 
 ## Roadmap Summary
 
-### Immediate Work (Priority 1)
-1. ✅ IMU integration + 15D state (Phases 1-2) - **COMPLETED**
-2. Wheel odom separation + factor scheduling (Phase 3)
-3. Dense RGB-D in 3D mode (Phase 4)
-4. Provenance + evaluation hardening (Phases 5-6)
-5. Self-adaptive systems integration (see Section 5.G)
+### Immediate Work (Priority 1) — GC v2 Full Implementation (Phases 1-5)
+1. ✅ 22D augmented state + 15-step LiDAR pipeline - **COMPLETED**
+2. ⏳ Phase 1: Inverse-Wishart adaptive process noise (replace fixed Q with datasheet priors)
+3. ⏳ Phase 2: Sensor evidence (IMU vMF/gyro + Odom partial observation)
+4. ⏳ Phase 3: IW conjugate updates + measurement noise IW states (Σg, Σa, Σodom, Σlidar)
+5. ⏳ Phase 4: Likelihood-based LiDAR evidence (replace UT regression with Laplace/I-projection)
+6. ⏳ Phase 5: Integration and validation (17-step pipeline, M3DGR evaluation)
 
-### Near-Term Future Work (Priority 2)
-- Camera-frame Gaussian splat map with vMF shading (K=512, J=2)
-- Replaces histogram-based RGB-D descriptors
-- Enables view-dependent appearance modeling for loop closure
+### Near-Term Future Work (Priority 2) — Phases 6-8
+7. ⏳ Phase 6: Dense RGB-D in 3D mode
+8. ⏳ Phase 7: Provenance + evaluation hardening
+9. ⏳ Phase 8: Camera-frame Gaussian splat map with vMF shading (K=512, J=2)
 
-### Medium-Term (Priority 3)
-- Alternative datasets (TurtleBot3, NVIDIA r2b)
-- GPU acceleration
-- Gazebo live testing
+### Medium-Term (Priority 3) — Phases 9-11
+10. ⏳ Phase 9: Alternative datasets (TurtleBot3, NVIDIA r2b)
+11. ⏳ Phase 10: GPU acceleration
+12. ⏳ Phase 11: Gazebo live testing
 
-### Long-Term (Priority 4)
-- Visual loop factors (bearing-based) with adaptive gating
-- GNSS integration (if dataset available) with adaptive sensor weighting
-- Semantic observations (Dirichlet factors) with adaptive concentration
-- Backend optimizations (hierarchical/budgeted recomposition) with adaptive Frobenius correction
-- Dirichlet semantic SLAM integration with adaptive association
-- Monge-Ampère transport for dynamic maps
-- System-wide adaptive coordinator
-- Visualization enhancements
+### Long-Term (Priority 4) — Phases 12-17
+13. ⏳ Phase 12: Visual loop closures (bearing-based) with adaptive gating
+14. ⏳ Phase 13: GNSS integration with adaptive sensor weighting
+15. ⏳ Phase 14: Semantic observations (Dirichlet)
+16. ⏳ Phase 15: Backend optimizations (hierarchical/budgeted recomposition)
+17. ⏳ Phase 16: Monge-Ampère transport for dynamic maps
+18. ⏳ Phase 17: System-wide adaptive coordinator
 
 ---
 

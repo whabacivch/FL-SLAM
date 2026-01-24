@@ -10,25 +10,31 @@ In practice, this means layering defenses in SLAM: Use principled tools like Wis
 
 ## MVP Status
 
-The current **MVP (Minimum Viable Product)** focuses on the **M3DGR Dynamic01 rosbag** evaluation pipeline. This is the smallest reproducible case for validating the FL-SLAM algorithm.
+The current **MVP** implements **Golden Child SLAM v2** — a strict, branch-free, fixed-cost SLAM backend validated on the **M3DGR Dynamic01 rosbag**.
 
 Bag topic inventory + usage map (canonical): `docs/BAG_TOPICS_AND_USAGE.md`.
 
-**MVP Components:**
-- M3DGR rosbag processing (Livox LiDAR + IMU + RGB-D)
-- Frontend: sensor association, ICP loop detection, anchor management, IMU preintegration
-- Backend: information-geometric fusion, trajectory estimation (6DOF/15DOF state)
-- Evaluation: ATE/RPE metrics and publication-quality plots
+**Current Architecture (GC v2):**
+- **22D augmented state**: pose (6D) + velocity (3D) + gyro bias (3D) + accel bias (3D) + time offset (1D) + LiDAR-IMU extrinsic (6D)
+- **LiDAR-only pipeline** (current): 15-step fixed-cost scan processing with UT deskew, soft binning, Wahba rotation, WLS translation
+- **Sensor Hub**: Single-process frontend converting raw topics to canonical `/gc/sensors/*` topics
+- **No gates/branches**: All operators are total functions with continuous influence scalars
 
-**Policy note:** IMU bias evolution is handled by an adaptive Wishart model (seeded by a fixed prior). The MVP pipeline intentionally does **not** use `imu_*_random_walk` parameters.
+**Target Endstate (in progress):**
+- **Inverse-Wishart adaptive noise**: Process and measurement covariances as conjugate IW states with datasheet priors
+- **Sensor evidence (IMU + Odom)**: vMF accelerometer + Gaussian gyro + Odom partial observation (x,y,yaw strong; z,roll,pitch weak)
+- **Likelihood-based evidence**: Replace UT regression with Laplace/I-projection of explicit likelihood terms
 
-**Current Priorities:** See [`ROADMAP.md`](ROADMAP.md) for:
-- Priority 1: IMU integration + 15D state extension, wheel odom separation, dense RGB-D in 3D mode
-- Priority 2-4: Alternative datasets, GPU acceleration, research features
+**Policy notes:**
+- All noise parameters will be IW random variables (not fixed constants)
+- IMU covariances from Livox are zeros (placeholder); using ICM-40609 datasheet specs as weak priors
+- Odometry covariances from bag are real 2D-aware values (used as informative priors)
+
+**Evaluation:** `bash tools/run_and_evaluate_gc.sh` (artifacts under `results/gc_*/`)
 
 ---
 
-## Quick Start (MVP)
+## Quick Start (GC v2)
 
 ### Build
 ```bash
@@ -38,138 +44,114 @@ colcon build --packages-select fl_slam_poc
 source install/setup.bash
 ```
 
-### Run MVP Pipeline
+### Run GC v2 Pipeline (Primary)
 ```bash
-# Full pipeline: SLAM + metrics + plots
+# Golden Child SLAM v2: full pipeline + metrics + plots
+bash tools/run_and_evaluate_gc.sh
+```
+
+This runs the M3DGR Dynamic01 rosbag through the GC v2 pipeline and generates evaluation artifacts in `results/gc_YYYYMMDD_HHMMSS/`.
+
+### Run Legacy Pipeline (if needed)
+```bash
+# Legacy frontend/backend architecture (for comparison)
 bash tools/run_and_evaluate.sh
 ```
 
-This runs the M3DGR Dynamic01 rosbag through the complete SLAM pipeline and generates evaluation metrics/plots in `results/m3dgr_YYYYMMDD_HHMMSS/`.
+Legacy results go to `results/m3dgr_YYYYMMDD_HHMMSS/`.
 
 ---
 
 ## System Architecture
 
-### M3DGR Rosbag Pipeline
+### Golden Child SLAM v2 Pipeline (Current)
 
-The following diagram illustrates the complete data flow for the M3DGR rosbag evaluation pipeline:
+The GC v2 architecture uses a single-process sensor hub and a branch-free 15-step pipeline:
 
 ```mermaid
-graph TB
-    subgraph "Rosbag Topics - M3DGR (Inputs)"
-        ODOM["/odom<br/>(nav_msgs/Odometry)<br/>absolute pose"]
-        LIVOX["/livox/mid360/lidar<br/>(Livox CustomMsg)"]
-        IMU["/livox/mid360/imu<br/>(sensor_msgs/Imu)"]
-        RGB_COMPRESSED["/camera/color/image_raw/compressed"]
-        DEPTH_COMPRESSED["/camera/aligned_depth_to_color/image_raw/compressedDepth"]
+flowchart LR
+    subgraph SOURCE["Rosbag M3DGR"]
+        BAG[("Dynamic01_ros2")]
     end
 
-    subgraph "Preprocessors - frontend/"
-        ODOM_BRIDGE["odom_bridge.py<br/>absolute → delta pose"]
-        LIVOX_CONV["livox_converter.py<br/>Livox → PointCloud2"]
-        IMG_DECOMP_CPP["image_decompress_cpp<br/>(C++)"]
+    subgraph HUB["gc_sensor_hub (single process)"]
+        direction TB
+        LIVOX[livox_converter]
+        ODOM_N[odom_normalizer]
+        IMU_N[imu_normalizer]
+        DEAD[dead_end_audit]
     end
 
-    subgraph "Shared - common/"
-        SE3["se3.py<br/>SE(3) transforms"]
-        DIRICHLET["dirichlet_geom.py<br/>Dirichlet geometry"]
+    subgraph BACKEND["gc_backend_node"]
+        direction TB
+        PIPE["GC v2 Pipeline - 15 Steps"]
     end
 
-    subgraph "Frontend Node - frontend/"
-        FRONTEND["frontend_node.py<br/>(orchestration)"]
-        SENSOR_IO["sensor_io.py<br/>(buffers + TF)"]
-        ANCHOR_MGR["anchor_manager.py<br/>anchor lifecycle"]
-        LOOP_PROC["loop_processor.py<br/>loop detection"]
-        ICP_GPU["pointcloud_gpu.py<br/>(GPU ICP)"]
-        ICP_CPU["icp.py<br/>(CPU ICP)"]
-        DESCRIPTOR["descriptor_builder.py<br/>NIG descriptors"]
+    subgraph OUT["Outputs"]
+        STATE["/gc/state + TF"]
+        TRAJ["/gc/trajectory"]
     end
 
-    subgraph "Backend Node - backend/"
-        BACKEND["backend_node.py<br/>(orchestration)"]
-        GAUSSIAN_INFO["gaussian_info.py<br/>(state fusion)"]
-        IMU_KERNEL["imu_jax_kernel.py<br/>(JAX/GPU)"]
-        DIRICHLET_ROUTING["dirichlet_routing.py"]
-        LIE_JAX["lie_jax.py<br/>(JAX/GPU)"]
-    end
+    BAG -->|"/livox/mid360/lidar"| LIVOX
+    BAG -->|"/odom"| ODOM_N
+    BAG -->|"/livox/mid360/imu"| IMU_N
+    BAG -->|"unused topics"| DEAD
 
-    subgraph "Outputs"
-        STATE["/cdwm/state<br/>Estimated state"]
-        TRAJ["/cdwm/trajectory<br/>Trajectory path"]
-        MAP["/cdwm/map<br/>Point cloud map"]
-    end
+    LIVOX -->|"/gc/sensors/lidar_points"| PIPE
+    ODOM_N -->|"/gc/sensors/odom"| PIPE
+    IMU_N -->|"/gc/sensors/imu"| PIPE
 
-    ODOM --> ODOM_BRIDGE
-    LIVOX --> LIVOX_CONV
-    RGB_COMPRESSED --> IMG_DECOMP_CPP
-    DEPTH_COMPRESSED --> IMG_DECOMP_CPP
-
-    ODOM_BRIDGE -->|"/sim/odom<br/>(delta pose)"| FRONTEND
-    ODOM_BRIDGE -->|"/sim/odom<br/>(delta pose)"| BACKEND
-    LIVOX_CONV -->|"/lidar/points<br/>(PointCloud2)"| FRONTEND
-    IMU -->|"/livox/mid360/imu"| FRONTEND
-
-    FRONTEND --> SENSOR_IO
-    SENSOR_IO --> ANCHOR_MGR
-    SENSOR_IO --> LOOP_PROC
-    LOOP_PROC --> ICP_GPU
-    LOOP_PROC --> ICP_CPU
-    ANCHOR_MGR --> DESCRIPTOR
-
-    FRONTEND -->|"/sim/anchor_create<br/>(AnchorCreate.msg)"| BACKEND
-    FRONTEND -->|"/sim/loop_factor<br/>(LoopFactor.msg)"| BACKEND
-    FRONTEND -->|"/sim/imu_segment<br/>(IMUSegment.msg)"| BACKEND
-
-    BACKEND --> GAUSSIAN_INFO
-    BACKEND --> IMU_KERNEL
-    BACKEND --> DIRICHLET_ROUTING
-    IMU_KERNEL --> LIE_JAX
-
-    DIRICHLET -.->|"imports"| DIRICHLET_ROUTING
-
-    BACKEND --> STATE
-    BACKEND --> TRAJ
-    BACKEND --> MAP
-
-    style RGB_DISABLED fill:#ffcccc,stroke:#ff0000
-    style DEPTH_DISABLED fill:#ffcccc,stroke:#ff0000
-    style IMG_DECOMP fill:#ffcccc,stroke:#ff0000
+    PIPE --> STATE
+    PIPE --> TRAJ
 ```
 
-### Component Summary
+**Topic Naming Convention:**
+- Raw topics stay as-is from bag (`/odom`, `/livox/mid360/*`)
+- Sensor Hub publishes canonical topics under `/gc/sensors/*`
+- Backend subscribes ONLY to `/gc/sensors/*` (never raw topics)
+
+**15-Step Pipeline (per scan, per hypothesis):**
+1. PointBudgetResample → 2. PredictDiffusion → 3. DeskewUTMomentMatch → 4. BinSoftAssign → 5. ScanBinMomentMatch → 6. KappaFromResultant → 7. WahbaSVD → 8. TranslationWLS → 9. LidarQuadraticEvidence → 10. FusionScaleFromCertificates → 11. InfoFusionAdditive → 12. PoseUpdateFrobeniusRecompose → 13. PoseCovInflationPushforward → 14. AnchorDriftUpdate → 15. HypothesisBarycenterProjection
+
+**Current status:** LiDAR-only (IMU/odom subscribed but not fused into belief). See `docs/Fusion_issues.md` for details.
+
+### Legacy Architecture (Archived)
+
+The legacy frontend/backend architecture is preserved under `archive/` for reference but is not used by the GC v2 evaluation pipeline.
+
+### Component Summary (GC v2)
 
 **Rosbag Topics (M3DGR):**
 - `/odom` - Absolute pose odometry (`nav_msgs/Odometry`)
 - `/livox/mid360/lidar` - Livox LiDAR data (`Livox CustomMsg`)
-- `/camera/imu` - IMU data (`sensor_msgs/Imu`)
-- Camera topics (RGB/Depth) - Present in bag as compressed; decompressed by `image_decompress_cpp` (usage still controlled by frontend flags)
+- `/livox/mid360/imu` - Livox IMU data (`sensor_msgs/Imu`)
+- Camera topics (RGB/Depth) - Present but not used in GC v2 eval
 
-**Preprocessors (`frontend/`):**
-- `odom_bridge.py` - Converts absolute odometry to delta poses (`/odom` → `/sim/odom`)
-- `livox_converter.py` - Converts Livox messages to PointCloud2 (`/livox/mid360/lidar` → `/lidar/points`)
-- `image_decompress_cpp` - Decompresses rosbag images (compressed RGB + compressedDepth → raw Image topics)
+**Sensor Hub (`gc_sensor_hub`):**
+- `livox_converter` - Converts Livox → `/gc/sensors/lidar_points`
+- `odom_normalizer` - Normalizes odom → `/gc/sensors/odom`
+- `imu_normalizer` - Normalizes IMU → `/gc/sensors/imu`
+- `dead_end_audit` - Monitors unused topics for accountability
 
-**Frontend Node (`frontend/`):**
-- `frontend_node.py` - Main orchestration node
-- `sensor_io.py` - Sensor buffering, TF management, point cloud handling
-- `anchor_manager.py` - Anchor lifecycle management
-- `loop_processor.py` - Loop detection via ICP
-- `pointcloud_gpu.py` / `icp.py` - GPU/CPU ICP registration
-- `descriptor_builder.py` - NIG descriptor extraction
-- **Publishes:** `/sim/anchor_create`, `/sim/loop_factor`, `/sim/imu_segment`
-
-**Backend Node (`backend/`):**
-- `backend_node.py` - Main orchestration node
-- `gaussian_info.py` - Gaussian information fusion (closed-form)
-- `imu_jax_kernel.py` - IMU preintegration kernels (JAX/GPU)
-- `lie_jax.py` - Lie algebra operations (JAX/GPU)
-- `dirichlet_routing.py` - Dirichlet-based routing
-- **Publishes:** `/cdwm/state`, `/cdwm/trajectory`, `/cdwm/map`
+**Backend Node (`gc_backend_node`):**
+- `backend_node.py` - 15-step fixed-cost pipeline orchestration
+- `pipeline.py` - Per-scan pipeline implementation
+- `operators/` - Individual operator implementations:
+  - `predict.py` - PredictDiffusion (process noise)
+  - `deskew.py` - DeskewUTMomentMatch (UT sigma-point deskew)
+  - `binning.py` - BinSoftAssign + ScanBinMomentMatch
+  - `kappa.py` - KappaFromResultant (vMF concentration)
+  - `wahba.py` - WahbaSVD (rotation estimation)
+  - `translation.py` - TranslationWLS (weighted least squares)
+  - `lidar_evidence.py` - LidarQuadraticEvidence (to be replaced)
+  - `fusion.py` - InfoFusionAdditive
+  - `recompose.py` - PoseUpdateFrobeniusRecompose
+- **Publishes:** `/gc/state`, `/gc/trajectory`, `/gc/status`
 
 **Shared Utilities (`common/`):**
-- `se3.py` - SE(3) transformation operations
-- `dirichlet_geom.py` - Dirichlet distribution geometry
-- `op_report.py` - Operation reporting (exactness, approximations, Frobenius corrections)
+- `belief.py` - BeliefGaussianInfo (22D augmented state)
+- `certificates.py` - CertBundle, ExpectedEffect
+- `geometry/se3_jax.py` - SE(3) JAX operations
 
 ---
 
@@ -354,27 +336,26 @@ See [`docs/EVALUATION.md`](docs/EVALUATION.md) for detailed evaluation guide.
 
 ---
 
-## Key Topics
+## Key Topics (GC v2)
 
-### Input Topics
-- `/odom` - Odometry (absolute pose, converted to delta by odom bridge)
-- `/lidar/points` - PointCloud2 (from Livox converter)
-- `/camera/imu` - IMU data (`sensor_msgs/Imu`)
-- `/scan` - LaserScan (optional, 2D mode)
-- `/camera/image_raw` - Image (optional, RGB-D mode)
-- `/camera/depth/image_raw` - Depth (optional, RGB-D mode)
+### Raw Topics (from M3DGR Rosbag)
+- `/odom` - Absolute pose odometry (`nav_msgs/Odometry`)
+- `/livox/mid360/lidar` - Livox LiDAR data (`livox_ros_driver2/CustomMsg`)
+- `/livox/mid360/imu` - Livox IMU data (`sensor_msgs/Imu`)
 
-### Internal Topics (Frontend → Backend)
-- `/sim/odom` - Delta pose odometry (from odom bridge)
-- `/sim/anchor_create` - Anchor creation events (`AnchorCreate.msg`)
-- `/sim/loop_factor` - Loop closure constraints (`LoopFactor.msg`)
-- `/sim/imu_segment` - IMU preintegrated segments (`IMUSegment.msg`)
-- `/sim/rgbd_evidence` - RGB-D dense evidence (JSON, optional)
+### Canonical Topics (Sensor Hub → Backend)
+- `/gc/sensors/lidar_points` - PointCloud2 (from Livox converter)
+- `/gc/sensors/odom` - Normalized odometry
+- `/gc/sensors/imu` - Normalized IMU
 
-### Output Topics
-- `/cdwm/state` - Estimated state (`nav_msgs/Odometry`)
-- `/cdwm/trajectory` - Trajectory path (`nav_msgs/Path`)
-- `/cdwm/map` - Point cloud map (`sensor_msgs/PointCloud2`)
+### Output Topics (GC Backend)
+- `/gc/state` - Estimated state (`nav_msgs/Odometry`) + TF
+- `/gc/trajectory` - Trajectory path (`nav_msgs/Path`)
+- `/gc/runtime_manifest` - Operator/sensor configuration (JSON)
+- `/gc/status` - Backend status and diagnostics
+
+### Dead-End Audit Topics (monitored but not fused)
+- `/camera/imu`, `/camera/color/image_raw/compressed`, etc. (see `gc_dead_end_audit.yaml`)
 - `/cdwm/op_report` - Operation reports (JSON)
 - `/cdwm/frontend_status` - Frontend sensor status (JSON)
 - `/cdwm/backend_status` - Backend mode and diagnostics (JSON)

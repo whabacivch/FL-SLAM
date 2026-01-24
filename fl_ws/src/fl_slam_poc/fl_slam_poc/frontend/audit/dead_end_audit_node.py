@@ -16,10 +16,11 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 
@@ -65,16 +66,65 @@ def _stamp_sec_from_msg(msg: Any) -> Optional[float]:
 class DeadEndAuditNode(Node):
     """Subscribes to explicitly listed topics for accountability only."""
 
-    def __init__(self, parameter_overrides: Optional[Dict[str, Any]] = None) -> None:
-        from rclpy.parameter import Parameter
+    # -------------------------------------------------------------------------
+    # ROS 2 Jazzy Bug Workaround (rclpy #912, ros2/ros2 #1518)
+    # -------------------------------------------------------------------------
+    # When a parameter override contains an empty list [] and you call
+    # declare_parameters() with an explicit type, ROS 2 internally extracts
+    # the override value and RE-INFERS its type. Empty lists become BYTE_ARRAY,
+    # causing InvalidParameterTypeException when STRING_ARRAY is declared.
+    #
+    # Broken pattern (DO NOT USE):
+    #   super().__init__(..., parameter_overrides=[Parameter("x", STRING_ARRAY, [])])
+    #   self.declare_parameters("", [("x", STRING_ARRAY)])  # CRASH: type mismatch
+    #
+    # Working pattern (used here):
+    #   1. Filter list params OUT of parameter_overrides before super().__init__()
+    #   2. Declare list params with explicit types (no override exists now)
+    #   3. Apply values via set_parameters() AFTER declaration
+    # -------------------------------------------------------------------------
+    _LIST_PARAM_NAMES = frozenset({"topic_specs", "required_topics"})
 
-        overrides = None
+    def __init__(self, parameter_overrides: Optional[Union[Dict[str, Any], Sequence[Parameter]]] = None) -> None:
+        # Step 1: Extract list param values and filter them OUT of overrides
+        list_param_values: Dict[str, List[str]] = {}
+        filtered_overrides: List[Parameter] = []
+
         if parameter_overrides:
-            overrides = [Parameter(k, value=v) for k, v in parameter_overrides.items()]
-        super().__init__("gc_dead_end_audit", parameter_overrides=overrides)
+            if isinstance(parameter_overrides, dict):
+                for k, v in parameter_overrides.items():
+                    if k in self._LIST_PARAM_NAMES:
+                        list_param_values[k] = list(v) if v else []
+                    else:
+                        filtered_overrides.append(Parameter(k, value=v))
+            else:
+                for p in parameter_overrides:
+                    if p.name in self._LIST_PARAM_NAMES:
+                        list_param_values[p.name] = list(p.value) if p.value else []
+                    else:
+                        filtered_overrides.append(p)
 
-        self.declare_parameter("topic_specs", [])
-        self.declare_parameter("required_topics", [])
+        # Pass only NON-list overrides to super().__init__()
+        super().__init__(
+            "gc_dead_end_audit",
+            parameter_overrides=filtered_overrides if filtered_overrides else None,
+        )
+
+        # Step 2: Declare list params with explicit types (no override exists now, so no crash)
+        self.declare_parameters(
+            "",
+            [
+                ("topic_specs", Parameter.Type.STRING_ARRAY),
+                ("required_topics", Parameter.Type.STRING_ARRAY),
+            ],
+        )
+
+        # Step 3: Apply list param values AFTER declaration via set_parameters()
+        if list_param_values:
+            self.set_parameters([
+                Parameter(k, Parameter.Type.STRING_ARRAY, v)
+                for k, v in list_param_values.items()
+            ])
         self.declare_parameter("required_timeout_sec", 10.0)
         self.declare_parameter("status_publish_period_sec", 5.0)
         self.declare_parameter("qos_reliability", "best_effort")
