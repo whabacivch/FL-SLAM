@@ -198,8 +198,9 @@ export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
 mkdir -p "$ROS_HOME" "$ROS_LOG_DIR"
 
 # Get bag duration
+# First-scan JIT compilation may take ~30s, add extra buffer
 BAG_DURATION=$(ros2 bag info "$BAG_PATH" 2>/dev/null | grep "Duration" | awk '{print $2}' | cut -d'.' -f1 || echo "180")
-TIMEOUT_SEC=$((BAG_DURATION + 30))
+TIMEOUT_SEC=$((BAG_DURATION + 45))
 
 echo -e "  Duration: ${CYAN}~${BAG_DURATION}s${NC} (timeout: ${TIMEOUT_SEC}s)"
 echo -e "  Log: ${CYAN}$LOG_FILE${NC}"

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import Header
 import numpy as np
@@ -95,49 +96,53 @@ class LivoxConverterNode(Node):
         self.declare_parameter("output_topic", "/lidar/points")
         # If empty, preserve msg.header.frame_id (recommended).
         self.declare_parameter("frame_id", "")
-        # Message type selection:
-        # - auto: subscribe with both supported types (whichever matches will receive messages)
+        # Message type selection (explicit, no fallback):
         # - livox_ros_driver2/msg/CustomMsg: MID360 bags (common)
         # - livox_ros_driver/msg/CustomMsg: AVIA bags (optional; may not be installed)
-        self.declare_parameter("input_msg_type", "auto")
+        self.declare_parameter("input_msg_type", "livox_ros_driver2/msg/CustomMsg")
         
         input_topic = str(self.get_parameter("input_topic").value)
         output_topic = str(self.get_parameter("output_topic").value)
         self.frame_id = str(self.get_parameter("frame_id").value)
         self.input_msg_type = str(self.get_parameter("input_msg_type").value)
         
+        # QoS: explicit, single-path.
+        # - Subscription from rosbag: RELIABLE (bags typically record with RELIABLE).
+        # - Publisher to backend: BEST_EFFORT to match GC backend sensor subscription.
+        qos_sub = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        qos_pub = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        
         # Publisher for PointCloud2
         self.publisher = self.create_publisher(
             PointCloud2,
             output_topic,
-            10
+            qos_pub,
         )
 
-        self._subscriptions = []
-        msg_types_to_subscribe: list[str]
-        if self.input_msg_type == "auto":
-            msg_types_to_subscribe = [
-                "livox_ros_driver2/msg/CustomMsg",
-                "livox_ros_driver/msg/CustomMsg",
-            ]
-        else:
-            msg_types_to_subscribe = [self.input_msg_type]
+        try:
+            MsgT = _try_import_msg(self.input_msg_type)
+        except Exception as exc:
+            self.get_logger().error(f"Livox converter: cannot import {self.input_msg_type}: {exc}")
+            raise RuntimeError(f"Unsupported input_msg_type: {self.input_msg_type}") from exc
 
-        for msg_type in msg_types_to_subscribe:
-            try:
-                MsgT = _try_import_msg(msg_type)
-            except Exception as exc:
-                self.get_logger().warn(f"Livox converter: cannot import {msg_type}: {exc}")
-                continue
-            self._subscriptions.append(
-                self.create_subscription(
-                    MsgT,
-                    input_topic,
-                    self._on_custom_msg,
-                    10,
-                )
-            )
+        self._subscription = self.create_subscription(
+            MsgT,
+            input_topic,
+            self._on_custom_msg,
+            qos_sub,
+        )
         
+        self._msg_count = 0
         self._logged_schema = False
         self.get_logger().info("Livox converter node started")
         self.get_logger().info(f"  Input:  {input_topic}")
@@ -147,6 +152,10 @@ class LivoxConverterNode(Node):
 
     def _on_custom_msg(self, msg):
         # Works for livox_ros_driver2 and (optionally) livox_ros_driver messages.
+        self._msg_count += 1
+        if self._msg_count <= 5 or self._msg_count % 100 == 0:
+            self.get_logger().info(f"Livox converter: received CustomMsg #{self._msg_count}")
+
         points_list = getattr(msg, "points", None)
         if not points_list:
             return
@@ -267,6 +276,10 @@ class LivoxConverterNode(Node):
                 )
 
         self.publisher.publish(cloud_msg)
+        if self._msg_count <= 5 or self._msg_count % 100 == 0:
+            self.get_logger().info(
+                f"Livox converter: published PointCloud2 #{self._msg_count} with {cloud_msg.width} points"
+            )
 
 
 def main(args=None):

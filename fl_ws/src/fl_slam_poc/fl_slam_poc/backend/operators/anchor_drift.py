@@ -14,7 +14,12 @@ from typing import Tuple
 
 from fl_slam_poc.common.jax_init import jax, jnp
 from fl_slam_poc.common import constants
-from fl_slam_poc.common.belief import BeliefGaussianInfo, D_Z, SLICE_POSE
+from fl_slam_poc.common.belief import (
+    BeliefGaussianInfo,
+    D_Z,
+    SLICE_POSE,
+    pose_z_to_se3_delta,
+)
 from fl_slam_poc.common.certificates import (
     CertBundle,
     ExpectedEffect,
@@ -56,8 +61,7 @@ class AnchorDriftResult:
 # =============================================================================
 
 
-@jax.jit
-def _compute_rho(drift_m: float, drift_r: float, M0: float, R0: float) -> float:
+def _compute_rho(drift_m: jnp.ndarray, drift_r: jnp.ndarray, M0: float, R0: float) -> jnp.ndarray:
     """
     Compute continuous drift blend factor.
     
@@ -78,7 +82,7 @@ def _compute_rho(drift_m: float, drift_r: float, M0: float, R0: float) -> float:
     rho_r = drift_r / R0
     rho_raw = jnp.maximum(rho_m, rho_r)
     rho = jnp.clip(rho_raw, 0.0, 1.0)
-    return float(rho)
+    return rho
 
 
 # =============================================================================
@@ -128,8 +132,10 @@ def anchor_drift_update(
     
     # Step 4: Blend anchor update
     # new_anchor = current_anchor ⊕ Exp(rho * delta_pose)
-    scaled_delta = rho * delta_pose
-    delta_SE3 = se3_jax.se3_exp(scaled_delta)
+    # delta_pose is GC-ordered [rot, trans]; se3_jax expects [trans, rot].
+    scaled_delta_z = rho * delta_pose
+    scaled_delta_se3 = pose_z_to_se3_delta(scaled_delta_z)
+    delta_SE3 = se3_jax.se3_exp(scaled_delta_se3)
     X_anchor_new = se3_jax.se3_compose(belief.X_anchor, delta_SE3)
     
     # Step 5: Update linearization point
@@ -141,10 +147,9 @@ def anchor_drift_update(
     # Step 6: Update h to match new linearization
     h_new = belief.L @ z_lin_new
     
-    # Generate new anchor id if rho > 0.5 (major update)
-    # This is for tracking purposes, not branching
+    # Deterministic anchor id update (branch-free)
     anchor_id_suffix = int(belief.stamp_sec * 1000) % 10000
-    new_anchor_id = f"anchor_{anchor_id_suffix}" if rho > 0.5 else belief.anchor_id
+    new_anchor_id = f"anchor_{anchor_id_suffix}"
     
     # Build result
     result = AnchorDriftResult(

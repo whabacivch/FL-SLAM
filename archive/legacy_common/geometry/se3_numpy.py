@@ -337,12 +337,11 @@ def se3_apply(T: np.ndarray, p: np.ndarray) -> np.ndarray:
         if len(p) != 3:
             raise ValueError(f"Expected 3D point, got shape {p.shape}")
         return R @ p + t
-    elif p.ndim == 2:
+    if p.ndim == 2:
         if p.shape[1] != 3:
             raise ValueError(f"Expected (N, 3) points, got shape {p.shape}")
         return (R @ p.T).T + t
-    else:
-        raise ValueError(f"Expected 1D or 2D array, got shape {p.shape}")
+    raise ValueError(f"Expected 1D or 2D array, got shape {p.shape}")
 
 
 def se3_adjoint(T: np.ndarray) -> np.ndarray:
@@ -401,96 +400,28 @@ def se3_cov_compose(cov_a: np.ndarray, cov_b: np.ndarray, T: np.ndarray = None) 
     cov_a = np.asarray(cov_a, dtype=float)
     cov_b = np.asarray(cov_b, dtype=float)
     
-    if cov_a.shape != (6, 6):
-        raise ValueError(f"Expected 6x6 covariance for cov_a, got shape {cov_a.shape}")
-    if cov_b.shape != (6, 6):
-        raise ValueError(f"Expected 6x6 covariance for cov_b, got shape {cov_b.shape}")
+    if cov_a.shape != (6, 6) or cov_b.shape != (6, 6):
+        raise ValueError(f"Expected 6x6 covariances, got {cov_a.shape}, {cov_b.shape}")
     
     if T is None:
-        # No transport, just add
         return cov_a + cov_b
     
-    T = np.asarray(T, dtype=float).reshape(-1)
-    if len(T) != 6:
-        raise ValueError(f"Expected 6D vector for T, got shape {T.shape}")
-    
-    # Transport cov_b through T using adjoint
     Ad = se3_adjoint(T)
-    cov_b_transported = Ad @ cov_b @ Ad.T
-    
-    return cov_a + cov_b_transported
+    return cov_a + Ad @ cov_b @ Ad.T
 
 
 def se3_exp(xi: np.ndarray) -> np.ndarray:
     """
-    Exponential map: se(3) -> SE(3).
-    
-    Maps a 6D twist (v, ω) in se(3) to an SE(3) transform.
-    
-    Args:
-        xi: 6D twist vector (vx, vy, vz, ωx, ωy, ωz)
-    
-    Returns:
-        6D SE(3) transform (x, y, z, rx, ry, rz)
+    Exponential map from se(3) to SE(3) (6D vector).
     """
     xi = np.asarray(xi, dtype=float).reshape(-1)
     if len(xi) != 6:
-        raise ValueError(f"Expected 6D twist, got shape {xi.shape}")
+        raise ValueError(f"Expected 6D tangent vector, got shape {xi.shape}")
     
-    v = xi[:3]
-    omega = xi[3:6]
+    rho = xi[:3]
+    phi = xi[3:6]
+    R = rotvec_to_rotmat(phi)
     
-    theta = np.linalg.norm(omega)
-    
-    if theta < ROTATION_EPSILON:
-        # Small rotation: use first-order approximation
-        R = np.eye(3, dtype=float) + skew(omega)
-        t = v
-    else:
-        # Standard formula
-        axis = omega / theta
-        K = skew(axis)
-        R = np.eye(3, dtype=float) + math.sin(theta) * K + (1.0 - math.cos(theta)) * (K @ K)
-        
-        # Translation part
-        V = np.eye(3, dtype=float) + ((1.0 - math.cos(theta)) / theta) * K + ((theta - math.sin(theta)) / theta) * (K @ K)
-        t = V @ v
-    
-    rvec = rotmat_to_rotvec(R)
-    return np.concatenate([t, rvec])
-
-
-def se3_log(T: np.ndarray) -> np.ndarray:
-    """
-    Logarithmic map: SE(3) -> se(3).
-    
-    Maps an SE(3) transform to a 6D twist in se(3).
-    
-    Args:
-        T: 6D SE(3) transform (x, y, z, rx, ry, rz)
-    
-    Returns:
-        6D twist vector (vx, vy, vz, ωx, ωy, ωz)
-    """
-    T = np.asarray(T, dtype=float).reshape(-1)
-    if len(T) != 6:
-        raise ValueError(f"Expected 6D transform, got shape {T.shape}")
-    
-    t = T[:3]
-    rvec = T[3:6]
-    R = rotvec_to_rotmat(rvec)
-    
-    theta = np.linalg.norm(rvec)
-    
-    if theta < ROTATION_EPSILON:
-        # Small rotation: use first-order approximation
-        omega = unskew(R - np.eye(3, dtype=float))
-        V_inv = np.eye(3, dtype=float)
-    else:
-        # Standard formula
-        omega = rvec
-        K = skew(omega / theta)
-        V_inv = np.eye(3, dtype=float) - 0.5 * K + ((1.0 - (theta / 2.0) * (1.0 / math.tan(theta / 2.0))) / (theta * theta)) * (K @ K)
-    
-    v = V_inv @ t
-    return np.concatenate([v, omega])
+    # For translation, use first-order approximation
+    t = rho
+    return np.concatenate([t, rotmat_to_rotvec(R)])

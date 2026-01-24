@@ -51,8 +51,12 @@ SLICE_ACCEL_BIAS = slice(12, 15)  # δba (accel bias)
 SLICE_TIME_OFFSET = slice(15, 16)  # δΔt (time offset)
 SLICE_EXTRINSIC = slice(16, 22)  # δξLI (LiDAR-IMU extrinsic)
 
-# Pose slice (rotation + translation) - NOTE: rotation first, then translation
-# This matches se(3) tangent vector convention: [ω, v] = [rotation, translation]
+# Pose slice (rotation + translation) in the GC tangent ordering
+# Per spec: [δθ, δt] = [rotation, translation].
+#
+# IMPORTANT: se3_jax uses 6D vectors ordered as [translation, rotation].
+# Any time we apply SE(3) group operators (Exp/compose/inverse), we must
+# convert between these two conventions explicitly.
 SLICE_POSE = slice(0, 6)
 
 
@@ -96,6 +100,32 @@ def se3_to_rotvec_trans(pose: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
     trans = pose[:3]
     rotvec = pose[3:6]
     return rotvec, trans
+
+
+def pose_z_to_se3_delta(delta_pose_z: jnp.ndarray) -> jnp.ndarray:
+    """
+    Convert a GC-ordered pose increment to se3_jax ordering.
+
+    GC tangent pose slice: [rot(3), trans(3)]
+    se3_jax increment:     [trans(3), rot(3)]
+    """
+    delta_pose_z = jnp.asarray(delta_pose_z, dtype=jnp.float64).reshape(-1)
+    if delta_pose_z.shape[0] != 6:
+        raise ValueError(f"delta_pose_z must be (6,), got {delta_pose_z.shape}")
+    return jnp.concatenate([delta_pose_z[3:6], delta_pose_z[0:3]])
+
+
+def pose_se3_to_z_delta(delta_pose_se3: jnp.ndarray) -> jnp.ndarray:
+    """
+    Convert a se3_jax-ordered pose increment to GC tangent ordering.
+
+    se3_jax increment:     [trans(3), rot(3)]
+    GC tangent pose slice: [rot(3), trans(3)]
+    """
+    delta_pose_se3 = jnp.asarray(delta_pose_se3, dtype=jnp.float64).reshape(-1)
+    if delta_pose_se3.shape[0] != 6:
+        raise ValueError(f"delta_pose_se3 must be (6,), got {delta_pose_se3.shape}")
+    return jnp.concatenate([delta_pose_se3[3:6], delta_pose_se3[0:3]])
 
 
 @jax.jit
@@ -376,8 +406,18 @@ class BeliefGaussianInfo:
             6D world pose
         """
         delta_z = self.mean_increment(eps_lift)
-        delta_pose = delta_z[SLICE_POSE]
-        return se3_compose(self.X_anchor, se3_exp(delta_pose))
+        delta_pose_z = delta_z[SLICE_POSE]
+        delta_pose_se3 = pose_z_to_se3_delta(delta_pose_z)
+        return se3_compose(self.X_anchor, se3_exp(delta_pose_se3))
+
+    def mean_world_pose(self, eps_lift: float = 1e-9) -> jnp.ndarray:
+        """
+        Backwards-compatible alias for world pose.
+
+        Returns:
+            6D world pose in se3_jax ordering: [trans, rotvec]
+        """
+        return self.world_pose(eps_lift=eps_lift)
 
     def copy(self) -> "BeliefGaussianInfo":
         """Create a deep copy of this belief."""

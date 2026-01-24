@@ -26,6 +26,7 @@ from fl_slam_poc.common.certificates import (
 from fl_slam_poc.common.primitives import (
     domain_projection_psd,
     spd_cholesky_solve_lifted,
+    spd_cholesky_inverse_lifted,
 )
 from fl_slam_poc.backend.operators.deskew import UTCache
 from fl_slam_poc.backend.operators.binning import ScanBinStats

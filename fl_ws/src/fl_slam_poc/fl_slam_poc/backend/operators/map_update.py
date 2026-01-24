@@ -110,6 +110,7 @@ def pos_cov_inflation_pushforward(
     delta_sum_ppT = jnp.zeros((n_bins, 3, 3), dtype=jnp.float64)
     
     total_inflation = 0.0
+    total_psd_projection_delta = 0.0
     
     for b in range(n_bins):
         N_b = scan_N[b]
@@ -148,6 +149,7 @@ def pos_cov_inflation_pushforward(
         # Project to PSD (always)
         Sigma_map_result = domain_projection_psd(Sigma_map_raw, eps_psd)
         Sigma_map_b = Sigma_map_result.M_psd
+        total_psd_projection_delta += Sigma_map_result.projection_delta
         
         inflation_b = float(jnp.trace(Sigma_map_b) - jnp.trace(R_hat @ Sigma_p_b @ R_hat.T))
         total_inflation += inflation_b * float(N_b)
@@ -181,7 +183,7 @@ def pos_cov_inflation_pushforward(
         triggers=["PoseCovInflationPushforward"],
         influence=InfluenceCert(
             lift_strength=0.0,
-            psd_projection_delta=0.0,  # Would need to track
+            psd_projection_delta=total_psd_projection_delta,
             mass_epsilon_ratio=0.0,
             anchor_drift_rho=0.0,
             dt_scale=1.0,

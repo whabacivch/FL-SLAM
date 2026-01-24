@@ -59,7 +59,10 @@ from fl_slam_poc.backend.operators.fusion import (
     info_fusion_additive,
 )
 from fl_slam_poc.backend.operators.recompose import pose_update_frobenius_recompose
-from fl_slam_poc.backend.operators.map_update import pos_cov_inflation_pushforward
+from fl_slam_poc.backend.operators.map_update import (
+    pos_cov_inflation_pushforward,
+    MapUpdateResult,
+)
 from fl_slam_poc.backend.operators.anchor_drift import anchor_drift_update
 from fl_slam_poc.backend.operators.hypothesis import hypothesis_barycenter_projection
 from fl_slam_poc.common.primitives import inv_mass, safe_normalize
@@ -119,7 +122,7 @@ class PipelineConfig:
 class ScanPipelineResult:
     """Result of processing a single scan for one hypothesis."""
     belief_updated: BeliefGaussianInfo
-    map_increments: jnp.ndarray  # Increments to map statistics
+    map_increments: MapUpdateResult  # Increments to map statistics
     all_certs: List[CertBundle]
     aggregated_cert: CertBundle
 
@@ -425,7 +428,7 @@ def process_scan_single_hypothesis(
     
     return ScanPipelineResult(
         belief_updated=belief_final,
-        map_increments=jnp.zeros(1),  # Placeholder - would need proper increment structure
+        map_increments=map_update_result,
         all_certs=all_certs,
         aggregated_cert=aggregated_cert,
     )

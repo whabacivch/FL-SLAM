@@ -13,7 +13,12 @@ from typing import Tuple
 
 from fl_slam_poc.common.jax_init import jax, jnp
 from fl_slam_poc.common import constants
-from fl_slam_poc.common.belief import BeliefGaussianInfo, D_Z, SLICE_POSE
+from fl_slam_poc.common.belief import (
+    BeliefGaussianInfo,
+    D_Z,
+    SLICE_POSE,
+    pose_z_to_se3_delta,
+)
 from fl_slam_poc.common.certificates import (
     CertBundle,
     ExpectedEffect,
@@ -116,31 +121,34 @@ def pose_update_frobenius_recompose(
     
     # Step 1: Compute MAP increment
     delta_z = belief_post.mean_increment(eps_lift)
-    delta_pose = delta_z[SLICE_POSE]  # (6,) pose increment
+    delta_pose_z = delta_z[SLICE_POSE]  # (6,) GC ordering: [rot, trans]
     
     # Step 2: Compute Frobenius strength (continuous)
     frobenius_strength = total_trigger_magnitude / (total_trigger_magnitude + c_frob)
     
-    # Step 3: Compute BCH3 correction
-    # First, get current anchor's tangent representation
-    # For simplicity, use identity as reference
-    xi_anchor = belief_post.X_anchor  # Already in 6D tangent form
-    
-    # BCH3 correction between anchor and increment
-    bch_correction = _bch3_correction(xi_anchor, delta_pose)
+    # Step 3: Compute BCH correction in GC pose ordering [rot, trans].
+    #
+    # NOTE: belief_post.X_anchor is an SE(3) element encoded as [trans, rot] for se3_jax,
+    # not a GC-ordered tangent increment, so we do not mix it into the BCH term.
+    #
+    # We instead use the current pose linearization offset (in-chart) as the second term.
+    xi_lin_z = belief_post.z_lin[SLICE_POSE]
+    bch_correction = _bch3_correction(xi_lin_z, delta_pose_z)
     
     # Step 4: Apply blended correction
     # delta_pose_corrected = delta_pose + s * bch_correction
-    delta_pose_corrected = delta_pose + frobenius_strength * bch_correction
+    delta_pose_corrected_z = delta_pose_z + frobenius_strength * bch_correction
     
     # Step 5: Compose with anchor to get new world pose
-    # X_new = X_anchor ⊕ Exp(delta_pose_corrected)
-    delta_SE3 = se3_jax.se3_exp(delta_pose_corrected)
+    # X_new = X_anchor ∘ Exp(delta_pose_corrected)
+    # Convert GC-ordered increment to se3_jax ordering before Exp.
+    delta_pose_corrected_se3 = pose_z_to_se3_delta(delta_pose_corrected_z)
+    delta_SE3 = se3_jax.se3_exp(delta_pose_corrected_se3)
     X_new = se3_jax.se3_compose(belief_post.X_anchor, delta_SE3)
     
     # Build result
     result = RecomposeResult(
-        delta_pose=delta_pose_corrected,
+        delta_pose=delta_pose_corrected_z,
         X_new=X_new,
         frobenius_strength=frobenius_strength,
         bch_correction=bch_correction,
@@ -185,7 +193,7 @@ def pose_update_frobenius_recompose(
     )
     
     # Expected effect: pose increment magnitude
-    pose_magnitude = float(jnp.linalg.norm(delta_pose_corrected))
+    pose_magnitude = float(jnp.linalg.norm(delta_pose_corrected_z))
     
     expected_effect = ExpectedEffect(
         objective_name="predicted_pose_increment_magnitude",

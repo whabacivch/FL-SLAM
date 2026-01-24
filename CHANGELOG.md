@@ -17,6 +17,18 @@ Complete implementation of the Golden Child SLAM v2 specification - a strict "br
 3. **Certificate Audit Trail**: Every operator returns `(result, CertBundle, ExpectedEffect)` tuple
 4. **Domain Projections Always Applied**: `DomainProjectionPSD` and `SPDCholeskySolveLifted` always execute with recorded magnitudes
 
+## 2026-01-23: GC Wiring Cleanup ✅
+
+### Summary
+
+Archived legacy constants and tightened runtime wiring to prevent confusing multi-paths.
+
+### Key Changes
+
+1. **Legacy constants archived**: moved non-GC constants to `archive/legacy_common/constants_legacy.py`
+2. **Runtime clarity**: clarified `se3_jax` vs `se3_numpy` usage in geometry docs
+3. **Map update certificates**: now track PSD projection deltas in `PoseCovInflationPushforward`
+
 ### Files Created
 
 **Common Layer:**

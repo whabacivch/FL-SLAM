@@ -61,7 +61,7 @@ def generate_launch_description():
         ],
     )
     
-    # Rosbag playback (delayed start to let nodes initialize)
+    # Rosbag playback (short delay to let nodes initialize)
     bag_play = TimerAction(
         period=3.0,  # 3 second delay
         actions=[

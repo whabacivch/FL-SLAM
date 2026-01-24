@@ -57,19 +57,30 @@ from fl_slam_poc.backend.structures.bin_atlas import (
 from scipy.spatial.transform import Rotation
 
 
-def parse_pointcloud2(msg: PointCloud2) -> Tuple[jnp.ndarray, jnp.ndarray]:
+def _smooth_window_weight(dist: float, min_r: float, max_r: float, sigma: float) -> float:
+    """Continuous range weighting without hard gates."""
+    # Smooth window: sigmoid(dist-min_r) * sigmoid(max_r-dist)
+    a = (dist - min_r) / sigma
+    b = (max_r - dist) / sigma
+    w_min = 1.0 / (1.0 + np.exp(-a))
+    w_max = 1.0 / (1.0 + np.exp(-b))
+    return float(w_min * w_max)
+
+
+def parse_pointcloud2(msg: PointCloud2) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
     Parse PointCloud2 message to extract xyz points.
     
     Returns:
         points: (N, 3) array of xyz coordinates
         timestamps: (N,) array of per-point timestamps (or zeros if unavailable)
+        weights: (N,) array of continuous point weights
     """
     # Find field offsets
     field_map = {f.name: (f.offset, f.datatype) for f in msg.fields}
     
     if 'x' not in field_map or 'y' not in field_map or 'z' not in field_map:
-        return jnp.zeros((0, 3)), jnp.zeros(0)
+        return jnp.zeros((0, 3)), jnp.zeros(0), jnp.zeros(0)
     
     x_off, x_type = field_map['x']
     y_off, y_type = field_map['y']
@@ -78,29 +89,57 @@ def parse_pointcloud2(msg: PointCloud2) -> Tuple[jnp.ndarray, jnp.ndarray]:
     point_step = msg.point_step
     n_points = msg.width * msg.height
     data = msg.data
-    
+
+    # Optional time fields (from livox_converter schema)
+    timebase_low_off = field_map.get("timebase_low", (None, None))[0]
+    timebase_high_off = field_map.get("timebase_high", (None, None))[0]
+    time_offset_off = field_map.get("time_offset", (None, None))[0]
+
+    # Compute message timebase once if available
+    timebase_sec = None
+    if timebase_low_off is not None and timebase_high_off is not None and n_points > 0:
+        low = struct.unpack_from('<I', data, timebase_low_off)[0]
+        high = struct.unpack_from('<I', data, timebase_high_off)[0]
+        timebase = (np.uint64(high) << np.uint64(32)) | np.uint64(low)
+        timebase_sec = float(timebase) * 1e-9
+
     # Extract points
     points = []
+    timestamps = []
+    weights = []
+    header_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
     for i in range(n_points):
         base = i * point_step
         x = struct.unpack_from('<f', data, base + x_off)[0]
         y = struct.unpack_from('<f', data, base + y_off)[0]
         z = struct.unpack_from('<f', data, base + z_off)[0]
-        
-        # Filter invalid points
-        if np.isfinite(x) and np.isfinite(y) and np.isfinite(z):
-            # Filter by range (skip points too close or too far)
-            dist = np.sqrt(x*x + y*y + z*z)
-            if 0.5 < dist < 50.0:
-                points.append([x, y, z])
-    
+
+        # Keep finite points only
+        if not (np.isfinite(x) and np.isfinite(y) and np.isfinite(z)):
+            continue
+
+        dist = np.sqrt(x * x + y * y + z * z)
+        w = _smooth_window_weight(dist, min_r=0.5, max_r=50.0, sigma=0.25)
+
+        # Per-point timestamps if available, otherwise header time
+        if timebase_sec is not None and time_offset_off is not None:
+            offset = struct.unpack_from('<I', data, base + time_offset_off)[0]
+            t_sec = timebase_sec + float(np.uint64(offset)) * 1e-9
+        else:
+            t_sec = header_time
+
+        points.append([x, y, z])
+        timestamps.append(t_sec)
+        weights.append(w)
+
     if len(points) == 0:
-        return jnp.zeros((0, 3)), jnp.zeros(0)
-    
+        return jnp.zeros((0, 3)), jnp.zeros(0), jnp.zeros(0)
+
     points_arr = jnp.array(points, dtype=jnp.float64)
-    timestamps = jnp.zeros(len(points), dtype=jnp.float64)
-    
-    return points_arr, timestamps
+    timestamps_arr = jnp.array(timestamps, dtype=jnp.float64)
+    weights_arr = jnp.array(weights, dtype=jnp.float64)
+
+    return points_arr, timestamps_arr, weights_arr
 
 
 class GoldenChildBackend(Node):
@@ -117,12 +156,7 @@ class GoldenChildBackend(Node):
         self._init_state()
         self._init_ros()
         self._publish_runtime_manifest()
-        
-        # JIT warm-up: compile pipeline functions before data arrives
-        self.get_logger().info("JIT warm-up starting...")
-        self._jit_warmup()
-        self.get_logger().info("JIT warm-up complete")
-        
+
         self.get_logger().info("Golden Child SLAM v2 Backend initialized - PIPELINE ENABLED")
 
     def _declare_parameters(self):
@@ -248,46 +282,6 @@ class GoldenChildBackend(Node):
             status_period, self._publish_status, clock=self._status_clock
         )
 
-    def _jit_warmup(self):
-        """
-        Warm up JAX JIT compilation by running a dummy scan.
-        
-        This ensures the pipeline is compiled before real data arrives,
-        preventing message drops due to slow first-call compilation.
-        """
-        # Create dummy points (small batch)
-        dummy_points = jnp.array([
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, 1.0],
-            [1.0, 1.0, 0.0],
-            [1.0, 0.0, 1.0],
-        ] * 20, dtype=jnp.float64)  # 100 points
-        
-        dummy_timestamps = jnp.zeros(dummy_points.shape[0], dtype=jnp.float64)
-        dummy_weights = jnp.ones(dummy_points.shape[0], dtype=jnp.float64)
-        
-        # Run pipeline once to trigger JIT compilation
-        try:
-            result = process_scan_single_hypothesis(
-                belief_prev=self.hypotheses[0],
-                raw_points=dummy_points,
-                raw_timestamps=dummy_timestamps,
-                raw_weights=dummy_weights,
-                scan_start_time=0.0,
-                scan_end_time=0.1,
-                dt_sec=0.1,
-                Q=self.Q,
-                bin_atlas=self.bin_atlas,
-                map_stats=self.map_stats,
-                config=self.config,
-            )
-            self.get_logger().info(f"  Warm-up scan processed, cert count: {len(result.all_certs)}")
-        except Exception as e:
-            self.get_logger().error(f"  Warm-up failed: {e}")
-            import traceback
-            self.get_logger().error(traceback.format_exc())
-
     def _publish_runtime_manifest(self):
         """Publish RuntimeManifest at startup."""
         manifest = RuntimeManifest()
@@ -356,21 +350,20 @@ class GoldenChildBackend(Node):
         stamp_sec = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         
         # Parse point cloud
-        points, timestamps = parse_pointcloud2(msg)
+        points, timestamps, weights = parse_pointcloud2(msg)
         n_points = points.shape[0]
-        
-        if n_points < 100:
-            if self.scan_count <= 10:
-                self.get_logger().warn(f"Scan {self.scan_count}: only {n_points} points, skipping")
-            return
+
+        if n_points == 0:
+            # Keep pipeline total by supplying a zero-weight dummy point.
+            points = jnp.zeros((1, 3), dtype=jnp.float64)
+            timestamps = jnp.zeros(1, dtype=jnp.float64)
+            weights = jnp.zeros(1, dtype=jnp.float64)
+            n_points = 1
         
         # Compute dt since last scan
-        dt_sec = stamp_sec - self.last_scan_stamp if self.last_scan_stamp > 0 else 0.1
-        dt_sec = max(0.01, min(dt_sec, 1.0))  # Clamp to reasonable range
+        dt_raw = stamp_sec - self.last_scan_stamp if self.last_scan_stamp > 0 else (float(jnp.max(timestamps)) - float(jnp.min(timestamps)))
+        dt_sec = float(jnp.sqrt(jnp.array(dt_raw, dtype=jnp.float64) ** 2 + 1e-6))
         self.last_scan_stamp = stamp_sec
-        
-        # Create weights (uniform for now)
-        weights = jnp.ones(n_points, dtype=jnp.float64)
         
         # Apply forgetting to map stats
         self.map_stats = apply_forgetting(self.map_stats, self.forgetting_factor)
@@ -406,6 +399,28 @@ class GoldenChildBackend(Node):
             self.current_belief = combined_belief
             self.pipeline_runs += 1
             
+            # Update map statistics with weighted increments
+            delta_S_dir = jnp.zeros_like(self.map_stats.S_dir)
+            delta_N_dir = jnp.zeros_like(self.map_stats.N_dir)
+            delta_N_pos = jnp.zeros_like(self.map_stats.N_pos)
+            delta_sum_p = jnp.zeros_like(self.map_stats.sum_p)
+            delta_sum_ppT = jnp.zeros_like(self.map_stats.sum_ppT)
+            for i, result in enumerate(results):
+                w_h = float(self.hyp_weights[i])
+                delta_S_dir = delta_S_dir + w_h * result.map_increments.delta_S_dir
+                delta_N_dir = delta_N_dir + w_h * result.map_increments.delta_N_dir
+                delta_N_pos = delta_N_pos + w_h * result.map_increments.delta_N_pos
+                delta_sum_p = delta_sum_p + w_h * result.map_increments.delta_sum_p
+                delta_sum_ppT = delta_sum_ppT + w_h * result.map_increments.delta_sum_ppT
+            self.map_stats = update_map_stats(
+                self.map_stats,
+                delta_S_dir,
+                delta_N_dir,
+                delta_N_pos,
+                delta_sum_p,
+                delta_sum_ppT,
+            )
+
             # Store certificate
             if results:
                 self.cert_history.append(results[0].aggregated_cert)
@@ -423,10 +438,11 @@ class GoldenChildBackend(Node):
                 )
         
         except Exception as e:
-            # Log error but don't crash - fall back to odometry
+            # Log error and fail fast (no silent fallbacks)
             self.get_logger().error(f"Pipeline error on scan {self.scan_count}: {e}")
-            if self.last_odom_pose is not None:
-                self._publish_state_from_pose(self.last_odom_pose, stamp_sec)
+            import traceback
+            self.get_logger().error(traceback.format_exc())
+            raise
 
     def _publish_state_from_pose(self, pose_6d: jnp.ndarray, stamp_sec: float):
         """Publish state from a 6D pose [trans, rotvec]."""

@@ -118,9 +118,9 @@ def translation_wls(
         total_projection_delta += Sigma_b_result.projection_delta
         
         # Invert covariance (lifted)
-        Sigma_b_inv, lift_b = spd_cholesky_solve_lifted(Sigma_b, jnp.eye(3), eps_lift)
-        Sigma_b_inv = Sigma_b_inv  # Result is already the inverse
-        total_lift += lift_b
+        solve_result = spd_cholesky_solve_lifted(Sigma_b, jnp.eye(3), eps_lift)
+        Sigma_b_inv = solve_result.x  # Result is already the inverse
+        total_lift += solve_result.lift_strength
         
         # Actually we need to use the inverse properly
         # Let's use the proper lifted solve

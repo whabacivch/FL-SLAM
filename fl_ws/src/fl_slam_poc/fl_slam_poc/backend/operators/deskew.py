@@ -14,7 +14,12 @@ from typing import Tuple, List
 
 from fl_slam_poc.common.jax_init import jax, jnp
 from fl_slam_poc.common import constants
-from fl_slam_poc.common.belief import BeliefGaussianInfo, D_Z, SLICE_POSE
+from fl_slam_poc.common.belief import (
+    BeliefGaussianInfo,
+    D_Z,
+    SLICE_POSE,
+    pose_z_to_se3_delta,
+)
 from fl_slam_poc.common.certificates import (
     CertBundle,
     ExpectedEffect,
@@ -214,7 +219,8 @@ def deskew_ut_moment_match(
     
     # Extract pose slice from each sigma point
     for s in range(n_sigma):
-        pose_s = sigma_points[s, SLICE_POSE]  # (6,)
+        pose_s_z = sigma_points[s, SLICE_POSE]  # (6,) GC ordering: [rot, trans]
+        pose_s = pose_z_to_se3_delta(pose_s_z)  # (6,) se3_jax ordering: [trans, rot]
         for t in range(T_SLICES):
             # Interpolation factor for this time slice
             alpha = (slice_times[t] - scan_start_time) / (scan_end_time - scan_start_time + 1e-12)
@@ -257,7 +263,8 @@ def deskew_ut_moment_match(
         transformed_points = jnp.zeros((n_sigma, 3))
         for s in range(n_sigma):
             # Interpolate pose delta for this sigma point
-            pose_s = sigma_points[s, SLICE_POSE]
+            pose_s_z = sigma_points[s, SLICE_POSE]
+            pose_s = pose_z_to_se3_delta(pose_s_z)
             pose_at_t = alpha * pose_s
             
             # Transform point

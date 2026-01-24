@@ -28,36 +28,35 @@ class OdomBridge(Node):
         self.declare_parameter("output_topic", "/odom")
         self.declare_parameter("output_frame", "odom")
         self.declare_parameter("child_frame", "base_link")
+        self.declare_parameter("qos_reliability", "reliable")
         
         input_topic = str(self.get_parameter("input_topic").value)
         output_topic = str(self.get_parameter("output_topic").value)
         self.output_frame = str(self.get_parameter("output_frame").value)
         self.child_frame = str(self.get_parameter("child_frame").value)
         
-        # QoS - try both reliable and best effort for compatibility
-        qos_reliable = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
+        qos_reliability = str(self.get_parameter("qos_reliability").value).lower()
+        if qos_reliability == "reliable":
+            reliability = ReliabilityPolicy.RELIABLE
+        elif qos_reliability == "best_effort":
+            reliability = ReliabilityPolicy.BEST_EFFORT
+        else:
+            raise ValueError(f"Unsupported qos_reliability: {qos_reliability}")
+
+        qos = QoSProfile(
+            reliability=reliability,
             durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST,
             depth=10,
         )
-        qos_best_effort = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            durability=DurabilityPolicy.VOLATILE,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10,
+
+        # Subscribe with explicit QoS profile
+        self.sub = self.create_subscription(
+            Odometry, input_topic, self.on_odom, qos
         )
-        
-        # Subscribe with both QoS profiles
-        self.sub_reliable = self.create_subscription(
-            Odometry, input_topic, self.on_odom, qos_reliable
-        )
-        self.sub_best_effort = self.create_subscription(
-            Odometry, input_topic, self.on_odom, qos_best_effort
-        )
-        
+
         # Publisher
-        self.pub = self.create_publisher(Odometry, output_topic, qos_reliable)
+        self.pub = self.create_publisher(Odometry, output_topic, qos)
         
         self.msg_count = 0
         self.get_logger().info(f"Odom bridge: {input_topic} -> {output_topic}")
