@@ -177,7 +177,6 @@ def process_scan_single_hypothesis(
     imu_stamps: jnp.ndarray,
     imu_gyro: jnp.ndarray,
     imu_accel: jnp.ndarray,
-    imu_valid: jnp.ndarray,
     odom_pose: jnp.ndarray,
     odom_cov_se3: jnp.ndarray,
     scan_start_time: float,
@@ -287,7 +286,6 @@ def process_scan_single_hypothesis(
         imu_stamps=imu_stamps,
         imu_gyro=imu_gyro,
         imu_accel=imu_accel,
-        imu_valid=imu_valid,
         weights=w_imu,
         rotvec_start_WB=rotvec0,
         gyro_bias=gyro_bias,
@@ -301,7 +299,6 @@ def process_scan_single_hypothesis(
     omega_avg = delta_pose[3:6] / dt_scan
     iw_meas_gyro_dPsi, iw_meas_gyro_dnu = imu_gyro_meas_iw_suffstats_from_avg_rate_jax(
         imu_gyro=imu_gyro,
-        imu_valid=imu_valid,
         weights=w_imu,
         gyro_bias=gyro_bias,
         omega_avg=omega_avg,
@@ -310,7 +307,6 @@ def process_scan_single_hypothesis(
     iw_meas_accel_dPsi, iw_meas_accel_dnu = imu_accel_meas_iw_suffstats_from_gravity_dir_jax(
         rotvec_world_body=rotvec0,
         imu_accel=imu_accel,
-        imu_valid=imu_valid,
         weights=w_imu,
         accel_bias=accel_bias,
         gravity_W=gravity_W,
@@ -475,7 +471,6 @@ def process_scan_single_hypothesis(
     imu_result, imu_cert, imu_effect = imu_vmf_gravity_evidence(
         rotvec_world_body=pose_pred[3:6],
         imu_accel=imu_accel,
-        imu_valid=imu_valid,
         weights=w_imu,
         accel_bias=accel_bias,
         gravity_W=gravity_W,

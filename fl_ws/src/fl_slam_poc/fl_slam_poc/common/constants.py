@@ -90,12 +90,19 @@ GC_TAU_SOFT_ASSIGN = 0.1  # Default temperature (configurable)
 # pseudocount (fast adaptation) rather than making the IW mean undefined.
 GC_IW_NU_WEAK_ADD = 0.5  # ν = p + 1 + GC_IW_NU_WEAK_ADD  (so ν - p - 1 = 0.5)
 
-# Datasheet-derived PSD priors (noise density squared, per Hz)
-GC_IMU_GYRO_NOISE_DENSITY = 8.7e-7   # (rad^2 / s^2) / Hz
-GC_IMU_ACCEL_NOISE_DENSITY = 9.5e-5  # (m^2 / s^4) / Hz
-
-# LiDAR residual noise proxy PSD prior (refined by IW updates later)
-GC_LIDAR_NOISE_3D = 1e-3  # (m^2) / Hz (proxy)
+# =============================================================================
+# Sensor noise hyperpriors (continuous-time; used as IW priors for Σ and as
+# white-noise PSD proxies when explicitly discretized once).
+# =============================================================================
+#
+# Units:
+# - `GC_IMU_GYRO_NOISE_DENSITY` is treated as continuous-time gyro *rate* noise PSD,
+#   with effective units rad^2 / s. When used for an integrated angle residual over
+#   duration dt, we discretize once as: Σ_rot ≈ PSD * dt.
+# - `GC_IMU_ACCEL_NOISE_DENSITY` is treated as continuous-time accel noise PSD,
+#   with effective units m^2 / s^3 (since (m/s^2)^2 * s).
+GC_IMU_GYRO_NOISE_DENSITY = 8.7e-7   # rad^2 / s   (gyro rate noise PSD proxy)
+GC_IMU_ACCEL_NOISE_DENSITY = 9.5e-5  # m^2 / s^3   (accel noise PSD proxy)
 
 # Default LiDAR translation-measurement covariance used by TranslationWLS (prior; adapted by IW updates).
 GC_LIDAR_SIGMA_MEAS = 0.01  # isotropic 3x3 covariance scale (legacy default)
@@ -105,12 +112,37 @@ GC_LIDAR_N_LINES = 8
 GC_LIDAR_N_TAGS = 3
 GC_LIDAR_N_BUCKETS = GC_LIDAR_N_LINES * GC_LIDAR_N_TAGS  # 24
 
-# Process-noise block priors for slow states (diffusion-rate units, per second).
-# These are weak priors for bias/time/extrinsic drift and will be adapted by IW updates.
-GC_PROCESS_BG_NOISE = 1e-8        # gyro bias diffusion prior
-GC_PROCESS_BA_NOISE = 1e-6        # accel bias diffusion prior
-GC_PROCESS_DT_NOISE = 1e-6        # time-offset diffusion prior
-GC_PROCESS_EXTRINSIC_NOISE = 1e-8 # extrinsic diffusion prior (se(3) 6D)
+# =============================================================================
+# Process diffusion-rate priors (Q is per-second; discretized exactly once as dt*Q)
+# =============================================================================
+#
+# Each value below is a diffusion *rate* in the units of the corresponding state
+# coordinate squared per second (z^2 / s), compatible with `cov += dt * Q`.
+#
+# State block ordering: [rot(3), trans(3), vel(3), bg(3), ba(3), dt(1), ex(6)].
+#
+# Notes:
+# - Rotation diffusion is in rad^2 / s and can be reasonably tied to gyro PSD.
+# - Translation diffusion is in m^2 / s (random walk on position in this model).
+# - Velocity diffusion is in (m/s)^2 / s = m^2 / s^3.
+GC_PROCESS_ROT_DIFFUSION = GC_IMU_GYRO_NOISE_DENSITY  # rad^2 / s
+GC_PROCESS_TRANS_DIFFUSION = 1e-4  # m^2 / s (weak prior; IW adapts from innovations)
+GC_PROCESS_VEL_DIFFUSION = GC_IMU_ACCEL_NOISE_DENSITY  # m^2 / s^3
+GC_PROCESS_BG_DIFFUSION = 1e-8  # (rad/s)^2 / s = rad^2 / s^3
+GC_PROCESS_BA_DIFFUSION = 1e-6  # (m/s^2)^2 / s = m^2 / s^5
+GC_PROCESS_DT_DIFFUSION = 1e-6  # s^2 / s = s
+GC_PROCESS_EXTRINSIC_DIFFUSION = 1e-8  # (se(3))^2 / s (weak; IW adapts)
+
+# =============================================================================
+# Continuous weighting / domain safeguards (no discrete gates)
+# =============================================================================
+GC_WEIGHT_FLOOR = 1e-12  # strictly positive floor for continuous weights
+GC_NONFINITE_SENTINEL = 1e6  # finite sentinel used by domain projection at wrapper boundaries
+
+# Range weighting parameters (continuous; used in PointCloud2 parsing)
+GC_RANGE_WEIGHT_SIGMA = 0.25
+GC_RANGE_WEIGHT_MIN_R = 0.5
+GC_RANGE_WEIGHT_MAX_R = 50.0
 
 # IW retention factors (forgetful prior). Applies deterministically every scan.
 GC_IW_RHO_ROT = 0.995

@@ -86,12 +86,13 @@ class TestKappaFromResultant:
         assert isinstance(cert, CertBundle)
         assert isinstance(effect, ExpectedEffect)
 
-    def test_is_exact_op(self):
-        """Kappa computation is a closed-form ExactOp."""
+    def test_is_approx_op(self):
+        """Kappa computation uses low-R approximation (not exact Bessel inverse)."""
         from fl_slam_poc.backend.operators.kappa import kappa_from_resultant_v2
         
         _, cert, _ = kappa_from_resultant_v2(0.5)
-        assert cert.exact is True
+        assert cert.exact is False  # Uses approximation, see kappa.py docstring
+        assert "KappaLowRApproximation" in cert.approximation_triggers
 
     def test_kappa_range(self):
         """Kappa should be non-negative for valid R_bar."""

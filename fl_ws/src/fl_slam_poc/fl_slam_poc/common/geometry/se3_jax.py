@@ -176,6 +176,48 @@ def se3_V(phi: jnp.ndarray) -> jnp.ndarray:
 
 
 @jit
+def _se3_V_inv(phi: jnp.ndarray) -> jnp.ndarray:
+    """
+    SE(3) V(phi)^{-1} matrix for computing rho from t in Log.
+
+    For small phi, V ≈ I so V^{-1} ≈ I.
+    For larger phi, uses the closed-form inverse.
+
+    The closed-form inverse is:
+        V^{-1} = I - 0.5 * [phi]× + D(theta) * [phi]×²
+
+    where D(theta) = (1/theta²) - (1 + cos(theta)) / (2 * theta * sin(theta))
+
+    This is numerically stable and avoids linear solve.
+    """
+    phi = jnp.asarray(phi, dtype=jnp.float64).reshape(-1)
+    theta_sq = jnp.dot(phi, phi)
+    theta = jnp.sqrt(theta_sq)
+
+    K = skew(phi)
+    K_sq = K @ K
+    I = jnp.eye(3, dtype=jnp.float64)
+
+    # For small theta, use Taylor expansion: V^{-1} ≈ I - 0.5 * K + K²/12
+    # D(theta) ≈ 1/12 + theta²/720 + ...
+    eps = 1e-12
+    safe_theta = jnp.where(theta < SMALL_ANGLE_THRESHOLD, 1.0, theta)
+    safe_theta_sq = jnp.where(theta_sq < SMALL_ANGLE_THRESHOLD**2, 1.0, theta_sq)
+
+    # Denominator: 2 * theta * sin(theta), regularized
+    sin_theta = jnp.sin(safe_theta)
+    denom = 2.0 * safe_theta * sin_theta + eps
+
+    D = jnp.where(
+        theta < SMALL_ANGLE_THRESHOLD,
+        1.0 / 12.0 + theta_sq / 720.0,  # Taylor: 1/12 + θ²/720 + O(θ⁴)
+        (1.0 / safe_theta_sq) - (1.0 + jnp.cos(safe_theta)) / denom,
+    )
+
+    return I - 0.5 * K + D * K_sq
+
+
+@jit
 def se3_log(T: jnp.ndarray) -> jnp.ndarray:
     """
     SE(3) logarithm map from group element to algebra (twist) in 6D representation.
@@ -191,7 +233,13 @@ def se3_log(T: jnp.ndarray) -> jnp.ndarray:
 
         rho = V(phi)^{-1} t
 
-    not just rho=t. This replaces the previous stub logic.
+    not just rho=t.
+
+    NUMERICAL STABILITY NOTE:
+    Uses closed-form V^{-1} instead of linear solve to avoid numerical
+    instability when phi is small (where V is near-identity but solve
+    can accumulate errors). The closed-form uses Taylor expansion for
+    small angles and the exact inverse formula for larger angles.
     """
     T = jnp.asarray(T, dtype=jnp.float64).reshape(-1)
     t = T[:3]
@@ -201,8 +249,9 @@ def se3_log(T: jnp.ndarray) -> jnp.ndarray:
     R = so3_exp(rotvec)
     phi = so3_log(R)
 
-    V = se3_V(phi)
-    rho = jnp.linalg.solve(V, t)
+    # Use closed-form V^{-1} instead of linear solve for numerical stability
+    V_inv = _se3_V_inv(phi)
+    rho = V_inv @ t
 
     return jnp.concatenate([rho, phi])
 

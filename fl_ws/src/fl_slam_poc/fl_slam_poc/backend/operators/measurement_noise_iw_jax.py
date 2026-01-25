@@ -103,7 +103,6 @@ def lidar_meas_iw_suffstats_from_translation_residuals_jax(
 @jax.jit
 def imu_gyro_meas_iw_suffstats_from_avg_rate_jax(
     imu_gyro: jnp.ndarray,    # (M,3)
-    imu_valid: jnp.ndarray,   # (M,)
     weights: jnp.ndarray,     # (M,)
     gyro_bias: jnp.ndarray,   # (3,)
     omega_avg: jnp.ndarray,   # (3,)
@@ -116,12 +115,11 @@ def imu_gyro_meas_iw_suffstats_from_avg_rate_jax(
       r_g = (gyro_i - bg) - omega_avg
     """
     imu_gyro = jnp.asarray(imu_gyro, dtype=jnp.float64)
-    imu_valid = jnp.asarray(imu_valid).reshape(-1)
     weights = jnp.asarray(weights, dtype=jnp.float64).reshape(-1)
     gyro_bias = jnp.asarray(gyro_bias, dtype=jnp.float64).reshape(-1)
     omega_avg = jnp.asarray(omega_avg, dtype=jnp.float64).reshape(-1)
 
-    w = weights * imu_valid.astype(jnp.float64)
+    w = weights
     w_sum = jnp.sum(w) + eps_mass
     w_norm = w / w_sum
 
@@ -140,7 +138,6 @@ def imu_gyro_meas_iw_suffstats_from_avg_rate_jax(
 def imu_accel_meas_iw_suffstats_from_gravity_dir_jax(
     rotvec_world_body: jnp.ndarray,  # (3,)
     imu_accel: jnp.ndarray,          # (M,3)
-    imu_valid: jnp.ndarray,          # (M,)
     weights: jnp.ndarray,            # (M,)
     accel_bias: jnp.ndarray,         # (3,)
     gravity_W: jnp.ndarray,          # (3,)
@@ -166,11 +163,10 @@ def imu_accel_meas_iw_suffstats_from_gravity_dir_jax(
     mu = R0.T @ (-g_hat)
 
     imu_accel = jnp.asarray(imu_accel, dtype=jnp.float64)
-    imu_valid = jnp.asarray(imu_valid).reshape(-1)
     weights = jnp.asarray(weights, dtype=jnp.float64).reshape(-1)
     accel_bias = jnp.asarray(accel_bias, dtype=jnp.float64).reshape(-1)
 
-    w = weights * imu_valid.astype(jnp.float64)
+    w = weights
     w_sum = jnp.sum(w) + eps_mass
     w_norm = w / w_sum
 

@@ -37,7 +37,10 @@ def smooth_window_weights(
     b = (end - t) / sig
     w_min = jax.nn.sigmoid(a)
     w_max = jax.nn.sigmoid(b)
-    return w_min * w_max
+    # Strictly-positive continuous floor (no discrete gating / no exact zeros).
+    w_raw = w_min * w_max
+    wf = jnp.array(constants.GC_WEIGHT_FLOOR, dtype=jnp.float64)
+    return w_raw * (1.0 - wf) + wf
 
 
 @jax.jit
@@ -45,7 +48,6 @@ def preintegrate_imu_relative_pose_jax(
     imu_stamps: jnp.ndarray,  # (M,)
     imu_gyro: jnp.ndarray,    # (M,3) rad/s
     imu_accel: jnp.ndarray,   # (M,3) m/s^2
-    imu_valid: jnp.ndarray,   # (M,) bool
     weights: jnp.ndarray,     # (M,) continuous
     rotvec_start_WB: jnp.ndarray,  # (3,) world->body rotation at scan start (approx)
     gyro_bias: jnp.ndarray,   # (3,)
@@ -59,16 +61,14 @@ def preintegrate_imu_relative_pose_jax(
       delta_pose_se3: (6,) [trans, rotvec] representing relative motion over the window
       delta_R:        (3,3) relative rotation
       delta_p:        (3,) relative position in world frame
-      ess:            scalar effective sample size proxy = sum(weights * valid)
+      ess:            scalar effective sample size proxy = sum(weights)
     """
     imu_stamps = jnp.asarray(imu_stamps, dtype=jnp.float64).reshape(-1)
     imu_gyro = jnp.asarray(imu_gyro, dtype=jnp.float64)
     imu_accel = jnp.asarray(imu_accel, dtype=jnp.float64)
-    imu_valid = jnp.asarray(imu_valid).reshape(-1)
     weights = jnp.asarray(weights, dtype=jnp.float64).reshape(-1)
 
-    valid_f = imu_valid.astype(jnp.float64)
-    w = weights * valid_f
+    w = weights
     ess = jnp.sum(w)
 
     # dt_i = t_{i+1} - t_i (last dt forced to 0)

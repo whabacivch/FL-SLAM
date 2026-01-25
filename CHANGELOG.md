@@ -23,6 +23,16 @@ This file tracks all significant changes, design decisions, and implementation m
 
 - The pipeline is still UT-based for deskew/evidence at this point; later phases will replace UT regression with factor \(\rightarrow\) Laplace/I-projection per the updated plan.
 
+## 2026-01-25: Audit fixes — units + no-fallback timestamps + no hard masks
+
+### Summary
+
+- Clarified **units** and introduced explicit **per-second process diffusion** priors (`GC_PROCESS_*_DIFFUSION`) so `Q` is interpretable as “per second” and discretized exactly once as `dt * Q`.
+- Removed the mis-use of a LiDAR noise proxy as a process prior; process-noise IW initialization now uses diffusion-rate priors.
+- Enforced **no silent fallbacks** for Livox per-point timing + metadata: PointCloud2 parsing fails fast if `ring/tag/timebase/time_offset` fields are missing (single math path).
+- Removed `imu_valid` boolean gating across IMU preintegration/evidence/IW updates; IMU influence is now controlled solely by **continuous, strictly-positive** window weights.
+- Replaced NaN/Inf point handling with a declared wrapper-boundary **domain projection** to finite sentinels plus strictly-positive continuous range weighting (no exact-zero masks).
+
 ## 2026-01-24: Fixed ROS 2 Jazzy Empty-List Parameter Type Bug
 
 ### Root Cause

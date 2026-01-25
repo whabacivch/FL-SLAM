@@ -55,17 +55,17 @@ def create_datasheet_process_noise_state() -> ProcessNoiseIWState:
     nu_extra = jnp.array(C.GC_IW_NU_WEAK_ADD, dtype=jnp.float64)
     nu = p + 1.0 + nu_extra  # (7,)
 
-    # Per-block prior covariance / diffusion-rate scales.
-    # NOTE: these are priors; the IW update adapts them from innovations.
+    # Per-block diffusion-rate priors (z^2 / s), compatible with `cov += dt * Q`.
+    # NOTE: these are weak priors; the IW update adapts them from innovations.
     sigma_diag = jnp.array(
         [
-            C.GC_IMU_GYRO_NOISE_DENSITY,   # rot
-            C.GC_LIDAR_NOISE_3D,           # trans
-            C.GC_LIDAR_NOISE_3D,           # vel
-            C.GC_PROCESS_BG_NOISE,         # bg
-            C.GC_PROCESS_BA_NOISE,         # ba
-            C.GC_PROCESS_DT_NOISE,         # dt
-            C.GC_PROCESS_EXTRINSIC_NOISE,  # ex (6D)
+            C.GC_PROCESS_ROT_DIFFUSION,        # rot   (rad^2 / s)
+            C.GC_PROCESS_TRANS_DIFFUSION,      # trans (m^2 / s)
+            C.GC_PROCESS_VEL_DIFFUSION,        # vel   (m^2 / s^3)
+            C.GC_PROCESS_BG_DIFFUSION,         # bg
+            C.GC_PROCESS_BA_DIFFUSION,         # ba
+            C.GC_PROCESS_DT_DIFFUSION,         # dt
+            C.GC_PROCESS_EXTRINSIC_DIFFUSION,  # ex (6D)
         ],
         dtype=jnp.float64,
     )
