@@ -11,9 +11,7 @@ Nodes:
 """
 
 from fl_slam_poc.frontend.audit.dead_end_audit_node import DeadEndAuditNode
-from fl_slam_poc.frontend.audit.wiring_auditor import WiringAuditorNode
-
-__all__ = [
+from fl_slam_poc.frontend.audit.wiring_auditor import WiringAuditorNode__all__ = [
     "DeadEndAuditNode",
     "WiringAuditorNode",
 ]

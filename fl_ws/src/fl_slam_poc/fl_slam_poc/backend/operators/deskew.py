@@ -100,16 +100,15 @@ def _generate_sigma_points(
     scaled_cov = scaled_cov + 1e-12 * jnp.eye(n)
     L = jnp.linalg.cholesky(scaled_cov)
     
-    # Generate 2n+1 sigma points
-    sigma_points = jnp.zeros((2 * n + 1, n))
+    # Generate 2n+1 sigma points (vectorized, no Python loop)
+    # Central point at index 0, positive directions at 1:n+1, negative at n+1:2n+1
+    L_T = L.T  # (n, n) - columns become rows for easy broadcasting
     
-    # Central point
-    sigma_points = sigma_points.at[0].set(mean)
-    
-    # Points along positive/negative sqrt directions
-    for i in range(n):
-        sigma_points = sigma_points.at[1 + i].set(mean + L[:, i])
-        sigma_points = sigma_points.at[1 + n + i].set(mean - L[:, i])
+    sigma_points = jnp.concatenate([
+        mean[None, :],           # (1, n) - central point
+        mean[None, :] + L_T,     # (n, n) - positive directions
+        mean[None, :] - L_T,     # (n, n) - negative directions
+    ], axis=0)  # (2n+1, n)
     
     # Weights
     w0 = lambda_ / (n + lambda_)

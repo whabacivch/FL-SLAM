@@ -69,6 +69,39 @@ def _kappa_continuous_formula(R: float, d: int = 3) -> float:
     return kappa
 
 
+@jax.jit
+def kappa_from_resultant_batch(
+    R_bar: jnp.ndarray,
+    eps_r: float = constants.GC_EPS_R,
+    d: int = 3,
+) -> jnp.ndarray:
+    """
+    Batched kappa computation for arrays of resultant lengths.
+    
+    Pure JAX implementation - no host sync, fully vectorized.
+    
+    Args:
+        R_bar: Mean resultant lengths (B,) in [0, 1)
+        eps_r: Small epsilon to keep R away from 1
+        d: Dimension (default 3 for S^2)
+        
+    Returns:
+        kappa values (B,)
+    """
+    R_bar = jnp.asarray(R_bar, dtype=jnp.float64)
+    
+    # Clamp R to valid range (continuous, always applied)
+    R_clamped = jnp.clip(R_bar, 0.0, 1.0 - eps_r)
+    
+    # Vectorized kappa formula: kappa = R * (d - R^2) / (1 - R^2 + eps)
+    R2 = R_clamped * R_clamped
+    numerator = R_clamped * (d - R2)
+    denominator = 1.0 - R2 + eps_r
+    kappa = numerator / denominator
+    
+    return kappa
+
+
 def kappa_from_resultant_v2(
     R_bar: float,
     eps_r: float = constants.GC_EPS_R,

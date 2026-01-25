@@ -23,6 +23,7 @@ from fl_slam_poc.common.primitives import (
     domain_projection_psd,
     inv_mass,
 )
+from fl_slam_poc.backend.operators.kappa import kappa_from_resultant_batch
 
 
 # =============================================================================
@@ -207,42 +208,32 @@ def scan_bin_moment_match(
     sum_ppT = jnp.einsum("nb,nij->bij", w_r, ppT)  # (B,3,3)
     sum_cov = jnp.einsum("nb,nij->bij", w_r, point_covariances)  # (B,3,3)
     
-    # Compute derived quantities using InvMass (no N==0 branches)
-    p_bar = jnp.zeros((n_bins, 3), dtype=jnp.float64)
-    Sigma_p = jnp.zeros((n_bins, 3, 3), dtype=jnp.float64)
-    kappa_scan = jnp.zeros(n_bins, dtype=jnp.float64)
+    # Compute derived quantities using batched operations (no per-bin Python loop)
+    # InvMass - batched: inv_N = 1 / max(N, eps_mass)
+    inv_N = 1.0 / jnp.maximum(N, eps_mass)  # (B,)
     
-    # Import kappa operator
-    from fl_slam_poc.backend.operators.kappa import kappa_from_resultant_v2
+    # Centroids: p_bar = sum_p * inv_N
+    p_bar = sum_p * inv_N[:, None]  # (B, 3)
     
-    for b in range(n_bins):
-        N_b = N[b]
-        
-        # InvMass - always applied, no conditional
-        inv_N_b = inv_mass(float(N_b), eps_mass).inv_mass
-        
-        # Centroid
-        c_b = sum_p[b] * inv_N_b
-        p_bar = p_bar.at[b].set(c_b)
-        
-        # Scatter covariance
-        scatter = sum_ppT[b] * inv_N_b - jnp.outer(c_b, c_b)
-        
-        # Add measurement covariance (weighted average)
-        meas_cov = sum_cov[b] * inv_N_b
-        
-        # Total covariance
-        Sigma_raw = scatter + meas_cov
-        
-        # Project to PSD (always)
-        Sigma_psd = domain_projection_psd(Sigma_raw, eps_psd).M_psd
-        Sigma_p = Sigma_p.at[b].set(Sigma_psd)
-        
-        # Kappa from resultant length
-        S_b_norm = float(jnp.linalg.norm(s_dir[b]))
-        Rbar_b = S_b_norm * inv_N_b  # R-bar in (0, 1)
-        kappa_result, _, _ = kappa_from_resultant_v2(Rbar_b)
-        kappa_scan = kappa_scan.at[b].set(kappa_result.kappa)
+    # Scatter covariance: scatter = sum_ppT * inv_N - outer(p_bar, p_bar)
+    scatter = sum_ppT * inv_N[:, None, None] - jnp.einsum("bi,bj->bij", p_bar, p_bar)  # (B, 3, 3)
+    
+    # Measurement covariance (weighted average)
+    meas_cov = sum_cov * inv_N[:, None, None]  # (B, 3, 3)
+    
+    # Total covariance
+    Sigma_raw = scatter + meas_cov  # (B, 3, 3)
+    
+    # Project to PSD (batched) - symmetrize and eigen-clamp
+    Sigma_sym = 0.5 * (Sigma_raw + jnp.swapaxes(Sigma_raw, -1, -2))
+    eigvals, eigvecs = jax.vmap(jnp.linalg.eigh)(Sigma_sym)
+    vals_clamped = jnp.maximum(eigvals, eps_psd)
+    Sigma_p = jnp.einsum("bij,bj,bkj->bik", eigvecs, vals_clamped, eigvecs)  # (B, 3, 3)
+    
+    # Kappa from resultant length (batched)
+    S_norms = jnp.linalg.norm(s_dir, axis=1)  # (B,)
+    Rbar = S_norms * inv_N  # R-bar in (0, 1) for each bin
+    kappa_scan = kappa_from_resultant_batch(Rbar, eps_r=constants.GC_EPS_R)  # (B,)
     
     # Build result
     result = ScanBinStats(
