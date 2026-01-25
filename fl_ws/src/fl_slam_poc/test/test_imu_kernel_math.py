@@ -1,52 +1,44 @@
+"""
+NOTE (repo hygiene):
+This test file originally referenced a legacy IMU kernel that lives under `archive/`
+and is not part of the live package import graph. As part of the GC v2 spec upgrade,
+we replace it with foundational Lie-primitive correctness tests.
+"""
+
 import numpy as np
 
-from fl_slam_poc.backend.math.imu_kernel import imu_batched_projection_kernel
 from fl_slam_poc.common.jax_init import jnp
+from fl_slam_poc.common.geometry import se3_jax
 
 
-def test_imu_kernel_shapes_and_finiteness():
-    anchor_mus = jnp.zeros((1, 15))
-    anchor_covs = jnp.tile(jnp.eye(15)[None, :, :], (1, 1, 1))
-    current_mu = jnp.zeros(15)
-    current_cov = jnp.eye(15)
-    routing_weights = jnp.array([1.0])
-    imu_stamps = jnp.array([0.0, 0.01])
-    imu_accel = jnp.zeros((2, 3))
-    imu_gyro = jnp.zeros((2, 3))
-    imu_valid = jnp.array([True, True])
-    R_imu = jnp.eye(9) * 1e-3
-    R_nom = jnp.eye(9) * 1e-3
-    gravity = jnp.array([0.0, 0.0, -9.81])
+def test_hat_vee_roundtrip():
+    w = jnp.array([0.3, -0.2, 0.1], dtype=jnp.float64)
+    W = se3_jax.skew(w)
+    w2 = se3_jax.vee(W)
+    np.testing.assert_allclose(np.asarray(w2), np.asarray(w), atol=1e-12, rtol=0.0)
 
-    joint_mean, joint_cov, diagnostics = imu_batched_projection_kernel(
-        anchor_mus=anchor_mus,
-        anchor_covs=anchor_covs,
-        current_mu=current_mu,
-        current_cov=current_cov,
-        routing_weights=routing_weights,
-        imu_stamps=imu_stamps,
-        imu_accel=imu_accel,
-        imu_gyro=imu_gyro,
-        imu_valid=imu_valid,
-        R_imu=R_imu,
-        R_nom=R_nom,
-        gravity=gravity,
-        dt_total=0.01,
-    )
 
-    joint_mean_np = np.asarray(joint_mean)
-    joint_cov_np = np.asarray(joint_cov)
-    h_weights_np = np.asarray(diagnostics['hellinger_weights'])
-    routing_np = np.asarray(diagnostics['routing_weights'])
-    hellinger_mean = float(diagnostics['hellinger_mean'])
+def test_so3_right_jacobian_inverse_consistency():
+    phi = jnp.array([0.2, -0.1, 0.05], dtype=jnp.float64)
+    Jr = se3_jax.so3_right_jacobian(phi)
+    Jr_inv = se3_jax.so3_right_jacobian_inv(phi)
+    I = jnp.eye(3, dtype=jnp.float64)
+    np.testing.assert_allclose(np.asarray(Jr_inv @ Jr), np.asarray(I), atol=1e-10, rtol=0.0)
 
-    # Joint state is [anchor_0 (15D), current (15D)] = 30D
-    assert joint_mean_np.shape == (30,)
-    assert joint_cov_np.shape == (30, 30)
-    assert h_weights_np.shape == (1,)
-    assert routing_np.shape == (1,)
-    assert np.all(np.isfinite(joint_mean_np))
-    assert np.all(np.isfinite(joint_cov_np))
-    assert np.all(np.isfinite(h_weights_np))
-    assert np.all(np.isfinite(routing_np))
-    assert 0.0 <= hellinger_mean <= 1.0
+
+def test_se3_exp_log_roundtrip_small():
+    # xi = [rho, phi] in se(3)
+    xi = jnp.array([0.1, -0.05, 0.02, 0.2, -0.1, 0.05], dtype=jnp.float64)
+    T = se3_jax.se3_exp(xi)     # group element [t, rotvec]
+    xi2 = se3_jax.se3_log(T)    # back to twist [rho, phi]
+    np.testing.assert_allclose(np.asarray(xi2), np.asarray(xi), atol=1e-9, rtol=0.0)
+
+
+def test_se3_V_matches_translation_part():
+    xi = jnp.array([0.2, 0.1, -0.05, 0.15, -0.05, 0.02], dtype=jnp.float64)
+    rho = xi[:3]
+    phi = xi[3:6]
+    T = se3_jax.se3_exp(xi)
+    t = T[:3]
+    t2 = se3_jax.se3_V(phi) @ rho
+    np.testing.assert_allclose(np.asarray(t2), np.asarray(t), atol=1e-12, rtol=0.0)

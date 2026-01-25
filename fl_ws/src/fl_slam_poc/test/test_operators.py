@@ -229,7 +229,6 @@ class TestPredictDiffusion:
         """Operator should return (result, cert, expected_effect)."""
         from fl_slam_poc.backend.operators.predict import (
             predict_diffusion,
-            build_default_process_noise,
         )
         
         # Create a simple prior belief
@@ -248,7 +247,7 @@ class TestPredictDiffusion:
             cert=cert,
         )
         
-        Q = build_default_process_noise()
+        Q = jnp.eye(D_Z, dtype=jnp.float64)
         result, pred_cert, effect = predict_diffusion(belief, Q, dt_sec=0.1)
         
         assert result is not None
@@ -259,7 +258,6 @@ class TestPredictDiffusion:
         """Predicted belief should have updated timestamp."""
         from fl_slam_poc.backend.operators.predict import (
             predict_diffusion,
-            build_default_process_noise,
         )
         
         cert = CertBundle.create_exact(
@@ -277,7 +275,7 @@ class TestPredictDiffusion:
             cert=cert,
         )
         
-        Q = build_default_process_noise()
+        Q = jnp.eye(D_Z, dtype=jnp.float64)
         result, _, _ = predict_diffusion(belief, Q, dt_sec=0.5)
         
         assert result.stamp_sec == 1.5

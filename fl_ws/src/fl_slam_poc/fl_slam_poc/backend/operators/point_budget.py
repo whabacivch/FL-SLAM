@@ -33,6 +33,8 @@ class PointBudgetResult:
     points: jnp.ndarray  # (M, 3) resampled points
     timestamps: jnp.ndarray  # (M,) timestamps
     weights: jnp.ndarray  # (M,) adjusted weights
+    ring: jnp.ndarray  # (M,) uint8 (0 if unavailable)
+    tag: jnp.ndarray   # (M,) uint8 (0 if unavailable)
     n_input: int
     n_output: int
     total_mass_in: float
@@ -48,6 +50,8 @@ def point_budget_resample(
     points: jnp.ndarray,
     timestamps: jnp.ndarray,
     weights: jnp.ndarray,
+    ring: jnp.ndarray | None = None,
+    tag: jnp.ndarray | None = None,
     n_points_cap: int = constants.GC_N_POINTS_CAP,
     chart_id: str = constants.GC_CHART_ID,
     anchor_id: str = "initial",
@@ -74,6 +78,14 @@ def point_budget_resample(
     points = jnp.asarray(points, dtype=jnp.float64)
     timestamps = jnp.asarray(timestamps, dtype=jnp.float64)
     weights = jnp.asarray(weights, dtype=jnp.float64)
+    if ring is None:
+        ring = jnp.zeros((points.shape[0],), dtype=jnp.uint8)
+    else:
+        ring = jnp.asarray(ring, dtype=jnp.uint8).reshape(-1)
+    if tag is None:
+        tag = jnp.zeros((points.shape[0],), dtype=jnp.uint8)
+    else:
+        tag = jnp.asarray(tag, dtype=jnp.uint8).reshape(-1)
     
     n_input = points.shape[0]
     total_mass_in = float(jnp.sum(weights))
@@ -91,6 +103,8 @@ def point_budget_resample(
     points_out = points[indices]
     timestamps_out = timestamps[indices]
     weights_raw = weights[indices]
+    ring_out = ring[indices]
+    tag_out = tag[indices]
     
     # Preserve total mass by scaling weights
     total_mass_selected = float(jnp.sum(weights_raw))
@@ -104,6 +118,8 @@ def point_budget_resample(
         points=points_out,
         timestamps=timestamps_out,
         weights=weights_out,
+        ring=ring_out,
+        tag=tag_out,
         n_input=n_input,
         n_output=n_selected,
         total_mass_in=total_mass_in,

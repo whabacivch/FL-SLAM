@@ -78,11 +78,6 @@ class TestDimensionInvariants:
         """D_DESKEW must equal D_Z."""
         assert constants.GC_D_DESKEW == constants.GC_D_Z
 
-    def test_sigma_points_formula(self):
-        """SIGMA_POINTS must be 2*D_DESKEW + 1."""
-        expected = 2 * constants.GC_D_DESKEW + 1
-        assert constants.GC_SIGMA_POINTS == expected
-
     def test_belief_dimensions(self):
         """BeliefGaussianInfo dimensions must match spec."""
         cert = CertBundle.create_exact(
@@ -122,10 +117,6 @@ class TestBudgetConstants:
     def test_b_bins(self):
         """B_BINS must be 48."""
         assert constants.GC_B_BINS == 48
-
-    def test_t_slices(self):
-        """T_SLICES must be 5."""
-        assert constants.GC_T_SLICES == 5
 
     def test_n_points_cap(self):
         """N_POINTS_CAP must be 8192."""

@@ -27,51 +27,6 @@ from fl_slam_poc.common.primitives import (
 
 
 # =============================================================================
-# Default Process Noise
-# =============================================================================
-
-
-def build_default_process_noise(
-    sigma_gyro: float = 0.01,
-    sigma_accel: float = 0.1,
-    sigma_gyro_bias: float = 1e-4,
-    sigma_accel_bias: float = 1e-3,
-    sigma_dt: float = 1e-3,
-    sigma_extrinsic: float = 1e-4,
-) -> jnp.ndarray:
-    """
-    Build default process noise matrix Q.
-    
-    Returns:
-        Process noise matrix (D_Z, D_Z)
-    """
-    Q = jnp.zeros((D_Z, D_Z), dtype=jnp.float64)
-    
-    # SO(3) rotation (indices 0:3)
-    Q = Q.at[0:3, 0:3].set(sigma_gyro**2 * jnp.eye(3))
-    
-    # Translation (indices 3:6)
-    Q = Q.at[3:6, 3:6].set(sigma_accel**2 * jnp.eye(3))
-    
-    # Velocity (indices 6:9)
-    Q = Q.at[6:9, 6:9].set(sigma_accel**2 * jnp.eye(3))
-    
-    # Gyro bias (indices 9:12)
-    Q = Q.at[9:12, 9:12].set(sigma_gyro_bias**2 * jnp.eye(3))
-    
-    # Accel bias (indices 12:15)
-    Q = Q.at[12:15, 12:15].set(sigma_accel_bias**2 * jnp.eye(3))
-    
-    # Time offset (index 15)
-    Q = Q.at[15, 15].set(sigma_dt**2)
-    
-    # Extrinsic (indices 16:22)
-    Q = Q.at[16:22, 16:22].set(sigma_extrinsic**2 * jnp.eye(6))
-    
-    return Q
-
-
-# =============================================================================
 # Main Operator
 # =============================================================================
 

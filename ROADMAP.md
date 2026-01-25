@@ -1079,5 +1079,184 @@ pi_outlier = 0.1       # outlier mixture weight
 18. ⏳ Phase 17: System-wide adaptive coordinator
 
 ---
+Yes—adding **categorical (and hierarchical categorical)** layers is the cleanest way to reach Hydra-DSG–level semantic usability while staying fully within your “exponential-family, additive stats, branch-free” doctrine.
+
+Below is a strict, implementable way to do it that (i) remains first principles, (ii) is JAX/static-shape friendly, and (iii) keeps the semantic layer auditable and uncertainty-aware.
+
+---
+
+## 1) The right semantic primitive: Categorical with conjugate Dirichlet
+
+For each map atom (j) (splat / voxel / bin-cell), maintain a categorical distribution over (K) labels:
+
+[
+\pi_j \in \Delta^{K-1},\qquad y \sim \mathrm{Cat}(\pi_j)
+]
+
+Use a Dirichlet prior/posterior:
+[
+\pi_j \sim \mathrm{Dir}(\alpha_j), \quad \alpha_j \in \mathbb R_{>0}^K
+]
+
+### Why this matches your architecture
+
+* **Exponential family**: Cat/Dir are canonical.
+* **Additive sufficient statistics**: Dirichlet posterior is updated by adding counts (or soft counts).
+* **No gates**: every semantic observation contributes soft mass; uncertainty is in (\alpha), not thresholds.
+* **Auditability**: (\alpha) is literally “evidence mass per class.”
+
+---
+
+## 2) The crucial move: semantics update uses *soft assignments* and *continuous reliability*
+
+You must never do “take argmax class” or “only accept if confidence > 0.7”.
+
+For a semantic observation at time (t), you should always produce a **soft responsibility vector**:
+[
+r_t \in \Delta^{K-1}
+]
+(e.g., from a perception model, a foundation model, or a learned classifier).
+
+Then update the atom’s Dirichlet counts additively:
+[
+\alpha_j \leftarrow \alpha_j + w_{t\to j}, r_t
+]
+
+Where (w_{t\to j}) is a **continuous** association weight (see §3).
+
+This is exactly analogous to how you already treat LiDAR bins and vMF resultants—just in the categorical simplex instead of the sphere.
+
+---
+
+## 3) How semantic observations attach to map atoms (no gating)
+
+You already have the machinery: soft assignment.
+
+Define a fixed-size set of map atoms (splats/voxels/bins). For each observation, compute **continuous association weights**:
+
+* **Geometric association**: based on distance in (\mathbb R^3) under the atom covariance (\Sigma_j)
+* **Directional consistency**: based on vMF alignment (\mu_j^\top x) and (\kappa_j)
+* **Optional appearance**: intensity/tag/other metadata as additional likelihood terms
+
+Then:
+[
+w_{t\to j} \propto \exp\Big(-\tfrac12 d_M(x_t,\mu_j,\Sigma_j)\Big)
+]
+normalized with a softmax temperature that you can also infer (same pattern as `tau_soft_assign` but now principled across modalities).
+
+No “nearest neighbor” decisions. No “if distance < threshold”.
+
+---
+
+## 4) Hierarchical categorical for expressiveness (Hydra-comparable)
+
+A flat categorical is useful but limited. The principled next step is a **hierarchical Dirichlet model** so you get:
+
+* global priors,
+* region priors (room/place),
+* object priors,
+* and local atom posteriors,
+
+all with conjugate updates.
+
+### 4.1 Three-level hierarchy (minimal and powerful)
+
+Let:
+
+* Global label frequency: (\pi_0 \sim \mathrm{Dir}(\alpha_0))
+* Region (r): (\pi_r \sim \mathrm{Dir}(\lambda,\pi_0))
+* Atom (j) in region (r(j)): (\pi_j \sim \mathrm{Dir}(\gamma,\pi_{r(j)}))
+
+Observations update only (\alpha_j) (local counts). Periodically (or per scan) you do fixed-cost VB updates for (\pi_r, \pi_0) from aggregated counts. This is branch-free and static-shape if you fix the number of regions or treat regions as a fixed atlas (see §6).
+
+### 4.2 Why this matters
+
+* In Hydra DSG terms: regions/places become semantic containers.
+* Your system remains fully probabilistic and continuous.
+* Semantics become *smoothly transferrable*: if a room is “kitchen-like,” atoms inside inherit that prior.
+
+---
+
+## 5) Semantics + geometry coupling without breaking your purity
+
+You have two correct options:
+
+### Option A (recommended initially): “Semantics is a read-only layer”
+
+* Semantics does **not** influence pose optimization.
+* You only visualize and audit it.
+* This avoids feedback loops and preserves estimator stability.
+
+### Option B (later): semantics contributes as a factor through learned likelihoods
+
+If you have a semantic sensor model (p(r_t \mid \pi_j)), you can include it as an additive negative log likelihood and project via Laplace along with the rest. Still no heuristics.
+
+Most teams get Option A correct first, then move to B.
+
+---
+
+## 6) JAX/static-shape implementation strategy
+
+To keep `jit` happy, you cannot create/destroy objects dynamically in the inner loop.
+
+So you define:
+
+* a fixed map atlas (e.g., hashed voxel table of fixed capacity, or fixed splat budget),
+* each slot contains:
+
+  * Gaussian params (mean/cov or info)
+  * vMF stats (S,N → μ,κ)
+  * Dirichlet α vector (`float32[K]`)
+
+Updates are pure adds + renormalizations.
+
+### Memory footprint
+
+If (K=40) classes and you store `alpha[K]` per atom:
+
+* 40 floats = 160 bytes/atom
+* 100k atoms = 16 MB (very manageable)
+
+---
+
+## 7) Visualization: “semantic splats” that are auditable
+
+Once each Gaussian splat atom has:
+
+* geometric (\mu,\Sigma)
+* directional vMF (\mu_d,\kappa)
+* semantic Dirichlet (\alpha)
+
+you can render:
+
+* **Most likely class**: (\arg\max_k \mathbb E[\pi_k]=\alpha_k/\sum\alpha)
+* **Semantic uncertainty**: entropy of (\mathbb E[\pi])
+* **Evidence mass**: (\sum\alpha) (how much semantic evidence is there)
+* **Geometry uncertainty**: (\mathrm{tr}(\Sigma)) or (\log\det\Sigma)
+
+This yields a map humans can *audit*:
+
+* “this region is labeled ‘chair’ but entropy is high”
+* “that wall has high geometric certainty but semantic ambiguity”
+* “this object hypothesis is strong because alpha mass is high”
+
+That is Hydra-like usability, but with far better uncertainty grounding.
+
+---
+
+## 8) What I recommend as the next concrete step
+
+Define a **MapAtom v2 schema**:
+
+* `mu_xyz: float32[3]`
+* `Lambda_xyz: float32[3,3]` (or Sigma)
+* `S_dir: float32[3]`, `N_dir: float32`
+* `alpha_sem: float32[K]`
+
+Then define two operators:
+
+1. `SemanticSoftAssign(observation → r_t, association weights w_{t→j})`
+2. `DirichletAccumulate(alpha_j += w*r_t)` (pure add)
+
 
 **End of Roadmap**

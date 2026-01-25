@@ -19,6 +19,7 @@ from fl_slam_poc.common.certificates import (
     CertBundle,
     ExpectedEffect,
     aggregate_certificates,
+    InfluenceCert,
 )
 from fl_slam_poc.backend.structures.bin_atlas import (
     BinAtlas,
@@ -35,11 +36,14 @@ from fl_slam_poc.backend.operators.point_budget import (
 )
 from fl_slam_poc.backend.operators.predict import (
     predict_diffusion,
-    build_default_process_noise,
 )
-from fl_slam_poc.backend.operators.deskew import (
-    deskew_ut_moment_match,
-    DeskewResult,
+from fl_slam_poc.backend.operators.imu_preintegration import (
+    smooth_window_weights,
+    preintegrate_imu_relative_pose_jax,
+)
+from fl_slam_poc.backend.operators.deskew_constant_twist import (
+    deskew_constant_twist,
+    DeskewConstantTwistResult,
 )
 from fl_slam_poc.backend.operators.binning import (
     bin_soft_assign,
@@ -50,15 +54,32 @@ from fl_slam_poc.backend.operators.binning import (
 from fl_slam_poc.backend.operators.kappa import kappa_from_resultant_v2
 from fl_slam_poc.backend.operators.wahba import wahba_svd
 from fl_slam_poc.backend.operators.translation import translation_wls
+from fl_slam_poc.backend.operators.measurement_noise_iw_jax import (
+    lidar_meas_iw_suffstats_from_translation_residuals_jax,
+    imu_gyro_meas_iw_suffstats_from_avg_rate_jax,
+    imu_accel_meas_iw_suffstats_from_gravity_dir_jax,
+)
+from fl_slam_poc.backend.operators.odom_evidence import odom_quadratic_evidence
+from fl_slam_poc.backend.operators.imu_evidence import imu_vmf_gravity_evidence
+from fl_slam_poc.backend.operators.imu_gyro_evidence import imu_gyro_rotation_evidence
 from fl_slam_poc.backend.operators.lidar_evidence import (
     lidar_quadratic_evidence,
     MapBinStats as LidarMapBinStats,
+)
+from fl_slam_poc.backend.operators.lidar_bucket_noise_iw_jax import (
+    lidar_point_reliability_from_buckets_jax,
+    lidar_bucket_iw_suffstats_from_bin_residuals_jax,
 )
 from fl_slam_poc.backend.operators.fusion import (
     fusion_scale_from_certificates,
     info_fusion_additive,
 )
+from fl_slam_poc.backend.operators.excitation import (
+    compute_excitation_scales_jax,
+    apply_excitation_prior_scaling_jax,
+)
 from fl_slam_poc.backend.operators.recompose import pose_update_frobenius_recompose
+from fl_slam_poc.backend.operators.inverse_wishart_jax import process_noise_iw_suffstats_from_info_jax
 from fl_slam_poc.backend.operators.map_update import (
     pos_cov_inflation_pushforward,
     MapUpdateResult,
@@ -78,7 +99,6 @@ class PipelineConfig:
     # Budgets (hard constants)
     K_HYP: int = constants.GC_K_HYP
     B_BINS: int = constants.GC_B_BINS
-    T_SLICES: int = constants.GC_T_SLICES
     N_POINTS_CAP: int = constants.GC_N_POINTS_CAP
     
     # Epsilon constants
@@ -105,11 +125,17 @@ class PipelineConfig:
     
     # Measurement noise
     Sigma_meas: jnp.ndarray = None
+    Sigma_g: jnp.ndarray = None  # (3,3) gyro covariance proxy (from measurement IW)
+    Sigma_a: jnp.ndarray = None  # (3,3) accel covariance proxy (from measurement IW)
     
     def __post_init__(self):
         if self.Sigma_meas is None:
             # Default measurement noise (3x3 isotropic)
             self.Sigma_meas = 0.01 * jnp.eye(3, dtype=jnp.float64)
+        if self.Sigma_g is None:
+            self.Sigma_g = constants.GC_IMU_GYRO_NOISE_DENSITY * jnp.eye(3, dtype=jnp.float64)
+        if self.Sigma_a is None:
+            self.Sigma_a = constants.GC_IMU_ACCEL_NOISE_DENSITY * jnp.eye(3, dtype=jnp.float64)
 
 
 # =============================================================================
@@ -122,6 +148,15 @@ class ScanPipelineResult:
     """Result of processing a single scan for one hypothesis."""
     belief_updated: BeliefGaussianInfo
     map_increments: MapUpdateResult  # Increments to map statistics
+    # Process-noise IW sufficient statistics proposal (commutative; aggregated once per scan).
+    iw_process_dPsi: jnp.ndarray  # (7, 6, 6) padded
+    iw_process_dnu: jnp.ndarray   # (7,)
+    # Measurement-noise IW sufficient statistics proposal (per-sensor; aggregated once per scan).
+    iw_meas_dPsi: jnp.ndarray     # (3, 3, 3) [gyro, accel, lidar]
+    iw_meas_dnu: jnp.ndarray      # (3,)
+    # LiDAR bucket IW sufficient statistics proposal (per-(line,tag); aggregated once per scan).
+    iw_lidar_bucket_dPsi: jnp.ndarray  # (K, 3, 3)
+    iw_lidar_bucket_dnu: jnp.ndarray   # (K,)
     all_certs: List[CertBundle]
     aggregated_cert: CertBundle
 
@@ -136,6 +171,15 @@ def process_scan_single_hypothesis(
     raw_points: jnp.ndarray,
     raw_timestamps: jnp.ndarray,
     raw_weights: jnp.ndarray,
+    raw_ring: jnp.ndarray,
+    raw_tag: jnp.ndarray,
+    lidar_bucket_state,
+    imu_stamps: jnp.ndarray,
+    imu_gyro: jnp.ndarray,
+    imu_accel: jnp.ndarray,
+    imu_valid: jnp.ndarray,
+    odom_pose: jnp.ndarray,
+    odom_cov_se3: jnp.ndarray,
     scan_start_time: float,
     scan_end_time: float,
     dt_sec: float,
@@ -147,16 +191,16 @@ def process_scan_single_hypothesis(
     """
     Process a single scan for one hypothesis.
     
-    Follows the exact 15-step order from spec Section 7:
+    Follows the fixed-cost scan pipeline:
     1. PointBudgetResample
     2. PredictDiffusion
-    3. DeskewUTMomentMatch (produces ut_cache)
+    3. DeskewConstantTwist
     4. BinSoftAssign
     5. ScanBinMomentMatch
     6. KappaFromResultant (map and scan)
     7. WahbaSVD
     8. TranslationWLS
-    9. LidarQuadraticEvidence (reuses ut_cache)
+    9. OdomEvidence + ImuEvidence + LidarEvidence (closed-form/Laplace; no moment-matching)
     10. FusionScaleFromCertificates
     11. InfoFusionAdditive
     12. PoseUpdateFrobeniusRecompose
@@ -190,6 +234,8 @@ def process_scan_single_hypothesis(
         points=raw_points,
         timestamps=raw_timestamps,
         weights=raw_weights,
+        ring=raw_ring,
+        tag=raw_tag,
         n_points_cap=config.N_POINTS_CAP,
         chart_id=belief_prev.chart_id,
         anchor_id=belief_prev.anchor_id,
@@ -199,6 +245,8 @@ def process_scan_single_hypothesis(
     points = budget_result.points
     timestamps = budget_result.timestamps
     weights = budget_result.weights
+    ring = budget_result.ring
+    tag = budget_result.tag
     
     # =========================================================================
     # Step 2: PredictDiffusion
@@ -213,26 +261,79 @@ def process_scan_single_hypothesis(
     all_certs.append(pred_cert)
     
     # =========================================================================
-    # Step 3: DeskewUTMomentMatch
+    # Step 3: DeskewConstantTwist (IMU-derived constant twist)
     # =========================================================================
-    deskew_result, deskew_cert, deskew_effect = deskew_ut_moment_match(
-        belief_pred=belief_pred,
+    # Time-warp width from dt uncertainty (continuous; no thresholding)
+    _mu_pred, Sigma_pred, _lift = belief_pred.to_moments(eps_lift=config.eps_lift)
+    dt_std = jnp.sqrt(Sigma_pred[15, 15])
+    sigma_warp = float(jnp.maximum(dt_std, 0.01))
+    w_imu = smooth_window_weights(
+        imu_stamps=imu_stamps,
+        scan_start_time=scan_start_time,
+        scan_end_time=scan_end_time,
+        sigma=sigma_warp,
+    )
+
+    # Biases from predicted belief increment
+    mu_inc = belief_pred.mean_increment(eps_lift=config.eps_lift)
+    gyro_bias = mu_inc[9:12]
+    accel_bias = mu_inc[12:15]
+
+    pose0 = belief_prev.mean_world_pose(eps_lift=config.eps_lift)
+    rotvec0 = pose0[3:6]
+    gravity_W = jnp.array(constants.GC_GRAVITY_W, dtype=jnp.float64)
+
+    delta_pose, _R_end, _p_end, ess_imu = preintegrate_imu_relative_pose_jax(
+        imu_stamps=imu_stamps,
+        imu_gyro=imu_gyro,
+        imu_accel=imu_accel,
+        imu_valid=imu_valid,
+        weights=w_imu,
+        rotvec_start_WB=rotvec0,
+        gyro_bias=gyro_bias,
+        accel_bias=accel_bias,
+        gravity_W=gravity_W,
+    )
+    xi_body = se3_jax.se3_log(delta_pose)  # (6,) twist over interval
+
+    # IMU measurement-noise IW sufficient stats (Σg, Σa) from commutative residuals
+    dt_scan = jnp.maximum(jnp.array(scan_end_time - scan_start_time, dtype=jnp.float64), 1e-12)
+    omega_avg = delta_pose[3:6] / dt_scan
+    iw_meas_gyro_dPsi, iw_meas_gyro_dnu = imu_gyro_meas_iw_suffstats_from_avg_rate_jax(
+        imu_gyro=imu_gyro,
+        imu_valid=imu_valid,
+        weights=w_imu,
+        gyro_bias=gyro_bias,
+        omega_avg=omega_avg,
+        eps_mass=config.eps_mass,
+    )
+    iw_meas_accel_dPsi, iw_meas_accel_dnu = imu_accel_meas_iw_suffstats_from_gravity_dir_jax(
+        rotvec_world_body=rotvec0,
+        imu_accel=imu_accel,
+        imu_valid=imu_valid,
+        weights=w_imu,
+        accel_bias=accel_bias,
+        gravity_W=gravity_W,
+        eps_mass=config.eps_mass,
+    )
+
+    deskew_twist_result, deskew_cert, deskew_effect = deskew_constant_twist(
         points=points,
         timestamps=timestamps,
         weights=weights,
         scan_start_time=scan_start_time,
         scan_end_time=scan_end_time,
-        T_SLICES=config.T_SLICES,
-        eps_psd=config.eps_psd,
-        eps_lift=config.eps_lift,
+        xi_body=xi_body,
+        ess_imu=float(ess_imu),
+        chart_id=belief_pred.chart_id,
+        anchor_id=belief_pred.anchor_id,
     )
     all_certs.append(deskew_cert)
-    ut_cache = deskew_result.ut_cache
-    
-    # Extract deskewed point data (batched arrays; no Python container stacking)
-    deskewed_points = deskew_result.p_mean
-    deskewed_covs = deskew_result.p_cov
-    deskewed_weights = deskew_result.weights
+
+    deskewed_points = deskew_twist_result.points
+    deskewed_weights = deskew_twist_result.weights
+    # Point covariances are not used by the new deskew. Keep zeros (deterministic).
+    deskewed_covs = jnp.zeros((deskewed_points.shape[0], 3, 3), dtype=jnp.float64)
     
     # Compute point directions for binning (batched, no per-point host sync)
     norms = jnp.linalg.norm(deskewed_points, axis=1, keepdims=True)
@@ -254,11 +355,13 @@ def process_scan_single_hypothesis(
     # =========================================================================
     # Step 5: ScanBinMomentMatch
     # =========================================================================
+    point_lambda = lidar_point_reliability_from_buckets_jax(lidar_bucket_state, ring=ring, tag=tag)
     scan_bins, scan_cert, scan_effect = scan_bin_moment_match(
         points=deskewed_points,
         point_covariances=deskewed_covs,
         weights=deskewed_weights,
         responsibilities=responsibilities,
+        point_lambda=point_lambda,
         eps_psd=config.eps_psd,
         eps_mass=config.eps_mass,
         chart_id=belief_pred.chart_id,
@@ -314,9 +417,31 @@ def process_scan_single_hypothesis(
     )
     all_certs.append(trans_cert)
     t_hat = trans_result.t_hat
+
+    # Measurement-noise IW sufficient stats from TranslationWLS residuals (LiDAR meas block)
+    # residual_b = c_map[b] - R_hat @ p_bar_scan[b] - t_hat
+    p_rot = (R_hat @ scan_bins.p_bar.T).T  # (B,3)
+    residuals_t = c_map - p_rot - t_hat[None, :]
+    iw_meas_dPsi, iw_meas_dnu = lidar_meas_iw_suffstats_from_translation_residuals_jax(
+        residuals=residuals_t,
+        weights=wahba_weights,
+        eps_mass=config.eps_mass,
+    )
+    iw_meas_dPsi = iw_meas_dPsi + iw_meas_gyro_dPsi + iw_meas_accel_dPsi
+    iw_meas_dnu = iw_meas_dnu + iw_meas_gyro_dnu + iw_meas_accel_dnu
+
+    # LiDAR bucket IW sufficient stats from translation residuals apportioned by responsibilities.
+    iw_lidar_bucket_dPsi, iw_lidar_bucket_dnu = lidar_bucket_iw_suffstats_from_bin_residuals_jax(
+        residuals_bin=residuals_t,
+        responsibilities=responsibilities,
+        weights=deskewed_weights,
+        ring=ring,
+        tag=tag,
+        eps_mass=config.eps_mass,
+    )
     
     # =========================================================================
-    # Step 9: LidarQuadraticEvidence (reuses ut_cache)
+    # Step 9: Odom + IMU + LiDAR evidence (no moment matching)
     # =========================================================================
     # Build map bins structure for lidar evidence
     lidar_map_bins = LidarMapBinStats(
@@ -331,25 +456,112 @@ def process_scan_single_hypothesis(
         Sigma_c=Sigma_c_map,
     )
     
+    # Odom evidence (Gaussian)
+    odom_pose = jnp.asarray(odom_pose, dtype=jnp.float64).reshape(-1)
+    odom_cov_se3 = jnp.asarray(odom_cov_se3, dtype=jnp.float64)
+    odom_result, odom_cert, odom_effect = odom_quadratic_evidence(
+        belief_pred_pose=belief_pred.mean_world_pose(eps_lift=config.eps_lift),
+        odom_pose=odom_pose,
+        odom_cov_se3=odom_cov_se3,
+        eps_psd=config.eps_psd,
+        eps_lift=config.eps_lift,
+        chart_id=belief_pred.chart_id,
+        anchor_id=belief_pred.anchor_id,
+    )
+    all_certs.append(odom_cert)
+
+    # IMU accel direction evidence (vMF Laplace on rotation perturbation)
+    pose_pred = belief_pred.mean_world_pose(eps_lift=config.eps_lift)
+    imu_result, imu_cert, imu_effect = imu_vmf_gravity_evidence(
+        rotvec_world_body=pose_pred[3:6],
+        imu_accel=imu_accel,
+        imu_valid=imu_valid,
+        weights=w_imu,
+        accel_bias=accel_bias,
+        gravity_W=gravity_W,
+        eps_psd=config.eps_psd,
+        eps_mass=config.eps_mass,
+        chart_id=belief_pred.chart_id,
+        anchor_id=belief_pred.anchor_id,
+    )
+    all_certs.append(imu_cert)
+
+    # IMU gyro rotation evidence (Gaussian on SO(3) using preintegrated delta rotation)
+    Sigma_g = jnp.asarray(config.Sigma_g, dtype=jnp.float64)
+    gyro_result, gyro_cert, gyro_effect = imu_gyro_rotation_evidence(
+        rotvec_start_WB=rotvec0,
+        rotvec_end_pred_WB=pose_pred[3:6],
+        delta_rotvec_meas=delta_pose[3:6],
+        Sigma_g=Sigma_g,
+        dt_scan=float(dt_scan),
+        eps_psd=config.eps_psd,
+        eps_lift=config.eps_lift,
+        chart_id=belief_pred.chart_id,
+        anchor_id=belief_pred.anchor_id,
+    )
+    all_certs.append(gyro_cert)
+
     evidence_result, evidence_cert, evidence_effect = lidar_quadratic_evidence(
         belief_pred=belief_pred,
         scan_bins=scan_bins,
         map_bins=lidar_map_bins,
         R_hat=R_hat,
         t_hat=t_hat,
-        ut_cache=ut_cache,
+        t_cov=trans_result.t_cov,
         c_dt=config.c_dt,
         c_ex=config.c_ex,
         eps_psd=config.eps_psd,
         eps_lift=config.eps_lift,
     )
     all_certs.append(evidence_cert)
+
+    # Combine evidence terms additively before fusion scaling
+    L_evidence = evidence_result.L_lidar + odom_result.L_odom + imu_result.L_imu + gyro_result.L_gyro
+    h_evidence = evidence_result.h_lidar + odom_result.h_odom + imu_result.h_imu + gyro_result.h_gyro
+
+    # Fisher-derived excitation scaling (Contract 1): scale dt/ex prior strength by (1 - s)
+    s_dt, s_ex = compute_excitation_scales_jax(L_evidence=L_evidence, L_prior=belief_pred.L)
+    L_prior_scaled, h_prior_scaled = apply_excitation_prior_scaling_jax(
+        L_prior=belief_pred.L,
+        h_prior=belief_pred.h,
+        s_dt=s_dt,
+        s_ex=s_ex,
+    )
+    exc_dt_scale = float(1.0 - s_dt)
+    exc_ex_scale = float(1.0 - s_ex)
+    exc_cert = CertBundle.create_approx(
+        chart_id=belief_pred.chart_id,
+        anchor_id=belief_pred.anchor_id,
+        triggers=["ExcitationPriorScaling"],
+        influence=InfluenceCert(
+            lift_strength=0.0,
+            psd_projection_delta=0.0,
+            mass_epsilon_ratio=0.0,
+            anchor_drift_rho=0.0,
+            dt_scale=exc_dt_scale,
+            extrinsic_scale=exc_ex_scale,
+            trust_alpha=1.0,
+        ),
+    )
+    all_certs.append(exc_cert)
+    belief_pred = BeliefGaussianInfo(
+        chart_id=belief_pred.chart_id,
+        anchor_id=belief_pred.anchor_id,
+        X_anchor=belief_pred.X_anchor,
+        stamp_sec=belief_pred.stamp_sec,
+        z_lin=belief_pred.z_lin,
+        L=L_prior_scaled,
+        h=h_prior_scaled,
+        cert=belief_pred.cert,
+    )
     
     # =========================================================================
     # Step 10: FusionScaleFromCertificates
     # =========================================================================
+    # Use a combined certificate for fusion scale (single-path, includes IMU+odom+lidar).
+    combined_evidence_cert = aggregate_certificates([evidence_cert, odom_cert, imu_cert, gyro_cert])
     fusion_scale_result, fusion_scale_cert, fusion_scale_effect = fusion_scale_from_certificates(
-        cert_evidence=evidence_cert,
+        cert_evidence=combined_evidence_cert,
         cert_belief=pred_cert,
         alpha_min=config.alpha_min,
         alpha_max=config.alpha_max,
@@ -366,8 +578,8 @@ def process_scan_single_hypothesis(
     # =========================================================================
     belief_post, fusion_cert, fusion_effect = info_fusion_additive(
         belief_pred=belief_pred,
-        L_evidence=evidence_result.L_lidar,
-        h_evidence=evidence_result.h_lidar,
+        L_evidence=L_evidence,
+        h_evidence=h_evidence,
         alpha=alpha,
         eps_psd=config.eps_psd,
         chart_id=belief_pred.chart_id,
@@ -387,6 +599,17 @@ def process_scan_single_hypothesis(
         eps_lift=config.eps_lift,
     )
     all_certs.append(recompose_cert)
+
+    # =========================================================================
+    # Process-noise IW sufficient statistics (NEW; commutative, no state mutation here)
+    # =========================================================================
+    iw_process_dPsi, iw_process_dnu = process_noise_iw_suffstats_from_info_jax(
+        L_pred=belief_pred.L,
+        h_pred=belief_pred.h,
+        L_post=belief_recomposed.L,
+        h_post=belief_recomposed.h,
+        eps_lift=config.eps_lift,
+    )
     
     # =========================================================================
     # Step 13: PoseCovInflationPushforward
@@ -422,6 +645,12 @@ def process_scan_single_hypothesis(
     return ScanPipelineResult(
         belief_updated=belief_final,
         map_increments=map_update_result,
+        iw_process_dPsi=iw_process_dPsi,
+        iw_process_dnu=iw_process_dnu,
+        iw_meas_dPsi=iw_meas_dPsi,
+        iw_meas_dnu=iw_meas_dnu,
+        iw_lidar_bucket_dPsi=iw_lidar_bucket_dPsi,
+        iw_lidar_bucket_dnu=iw_lidar_bucket_dnu,
         all_certs=all_certs,
         aggregated_cert=aggregated_cert,
     )
@@ -476,8 +705,6 @@ class RuntimeManifest:
     K_HYP: int = constants.GC_K_HYP
     HYP_WEIGHT_FLOOR: float = constants.GC_HYP_WEIGHT_FLOOR
     B_BINS: int = constants.GC_B_BINS
-    T_SLICES: int = constants.GC_T_SLICES
-    SIGMA_POINTS: int = constants.GC_SIGMA_POINTS
     N_POINTS_CAP: int = constants.GC_N_POINTS_CAP
     
     tau_soft_assign: float = constants.GC_TAU_SOFT_ASSIGN
@@ -508,8 +735,16 @@ class RuntimeManifest:
             self.backends = {
                 "core_array": "jax",
                 "se3": "fl_slam_poc.common.geometry.se3_jax",
-                "domain_projection_psd": "fl_slam_poc.common.primitives.domain_projection_psd",
-                "lifted_spd_solve": "fl_slam_poc.common.primitives.spd_cholesky_solve_lifted",
+                "so3_right_jacobian": "fl_slam_poc.common.geometry.se3_jax.so3_right_jacobian",
+                "domain_projection_psd": "fl_slam_poc.common.primitives.domain_projection_psd_core",
+                "lifted_spd_solve": "fl_slam_poc.common.primitives.spd_cholesky_solve_lifted_core",
+                "process_noise_model": "fl_slam_poc.backend.operators.inverse_wishart_jax (IW, commutative per-scan)",
+                "measurement_noise_model": "fl_slam_poc.backend.operators.measurement_noise_iw_jax (IW per-sensor; lidar enabled)",
+                "deskew": "fl_slam_poc.backend.operators.deskew_constant_twist (constant twist; IMU preintegration)",
+                "imu_preintegration": "fl_slam_poc.backend.operators.imu_preintegration",
+                "imu_evidence": "fl_slam_poc.backend.operators.imu_evidence (Laplace over intrinsic ops)",
+                "odom_evidence": "fl_slam_poc.backend.operators.odom_evidence (Gaussian SE(3) pose factor)",
+                "lidar_evidence": "fl_slam_poc.backend.operators.lidar_evidence (closed-form pose info; no sigma-point regression)",
                 "lidar_converter": "fl_slam_poc.frontend.sensors.livox_converter",
                 "pointcloud_parser": "fl_slam_poc.backend.backend_node.parse_pointcloud2",
             }
@@ -523,8 +758,6 @@ class RuntimeManifest:
             "K_HYP": self.K_HYP,
             "HYP_WEIGHT_FLOOR": self.HYP_WEIGHT_FLOOR,
             "B_BINS": self.B_BINS,
-            "T_SLICES": self.T_SLICES,
-            "SIGMA_POINTS": self.SIGMA_POINTS,
             "N_POINTS_CAP": self.N_POINTS_CAP,
             "tau_soft_assign": self.tau_soft_assign,
             "eps_psd": self.eps_psd,

@@ -41,9 +41,28 @@ from fl_slam_poc.backend.pipeline import (
     process_hypotheses,
     ScanPipelineResult,
 )
-from fl_slam_poc.backend.operators.predict import (
-    predict_diffusion,
-    build_default_process_noise,
+from fl_slam_poc.backend.structures.inverse_wishart_jax import (
+    ProcessNoiseIWState,
+    create_datasheet_process_noise_state,
+)
+from fl_slam_poc.backend.operators.inverse_wishart_jax import (
+    process_noise_state_to_Q_jax,
+    process_noise_iw_apply_suffstats_jax,
+)
+from fl_slam_poc.backend.structures.measurement_noise_iw_jax import (
+    MeasurementNoiseIWState,
+    create_datasheet_measurement_noise_state,
+)
+from fl_slam_poc.backend.operators.measurement_noise_iw_jax import (
+    measurement_noise_mean_jax,
+    measurement_noise_apply_suffstats_jax,
+)
+from fl_slam_poc.backend.structures.lidar_bucket_noise_iw_jax import (
+    LidarBucketNoiseIWState,
+    create_datasheet_lidar_bucket_noise_state,
+)
+from fl_slam_poc.backend.operators.lidar_bucket_noise_iw_jax import (
+    lidar_bucket_iw_apply_suffstats_jax,
 )
 from fl_slam_poc.backend.structures.bin_atlas import (
     BinAtlas,
@@ -67,7 +86,30 @@ def _smooth_window_weight(dist: float, min_r: float, max_r: float, sigma: float)
     return float(w_min * w_max)
 
 
-def parse_pointcloud2(msg: PointCloud2) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+def _pointfield_to_dtype(datatype: int) -> np.dtype:
+    """Map sensor_msgs.msg.PointField datatype to numpy dtype."""
+    if datatype == PointField.INT8:
+        return np.dtype("i1")
+    if datatype == PointField.UINT8:
+        return np.dtype("u1")
+    if datatype == PointField.INT16:
+        return np.dtype("<i2")
+    if datatype == PointField.UINT16:
+        return np.dtype("<u2")
+    if datatype == PointField.INT32:
+        return np.dtype("<i4")
+    if datatype == PointField.UINT32:
+        return np.dtype("<u4")
+    if datatype == PointField.FLOAT32:
+        return np.dtype("<f4")
+    if datatype == PointField.FLOAT64:
+        return np.dtype("<f8")
+    raise ValueError(f"Unsupported PointField datatype: {datatype}")
+
+
+def parse_pointcloud2_vectorized(
+    msg: PointCloud2,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
     Parse PointCloud2 message to extract xyz points.
     
@@ -75,71 +117,93 @@ def parse_pointcloud2(msg: PointCloud2) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.n
         points: (N, 3) array of xyz coordinates
         timestamps: (N,) array of per-point timestamps (or zeros if unavailable)
         weights: (N,) array of continuous point weights
+        ring: (N,) uint8 ring/line id (0 if unavailable)
+        tag: (N,) uint8 tag class (0 if unavailable)
     """
-    # Find field offsets
-    field_map = {f.name: (f.offset, f.datatype) for f in msg.fields}
-    
-    if 'x' not in field_map or 'y' not in field_map or 'z' not in field_map:
-        return jnp.zeros((0, 3)), jnp.zeros(0), jnp.zeros(0)
-    
-    x_off, x_type = field_map['x']
-    y_off, y_type = field_map['y']
-    z_off, z_type = field_map['z']
-    
-    point_step = msg.point_step
     n_points = msg.width * msg.height
-    data = msg.data
+    if n_points <= 0:
+        return (
+            jnp.zeros((0, 3), dtype=jnp.float64),
+            jnp.zeros((0,), dtype=jnp.float64),
+            jnp.zeros((0,), dtype=jnp.float64),
+            jnp.zeros((0,), dtype=jnp.uint8),
+            jnp.zeros((0,), dtype=jnp.uint8),
+        )
 
-    # Optional time fields (from livox_converter schema)
-    timebase_low_off = field_map.get("timebase_low", (None, None))[0]
-    timebase_high_off = field_map.get("timebase_high", (None, None))[0]
-    time_offset_off = field_map.get("time_offset", (None, None))[0]
+    field_map = {f.name: (f.offset, f.datatype) for f in msg.fields}
+    if "x" not in field_map or "y" not in field_map or "z" not in field_map:
+        return (
+            jnp.zeros((0, 3), dtype=jnp.float64),
+            jnp.zeros((0,), dtype=jnp.float64),
+            jnp.zeros((0,), dtype=jnp.float64),
+            jnp.zeros((0,), dtype=jnp.uint8),
+            jnp.zeros((0,), dtype=jnp.uint8),
+        )
 
-    # Compute message timebase once if available
-    timebase_sec = None
-    if timebase_low_off is not None and timebase_high_off is not None and n_points > 0:
-        low = struct.unpack_from('<I', data, timebase_low_off)[0]
-        high = struct.unpack_from('<I', data, timebase_high_off)[0]
-        timebase = (np.uint64(high) << np.uint64(32)) | np.uint64(low)
-        timebase_sec = float(timebase) * 1e-9
+    needed = ["x", "y", "z", "intensity", "ring", "tag", "time_offset", "timebase_low", "timebase_high"]
+    names = []
+    formats = []
+    offsets = []
+    for name in needed:
+        if name in field_map:
+            off, dt = field_map[name]
+            names.append(name)
+            formats.append(_pointfield_to_dtype(dt))
+            offsets.append(off)
 
-    # Extract points
-    points = []
-    timestamps = []
-    weights = []
+    dtype = np.dtype({"names": names, "formats": formats, "offsets": offsets, "itemsize": msg.point_step})
+    arr = np.frombuffer(msg.data, dtype=dtype, count=n_points)
+
+    x = np.asarray(arr["x"], dtype=np.float64)
+    y = np.asarray(arr["y"], dtype=np.float64)
+    z = np.asarray(arr["z"], dtype=np.float64)
+
     header_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-    for i in range(n_points):
-        base = i * point_step
-        x = struct.unpack_from('<f', data, base + x_off)[0]
-        y = struct.unpack_from('<f', data, base + y_off)[0]
-        z = struct.unpack_from('<f', data, base + z_off)[0]
+    t = np.full((n_points,), header_time, dtype=np.float64)
 
-        # Keep finite points only
-        if not (np.isfinite(x) and np.isfinite(y) and np.isfinite(z)):
-            continue
+    if "timebase_low" in arr.dtype.names and "timebase_high" in arr.dtype.names:
+        low = np.uint64(arr["timebase_low"][0])
+        high = np.uint64(arr["timebase_high"][0])
+        timebase = (high << np.uint64(32)) | low
+        timebase_sec = float(timebase) * 1e-9
+        if "time_offset" in arr.dtype.names:
+            offs = np.asarray(arr["time_offset"], dtype=np.uint64)
+            t = timebase_sec + offs.astype(np.float64) * 1e-9
 
-        dist = np.sqrt(x * x + y * y + z * z)
-        w = _smooth_window_weight(dist, min_r=0.5, max_r=50.0, sigma=0.25)
+    # Metadata (optional)
+    ring = np.zeros((n_points,), dtype=np.uint8)
+    tag = np.zeros((n_points,), dtype=np.uint8)
+    if "ring" in arr.dtype.names:
+        ring = np.asarray(arr["ring"], dtype=np.uint8)
+    if "tag" in arr.dtype.names:
+        tag = np.asarray(arr["tag"], dtype=np.uint8)
 
-        # Per-point timestamps if available, otherwise header time
-        if timebase_sec is not None and time_offset_off is not None:
-            offset = struct.unpack_from('<I', data, base + time_offset_off)[0]
-            t_sec = timebase_sec + float(np.uint64(offset)) * 1e-9
-        else:
-            t_sec = header_time
+    # Continuous range-based weighting (vectorized)
+    dist = np.sqrt(x * x + y * y + z * z)
+    sigma = 0.25
+    min_r = 0.5
+    max_r = 50.0
+    a = (dist - min_r) / sigma
+    b = (max_r - dist) / sigma
+    w_min = 1.0 / (1.0 + np.exp(-a))
+    w_max = 1.0 / (1.0 + np.exp(-b))
+    w = (w_min * w_max).astype(np.float64)
 
-        points.append([x, y, z])
-        timestamps.append(t_sec)
-        weights.append(w)
+    # Domain guard: invalid xyz -> zero weight + zero point (no NaN propagation)
+    valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+    w = w * valid.astype(np.float64)
+    x = np.where(valid, x, 0.0)
+    y = np.where(valid, y, 0.0)
+    z = np.where(valid, z, 0.0)
 
-    if len(points) == 0:
-        return jnp.zeros((0, 3)), jnp.zeros(0), jnp.zeros(0)
-
-    points_arr = jnp.array(points, dtype=jnp.float64)
-    timestamps_arr = jnp.array(timestamps, dtype=jnp.float64)
-    weights_arr = jnp.array(weights, dtype=jnp.float64)
-
-    return points_arr, timestamps_arr, weights_arr
+    pts = np.stack([x, y, z], axis=1)
+    return (
+        jnp.array(pts, dtype=jnp.float64),
+        jnp.array(t, dtype=jnp.float64),
+        jnp.array(w, dtype=jnp.float64),
+        jnp.array(ring),
+        jnp.array(tag),
+    )
 
 
 class GoldenChildBackend(Node):
@@ -170,15 +234,26 @@ class GoldenChildBackend(Node):
         self.declare_parameter("trajectory_export_path", "/tmp/gc_slam_trajectory.tum")
         self.declare_parameter("status_check_period_sec", 5.0)
         self.declare_parameter("forgetting_factor", 0.99)
+        # Hard single-path enforcement: if enabled, missing topics are hard errors.
+        self.declare_parameter("use_imu", True)
+        self.declare_parameter("use_odom", True)
 
     def _init_state(self):
         """Initialize Golden Child state."""
         # Pipeline configuration
         self.config = PipelineConfig()
         
-        # Process noise matrix (22x22 for full state)
-        self.Q = build_default_process_noise()
+        # Adaptive process noise IW state (datasheet priors) + derived Q
+        self.process_noise_state: ProcessNoiseIWState = create_datasheet_process_noise_state()
+        self.Q = process_noise_state_to_Q_jax(self.process_noise_state)
         
+        # Adaptive measurement noise IW state (per-sensor, phase 1) + derived Sigma_meas (LiDAR)
+        self.measurement_noise_state: MeasurementNoiseIWState = create_datasheet_measurement_noise_state()
+        self.config.Sigma_meas = measurement_noise_mean_jax(self.measurement_noise_state, idx=2)
+
+        # LiDAR per-(line,tag) bucket noise IW state (Phase 3 part 2)
+        self.lidar_bucket_noise_state: LidarBucketNoiseIWState = create_datasheet_lidar_bucket_noise_state()
+
         # Bin atlas for directional binning
         self.bin_atlas = create_fibonacci_atlas(self.config.B_BINS)
         
@@ -204,6 +279,7 @@ class GoldenChildBackend(Node):
         # Odometry for initial guess / prediction
         self.last_odom_pose = None
         self.last_odom_stamp = 0.0
+        self.last_odom_cov_se3 = None  # (6,6) in [x,y,z,roll,pitch,yaw] ~ [trans, rotvec]
         
         # IMU buffer for high-rate prediction
         self.imu_buffer: List[Tuple[float, jnp.ndarray, jnp.ndarray]] = []
@@ -304,19 +380,17 @@ class GoldenChildBackend(Node):
         self.imu_count += 1
         
         stamp_sec = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-        
-        gyro = jnp.array([
-            msg.angular_velocity.x,
-            msg.angular_velocity.y,
-            msg.angular_velocity.z,
-        ], dtype=jnp.float64)
-        
-        accel = jnp.array([
-            msg.linear_acceleration.x,
-            msg.linear_acceleration.y,
-            msg.linear_acceleration.z,
-        ], dtype=jnp.float64)
-        
+
+        # Keep callback CPU-only (no JAX ops per message).
+        gyro = np.array(
+            [msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z],
+            dtype=np.float64,
+        )
+        accel = np.array(
+            [msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z],
+            dtype=np.float64,
+        )
+
         self.imu_buffer.append((stamp_sec, gyro, accel))
         
         # Keep buffer bounded
@@ -340,6 +414,9 @@ class GoldenChildBackend(Node):
             jnp.array([pos.x, pos.y, pos.z], dtype=jnp.float64)
         )
         self.last_odom_stamp = stamp_sec
+        # Pose covariance is row-major 6x6: [x,y,z,roll,pitch,yaw]
+        cov = np.array(msg.pose.covariance, dtype=np.float64).reshape(6, 6)
+        self.last_odom_cov_se3 = jnp.array(cov, dtype=jnp.float64)
 
     def on_lidar(self, msg: PointCloud2):
         """
@@ -351,8 +428,11 @@ class GoldenChildBackend(Node):
         self.get_logger().info(f"on_lidar callback #{self.scan_count} received")
         stamp_sec = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         
-        # Parse point cloud
-        points, timestamps, weights = parse_pointcloud2(msg)
+        use_imu = bool(self.get_parameter("use_imu").value)
+        use_odom = bool(self.get_parameter("use_odom").value)
+
+        # Parse point cloud (vectorized; preserves Livox metadata)
+        points, timestamps, weights, ring, tag = parse_pointcloud2_vectorized(msg)
         n_points = points.shape[0]
 
         if n_points == 0:
@@ -379,27 +459,83 @@ class GoldenChildBackend(Node):
         
         # Apply forgetting to map stats
         self.map_stats = apply_forgetting(self.map_stats, self.forgetting_factor)
+
+        # Fail-fast single-path enforcement
+        if use_odom and (self.last_odom_pose is None or self.last_odom_cov_se3 is None):
+            raise RuntimeError("use_odom=True but no odometry received yet (no fallback path).")
+        if use_imu and (len(self.imu_buffer) == 0):
+            raise RuntimeError("use_imu=True but no IMU received yet (no fallback path).")
+
+        # Build fixed-size IMU arrays (pads with zeros; validity mask gates contributions continuously)
+        M = self.max_imu_buffer
+        imu_stamps = np.zeros((M,), dtype=np.float64)
+        imu_gyro = np.zeros((M, 3), dtype=np.float64)
+        imu_accel = np.zeros((M, 3), dtype=np.float64)
+        imu_valid = np.zeros((M,), dtype=np.bool_)
+        tail = self.imu_buffer[-M:]
+        for i, (t, g, a) in enumerate(tail):
+            imu_stamps[i] = float(t)
+            imu_gyro[i, :] = np.array(g)
+            imu_accel[i, :] = np.array(a)
+            imu_valid[i] = True
+        imu_stamps_j = jnp.array(imu_stamps, dtype=jnp.float64)
+        imu_gyro_j = jnp.array(imu_gyro, dtype=jnp.float64)
+        imu_accel_j = jnp.array(imu_accel, dtype=jnp.float64)
+        imu_valid_j = jnp.array(imu_valid)
         
         # Run pipeline for each hypothesis
         results: List[ScanPipelineResult] = []
+        # Commutative IW sufficient-statistics accumulation (order-robust; applied once per scan)
+        accum_dPsi = jnp.zeros((7, 6, 6), dtype=jnp.float64)
+        accum_dnu = jnp.zeros((7,), dtype=jnp.float64)
+        accum_meas_dPsi = jnp.zeros((3, 3, 3), dtype=jnp.float64)
+        accum_meas_dnu = jnp.zeros((3,), dtype=jnp.float64)
+        accum_lidar_bucket_dPsi = jnp.zeros((constants.GC_LIDAR_N_BUCKETS, 3, 3), dtype=jnp.float64)
+        accum_lidar_bucket_dnu = jnp.zeros((constants.GC_LIDAR_N_BUCKETS,), dtype=jnp.float64)
         
         try:
+            # Update per-scan measurement covariance from IW state (shared across hypotheses)
+            self.config.Sigma_meas = measurement_noise_mean_jax(self.measurement_noise_state, idx=2)
+            self.config.Sigma_g = measurement_noise_mean_jax(self.measurement_noise_state, idx=0)
+            self.config.Sigma_a = measurement_noise_mean_jax(self.measurement_noise_state, idx=1)
+
+            # Precompute Q once for this scan (shared across hypotheses)
+            Q_scan = process_noise_state_to_Q_jax(self.process_noise_state)
+
             for i, belief in enumerate(self.hypotheses):
                 result = process_scan_single_hypothesis(
                     belief_prev=belief,
                     raw_points=points,
                     raw_timestamps=timestamps,
                     raw_weights=weights,
+                    raw_ring=ring,
+                    raw_tag=tag,
+                    lidar_bucket_state=self.lidar_bucket_noise_state,
+                    imu_stamps=imu_stamps_j,
+                    imu_gyro=imu_gyro_j,
+                    imu_accel=imu_accel_j,
+                    imu_valid=imu_valid_j,
+                    odom_pose=self.last_odom_pose if self.last_odom_pose is not None else se3_identity(),
+                    odom_cov_se3=self.last_odom_cov_se3 if self.last_odom_cov_se3 is not None else jnp.eye(6, dtype=jnp.float64),
                     scan_start_time=scan_start_time,
                     scan_end_time=scan_end_time,
                     dt_sec=dt_sec,
-                    Q=self.Q,
+                    Q=Q_scan,
                     bin_atlas=self.bin_atlas,
                     map_stats=self.map_stats,
                     config=self.config,
                 )
                 results.append(result)
                 self.hypotheses[i] = result.belief_updated
+
+                # Accumulate commutative IW sufficient statistics
+                w_h = float(self.hyp_weights[i])
+                accum_dPsi = accum_dPsi + w_h * result.iw_process_dPsi
+                accum_dnu = accum_dnu + w_h * result.iw_process_dnu
+                accum_meas_dPsi = accum_meas_dPsi + w_h * result.iw_meas_dPsi
+                accum_meas_dnu = accum_meas_dnu + w_h * result.iw_meas_dnu
+                accum_lidar_bucket_dPsi = accum_lidar_bucket_dPsi + w_h * result.iw_lidar_bucket_dPsi
+                accum_lidar_bucket_dnu = accum_lidar_bucket_dnu + w_h * result.iw_lidar_bucket_dnu
             
             # Combine hypotheses
             combined_belief, combo_cert, combo_effect = process_hypotheses(
@@ -410,6 +546,32 @@ class GoldenChildBackend(Node):
             
             self.current_belief = combined_belief
             self.pipeline_runs += 1
+
+            # Apply process-noise IW update ONCE per scan (after hypothesis combine)
+            self.process_noise_state = process_noise_iw_apply_suffstats_jax(
+                pn_state=self.process_noise_state,
+                dPsi=accum_dPsi,
+                dnu=accum_dnu,
+                dt_sec=dt_sec,
+                eps_psd=self.config.eps_psd,
+            )
+            self.Q = process_noise_state_to_Q_jax(self.process_noise_state)
+
+            # Apply measurement-noise IW update ONCE per scan (after hypothesis combine)
+            self.measurement_noise_state = measurement_noise_apply_suffstats_jax(
+                mn_state=self.measurement_noise_state,
+                dPsi_blocks=accum_meas_dPsi,
+                dnu=accum_meas_dnu,
+                eps_psd=self.config.eps_psd,
+            )
+
+            # Apply LiDAR bucket IW update ONCE per scan (after hypothesis combine)
+            self.lidar_bucket_noise_state = lidar_bucket_iw_apply_suffstats_jax(
+                state=self.lidar_bucket_noise_state,
+                dPsi=accum_lidar_bucket_dPsi,
+                dnu=accum_lidar_bucket_dnu,
+                eps_psd=self.config.eps_psd,
+            )
             
             # Update map statistics with weighted increments
             delta_S_dir = jnp.zeros_like(self.map_stats.S_dir)

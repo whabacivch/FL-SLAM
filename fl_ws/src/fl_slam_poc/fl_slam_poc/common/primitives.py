@@ -77,6 +77,136 @@ class ClampResult:
 # NOTE: No float() conversions inside JIT - do conversions in wrappers
 # =============================================================================
 
+def domain_projection_psd_core(
+    M: jnp.ndarray,
+    eps_psd: float = 1e-12,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Arrays-only PSD projection core (JIT-safe).
+
+    This is the JAX-pytree-friendly variant used inside `@jax.jit` codepaths.
+
+    Returns:
+        M_psd: (d,d) PSD-projected matrix
+        cert_vec: (6,) float64 vector:
+          [projection_delta, sym_delta, eig_min, eig_max, cond, near_null_count]
+    """
+    M = jnp.asarray(M, dtype=jnp.float64)
+
+    # Always symmetrize
+    M_sym = 0.5 * (M + M.T)
+    sym_delta = jnp.linalg.norm(M_sym - M, ord="fro")
+
+    # Always eigendecompose
+    eigvals, eigvecs = jnp.linalg.eigh(M_sym)
+
+    # Always clamp eigenvalues
+    vals_clamped = jnp.maximum(eigvals, eps_psd)
+
+    # Always reconstruct
+    M_psd = eigvecs @ jnp.diag(vals_clamped) @ eigvecs.T
+
+    # Always compute projection delta
+    projection_delta = jnp.linalg.norm(M_psd - M_sym, ord="fro")
+
+    # Conditioning / diagnostics (arrays-only)
+    near_null_threshold = 10.0 * eps_psd
+    near_null_count = jnp.sum(vals_clamped < near_null_threshold).astype(jnp.float64)
+    eig_min = jnp.min(vals_clamped)
+    eig_max = jnp.max(vals_clamped)
+    cond = eig_max / eig_min
+
+    cert_vec = jnp.array(
+        [projection_delta, sym_delta, eig_min, eig_max, cond, near_null_count],
+        dtype=jnp.float64,
+    )
+    return M_psd, cert_vec
+
+
+def spd_cholesky_solve_lifted_core(
+    L: jnp.ndarray,
+    b: jnp.ndarray,
+    eps_lift: float = 1e-9,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Arrays-only lifted SPD solve core (JIT-safe).
+
+    Returns:
+        x: solution
+        lift_strength: scalar (float64) = eps_lift * d
+    """
+    L = jnp.asarray(L, dtype=jnp.float64)
+    b = jnp.asarray(b, dtype=jnp.float64)
+    d = L.shape[0]
+
+    # Always apply lift
+    L_lifted = L + eps_lift * jnp.eye(d, dtype=jnp.float64)
+    lift_strength = jnp.array(eps_lift * d, dtype=jnp.float64)
+
+    # Cholesky and triangular solves
+    L_chol = jnp.linalg.cholesky(L_lifted)
+    y = jax.scipy.linalg.solve_triangular(L_chol, b, lower=True)
+    x = jax.scipy.linalg.solve_triangular(L_chol.T, y, lower=False)
+
+    return x, lift_strength
+
+
+def spd_cholesky_inverse_lifted_core(
+    L: jnp.ndarray,
+    eps_lift: float = 1e-9,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Arrays-only lifted SPD inverse core (JIT-safe).
+
+    Returns:
+        L_inv: inverse of (L + eps_lift I)
+        lift_strength: scalar (float64) = eps_lift * d
+    """
+    L = jnp.asarray(L, dtype=jnp.float64)
+    d = L.shape[0]
+
+    # Always apply lift
+    L_lifted = L + eps_lift * jnp.eye(d, dtype=jnp.float64)
+    lift_strength = jnp.array(eps_lift * d, dtype=jnp.float64)
+
+    # Cholesky and invert
+    L_chol = jnp.linalg.cholesky(L_lifted)
+    L_chol_inv = jax.scipy.linalg.solve_triangular(L_chol, jnp.eye(d, dtype=jnp.float64), lower=True)
+    L_inv = L_chol_inv.T @ L_chol_inv
+
+    return L_inv, lift_strength
+
+
+def inv_mass_core(m: jnp.ndarray, eps_mass: float = 1e-12) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Arrays-only InvMass core (JIT-safe).
+
+    Matches the project convention: denom = max(m, eps_mass).
+
+    Returns:
+        inv_m: 1 / denom
+        mass_epsilon_ratio: eps_mass / denom
+    """
+    m = jnp.asarray(m, dtype=jnp.float64)
+    denom = jnp.maximum(m, eps_mass)
+    inv_m = 1.0 / denom
+    eps_ratio = eps_mass / denom
+    return inv_m, eps_ratio
+
+
+def clamp_core(x: jnp.ndarray, lo: float, hi: float) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Arrays-only Clamp core (JIT-safe).
+
+    Returns:
+        clamped: clipped to [lo, hi]
+        clamp_delta: |clamped - x|
+    """
+    x = jnp.asarray(x, dtype=jnp.float64)
+    clamped = jnp.clip(x, lo, hi)
+    clamp_delta = jnp.abs(clamped - x)
+    return clamped, clamp_delta
+
 
 def _symmetrize_jax(M: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """JAX implementation of symmetrize (not JIT - called from wrapper)."""
@@ -151,15 +281,14 @@ def domain_projection_psd(
     Spec ref: Section 3.2
     """
     M = jnp.asarray(M, dtype=jnp.float64)
-    M_psd, vals_clamped, sym_delta, projection_delta = _domain_projection_psd_jax(M, eps_psd)
-    
-    # Compute conditioning info (outside JIT, can use float())
-    near_null_threshold = 10.0 * eps_psd
-    near_null_count = int(jnp.sum(vals_clamped < near_null_threshold))
-    
-    eig_min = float(jnp.min(vals_clamped))
-    eig_max = float(jnp.max(vals_clamped))
-    cond = eig_max / eig_min  # Always valid due to clamping
+    M_psd, cert_vec = domain_projection_psd_core(M, eps_psd)
+
+    projection_delta = float(cert_vec[0])
+    sym_delta = float(cert_vec[1])
+    eig_min = float(cert_vec[2])
+    eig_max = float(cert_vec[3])
+    cond = float(cert_vec[4])
+    near_null_count = int(cert_vec[5])
     
     conditioning = ConditioningInfo(
         eig_min=eig_min,
@@ -170,8 +299,8 @@ def domain_projection_psd(
     
     return DomainProjectionPSDResult(
         M_psd=M_psd,
-        projection_delta=float(projection_delta),
-        sym_delta=float(sym_delta),
+        projection_delta=projection_delta,
+        sym_delta=sym_delta,
         conditioning=conditioning,
     )
 
@@ -219,11 +348,7 @@ def spd_cholesky_solve_lifted(
         
     Spec ref: Section 3.3
     """
-    L = jnp.asarray(L, dtype=jnp.float64)
-    b = jnp.asarray(b, dtype=jnp.float64)
-    
-    x, lift_strength = _spd_cholesky_solve_lifted_jax(L, b, eps_lift)
-    
+    x, lift_strength = spd_cholesky_solve_lifted_core(L, b, eps_lift)
     return SPDSolveResult(x=x, lift_strength=float(lift_strength))
 
 
@@ -260,8 +385,7 @@ def spd_cholesky_inverse_lifted(
     Returns:
         Tuple of (inverse matrix, lift_strength)
     """
-    L = jnp.asarray(L, dtype=jnp.float64)
-    L_inv, lift_strength = _spd_cholesky_inverse_lifted_jax(L, eps_lift)
+    L_inv, lift_strength = spd_cholesky_inverse_lifted_core(L, eps_lift)
     return L_inv, float(lift_strength)
 
 
@@ -282,15 +406,8 @@ def inv_mass(m: float, eps_mass: float = 1e-12) -> InvMassResult:
         
     Spec ref: Section 3.4
     """
-    m = float(m)
-    eps_mass = float(eps_mass)
-    
-    # Always compute (no conditional) - use max to ensure positive denominator
-    denom = max(m, eps_mass)
-    inv_m = 1.0 / denom
-    mass_epsilon_ratio = eps_mass / denom if m >= eps_mass else 1.0
-    
-    return InvMassResult(inv_mass=inv_m, mass_epsilon_ratio=mass_epsilon_ratio)
+    inv_m, eps_ratio = inv_mass_core(jnp.array(m, dtype=jnp.float64), float(eps_mass))
+    return InvMassResult(inv_mass=float(inv_m), mass_epsilon_ratio=float(eps_ratio))
 
 
 def clamp(x: float, lo: float, hi: float) -> ClampResult:
@@ -307,15 +424,8 @@ def clamp(x: float, lo: float, hi: float) -> ClampResult:
         
     Spec ref: Section 3.5
     """
-    x = float(x)
-    lo = float(lo)
-    hi = float(hi)
-    
-    # Always compute using Python ops (branchless via min/max)
-    clamped = max(lo, min(x, hi))
-    clamp_delta = abs(clamped - x)
-    
-    return ClampResult(value=clamped, clamp_delta=clamp_delta)
+    clamped, clamp_delta = clamp_core(jnp.array(x, dtype=jnp.float64), float(lo), float(hi))
+    return ClampResult(value=float(clamped), clamp_delta=float(clamp_delta))
 
 
 def _clamp_array_jax(x: jnp.ndarray, lo: float, hi: float) -> Tuple[jnp.ndarray, jnp.ndarray]:

@@ -4,6 +4,25 @@ Project: Frobenius-Legendre SLAM POC (Impact Project_v1)
 
 This file tracks all significant changes, design decisions, and implementation milestones for the FL-SLAM project.
 
+## 2026-01-25: GC v2 Foundations — Lie Primitives + Process-Noise IW
+
+### Summary
+
+- Implemented **SE(3) Log** with the correct translation twist (\(\rho = V(\phi)^{-1} t\)) and added **SO(3) right Jacobian** primitives in `fl_slam_poc/common/geometry/se3_jax.py`; removed the prior `se3_log` stub in `fl_slam_poc/common/belief.py`.
+- Added **arrays-only JIT-safe primitive cores** in `fl_slam_poc/common/primitives.py` (`domain_projection_psd_core`, lifted solve cores, `inv_mass_core`, `clamp_core`) while keeping the existing dataclass-returning wrappers for non-jit call sites.
+- Added **process-noise inverse-Wishart state** + commutative per-scan sufficient-statistics updates (no per-hypothesis mutation). Backend now derives `Q` from the IW state and updates the IW state **once per scan**.
+- Added **measurement-noise inverse-Wishart state** (per-sensor, phase 1). LiDAR translation measurement covariance is now derived from the IW state and updated per scan from TranslationWLS residual outer products.
+- Replaced legacy regression evidence with **closed-form pose information** (directional Fisher-style curvature + translation covariance inverse).
+- Replaced legacy deskew with **constant-twist deskew** driven by IMU preintegration, and added **IMU + odometry evidence** (IMU accel direction via Laplace on intrinsic primitives; odom as Gaussian pose factor).
+- Completed **Phase 2 IMU evidence** by adding a **gyro rotation Gaussian factor** (in addition to accel direction) and feeding **Σg/Σa** measurement-noise IW updates from IMU residual statistics.
+- Replaced the PointCloud2 parser with a **vectorized Livox-aware parser** (preserves `time_offset` when present, plus `ring`/`tag` metadata) to avoid per-point Python loops.
+- Removed sigma-point/moment-matching artifacts from the runtime path (and updated the unit tests accordingly).
+- Replaced a broken legacy IMU-kernel unit test (which referenced archived code) with Lie-primitive correctness tests.
+
+### Notes
+
+- The pipeline is still UT-based for deskew/evidence at this point; later phases will replace UT regression with factor \(\rightarrow\) Laplace/I-projection per the updated plan.
+
 ## 2026-01-24: Fixed ROS 2 Jazzy Empty-List Parameter Type Bug
 
 ### Root Cause

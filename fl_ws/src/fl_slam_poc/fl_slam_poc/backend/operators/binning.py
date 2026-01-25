@@ -159,6 +159,7 @@ def scan_bin_moment_match(
     point_covariances: jnp.ndarray,
     weights: jnp.ndarray,
     responsibilities: jnp.ndarray,
+    point_lambda: jnp.ndarray | None = None,
     eps_psd: float = constants.GC_EPS_PSD,
     eps_mass: float = constants.GC_EPS_MASS,
     chart_id: str = constants.GC_CHART_ID,
@@ -191,9 +192,18 @@ def scan_bin_moment_match(
     
     n_points = points.shape[0]
     n_bins = responsibilities.shape[1]
+
+    # Noise-weighting (Contract 3): per-point reliability enters as a multiplicative weight.
+    if point_lambda is None:
+        point_lambda = jnp.ones((n_points,), dtype=jnp.float64)
+    else:
+        point_lambda = jnp.asarray(point_lambda, dtype=jnp.float64).reshape(-1)
+        if point_lambda.shape[0] != n_points:
+            raise ValueError(f"point_lambda must be (N,), got {point_lambda.shape} for N={n_points}")
     
     # Weighted responsibilities per bin: (N, B)
-    w_r = weights[:, None] * responsibilities
+    w_eff = weights * point_lambda
+    w_r = w_eff[:, None] * responsibilities
 
     # Normalize point directions (batched, branch-free)
     norms = jnp.linalg.norm(points, axis=1, keepdims=True)

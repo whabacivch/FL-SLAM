@@ -2,7 +2,6 @@
 LidarQuadraticEvidence operator for Golden Child SLAM v2.
 
 Produces quadratic evidence on full 22D tangent at fixed cost.
-Reuses ut_cache from DeskewUTMomentMatch.
 
 Reference: docs/GOLDEN_CHILD_INTERFACE_SPEC.md Section 5.9
 """
@@ -28,7 +27,6 @@ from fl_slam_poc.common.primitives import (
     spd_cholesky_solve_lifted,
     spd_cholesky_inverse_lifted,
 )
-from fl_slam_poc.backend.operators.deskew import UTCache
 from fl_slam_poc.backend.operators.binning import ScanBinStats
 from fl_slam_poc.common.geometry import se3_jax
 
@@ -71,7 +69,7 @@ def lidar_quadratic_evidence(
     map_bins: MapBinStats,
     R_hat: jnp.ndarray,
     t_hat: jnp.ndarray,
-    ut_cache: UTCache,
+    t_cov: jnp.ndarray,
     c_dt: float = constants.GC_C_DT,
     c_ex: float = constants.GC_C_EX,
     eps_psd: float = constants.GC_EPS_PSD,
@@ -79,8 +77,6 @@ def lidar_quadratic_evidence(
 ) -> Tuple[LidarEvidenceResult, CertBundle, ExpectedEffect]:
     """
     Produce quadratic evidence on full 22D tangent at fixed cost.
-    
-    Reuses ut_cache from DeskewUTMomentMatch (no extra sigma point passes).
     
     Branch-free coupling rule:
         s_dt = dt_effect / (dt_effect + c_dt)
@@ -95,7 +91,7 @@ def lidar_quadratic_evidence(
         map_bins: Map bin statistics
         R_hat: Estimated rotation (3, 3)
         t_hat: Estimated translation (3,)
-        ut_cache: UT cache from DeskewUTMomentMatch
+        t_cov: Translation covariance from TranslationWLS (3,3)
         c_dt: Time offset coupling constant
         c_ex: Extrinsic coupling constant
         eps_psd: PSD projection epsilon
@@ -108,10 +104,13 @@ def lidar_quadratic_evidence(
     """
     R_hat = jnp.asarray(R_hat, dtype=jnp.float64)
     t_hat = jnp.asarray(t_hat, dtype=jnp.float64)
+    t_cov = jnp.asarray(t_cov, dtype=jnp.float64)
     
     # Step 1: Compute excitation scales (continuous, no branching)
-    dt_effect = float(jnp.std(ut_cache.dt_contributions))
-    extrinsic_effect = float(jnp.std(jnp.linalg.norm(ut_cache.extrinsic_contributions, axis=1)))
+    # Use belief covariance as the continuous excitation proxy (no legacy cache dependency).
+    _mu_pred, Sigma_pred = belief_pred.to_moments(eps_lift)
+    dt_effect = float(jnp.sqrt(Sigma_pred[15, 15]))
+    extrinsic_effect = float(jnp.sqrt(jnp.trace(Sigma_pred[16:22, 16:22])))
     
     s_dt = dt_effect / (dt_effect + c_dt)
     s_ex = extrinsic_effect / (extrinsic_effect + c_ex)
@@ -127,44 +126,29 @@ def lidar_quadratic_evidence(
     delta_z_star = delta_z_star.at[0:3].set(rotvec)
     delta_z_star = delta_z_star.at[3:6].set(t_hat)
     
-    # Step 3: Build L_lidar using UT regression
-    # Use sigma points from ut_cache to build quadratic model
-    sigma_points = ut_cache.sigma_points  # (SIGMA_POINTS, D_Z)
-    weights_cov = ut_cache.weights_cov  # (SIGMA_POINTS,)
-    n_sigma = sigma_points.shape[0]
-    
-    # Compute residuals for each sigma point
-    # Residual = how well the sigma point explains the observations
-    # Using pose slice only for residual computation
-    residuals = jnp.zeros(n_sigma, dtype=jnp.float64)
-    
-    # Mean sigma point (should be close to zero for increments)
-    mean_sigma = jnp.sum(weights_cov[:, None] * sigma_points, axis=0)
-    
-    # Build information matrix from weighted outer products
-    # L_lidar = sum_s w_s * (sigma_s - mean) @ (sigma_s - mean)^T
-    # This is the inverse of the UT covariance, scaled
-    L_lidar_raw = jnp.zeros((D_Z, D_Z), dtype=jnp.float64)
-    
-    for s in range(n_sigma):
-        delta_s = sigma_points[s] - mean_sigma
-        L_lidar_raw = L_lidar_raw + weights_cov[s] * jnp.outer(delta_s, delta_s)
-    
-    # Invert to get precision (information) matrix
-    # First project to PSD
-    L_cov_psd = domain_projection_psd(L_lidar_raw, eps_psd).M_psd
-    
-    # Invert with lift
-    L_lidar_inv, _ = spd_cholesky_inverse_lifted(L_cov_psd, eps_lift)
-    
-    # The information from LiDAR registration
-    # Scale by a factor based on the quality of the registration
-    n_bins = scan_bins.N.shape[0]
+    # Step 3: Build L_lidar from closed-form Fisher-style pose information (no sigma-point regression)
+    #
+    # Rotation: vMF directional curvature proxy aggregated over bins:
+    #   H_rot ≈ Σ_b w_b * (I - μ_b μ_b^T)    (PSD, rank-2 per bin)
+    #
+    # Translation: use TranslationWLS covariance as a Gaussian measurement term:
+    #   H_trans = (t_cov + eps I)^{-1}
+    mu_map = jnp.asarray(map_bins.mu_dir, dtype=jnp.float64)  # (B,3)
+    I3 = jnp.eye(3, dtype=jnp.float64)
+    P = I3[None, :, :] - jnp.einsum("bi,bj->bij", mu_map, mu_map)  # (B,3,3)
+    w_b = scan_bins.N * map_bins.kappa_map * scan_bins.kappa_scan  # (B,)
+    H_rot = jnp.einsum("b,bij->ij", w_b, P)
+    H_rot = domain_projection_psd(H_rot, eps_psd).M_psd
+
+    t_cov_psd = domain_projection_psd(t_cov, eps_psd).M_psd
+    H_trans, _ = spd_cholesky_inverse_lifted(t_cov_psd, eps_lift)
+
     total_mass = float(jnp.sum(scan_bins.N))
-    
-    # Information scaling based on total mass
     info_scale = total_mass / (total_mass + constants.GC_EPS_MASS)
-    L_lidar_raw = info_scale * L_lidar_inv
+
+    L_lidar_raw = jnp.zeros((D_Z, D_Z), dtype=jnp.float64)
+    L_lidar_raw = L_lidar_raw.at[0:3, 0:3].set(info_scale * H_rot)
+    L_lidar_raw = L_lidar_raw.at[3:6, 3:6].set(info_scale * H_trans)
     
     # Step 4: Apply excitation scaling to relevant blocks (always)
     # Time offset: index 15

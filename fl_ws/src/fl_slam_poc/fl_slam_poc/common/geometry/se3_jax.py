@@ -55,6 +55,159 @@ def skew(v: jnp.ndarray) -> jnp.ndarray:
 
 
 @jit
+def vee(W: jnp.ndarray) -> jnp.ndarray:
+    """
+    Vee operator (inverse of skew/hat) for a 3x3 skew-symmetric matrix.
+
+    Assumes W ≈ [w]× and returns w.
+    """
+    return jnp.array([W[2, 1], W[0, 2], W[1, 0]])
+
+
+@jit
+def so3_right_jacobian(phi: jnp.ndarray) -> jnp.ndarray:
+    """
+    SO(3) right Jacobian Jr(phi) (closed form, universal).
+
+        Jr(phi) = I - B(theta) [phi]× + C2(theta) [phi]×^2
+
+    where theta = ||phi|| and
+
+        B(theta)  = (1 - cos(theta)) / theta^2
+        C2(theta) = (theta - sin(theta)) / theta^3
+
+    Uses analytic continuation near theta -> 0.
+    """
+    phi = jnp.asarray(phi, dtype=jnp.float64).reshape(-1)
+    theta_sq = jnp.dot(phi, phi)
+    theta = jnp.sqrt(theta_sq)
+    K = skew(phi)
+    K_sq = K @ K
+    I = jnp.eye(3, dtype=jnp.float64)
+
+    safe_theta = jnp.where(theta < SMALL_ANGLE_THRESHOLD, 1.0, theta)
+    safe_theta_sq = jnp.where(theta_sq < SMALL_ANGLE_THRESHOLD**2, 1.0, theta_sq)
+    safe_theta_cu = safe_theta_sq * safe_theta
+
+    B = jnp.where(
+        theta < SMALL_ANGLE_THRESHOLD,
+        0.5 - theta_sq / 24.0,
+        (1.0 - jnp.cos(safe_theta)) / safe_theta_sq,
+    )
+    C2 = jnp.where(
+        theta < SMALL_ANGLE_THRESHOLD,
+        1.0 / 6.0 - theta_sq / 120.0,
+        (safe_theta - jnp.sin(safe_theta)) / safe_theta_cu,
+    )
+
+    return I - B * K + C2 * K_sq
+
+
+@jit
+def so3_right_jacobian_inv(phi: jnp.ndarray) -> jnp.ndarray:
+    """
+    SO(3) inverse right Jacobian Jr^{-1}(phi) (closed form, universal).
+
+        Jr^{-1}(phi) = I + 1/2 [phi]× + D(theta) [phi]×^2
+
+    where
+
+        D(theta) = (1/theta^2) - (1 + cos(theta)) / (2*theta*sin(theta))
+
+    Uses analytic continuation near theta -> 0.
+    """
+    phi = jnp.asarray(phi, dtype=jnp.float64).reshape(-1)
+    theta_sq = jnp.dot(phi, phi)
+    theta = jnp.sqrt(theta_sq)
+    K = skew(phi)
+    K_sq = K @ K
+    I = jnp.eye(3, dtype=jnp.float64)
+
+    eps = 1e-12
+    denom = (2.0 * theta * jnp.sin(theta)) + eps
+    D = jnp.where(
+        theta < 1e-4,
+        1.0 / 12.0 + theta_sq / 720.0,
+        (1.0 / (theta_sq + eps)) - (1.0 + jnp.cos(theta)) / denom,
+    )
+
+    return I + 0.5 * K + D * K_sq
+
+
+@jit
+def se3_V(phi: jnp.ndarray) -> jnp.ndarray:
+    """
+    SE(3) V(phi) matrix mapping rho -> t in Exp([rho;phi]).
+
+        Exp([rho;phi]) has translation t = V(phi) rho
+
+    where
+
+        V(phi) = I + B(theta)[phi]× + C(theta)[phi]×^2
+
+    with
+
+        B(theta) = (1 - cos(theta)) / theta^2
+        C(theta) = (theta - sin(theta)) / theta^3
+    """
+    phi = jnp.asarray(phi, dtype=jnp.float64).reshape(-1)
+    theta_sq = jnp.dot(phi, phi)
+    theta = jnp.sqrt(theta_sq)
+
+    K = skew(phi)
+    K_sq = K @ K
+
+    safe_theta = jnp.where(theta < SMALL_ANGLE_THRESHOLD, 1.0, theta)
+    safe_theta_sq = jnp.where(theta_sq < SMALL_ANGLE_THRESHOLD**2, 1.0, theta_sq)
+    safe_theta_cu = safe_theta_sq * safe_theta
+
+    B = jnp.where(
+        theta < SMALL_ANGLE_THRESHOLD,
+        0.5 - theta_sq / 24.0,
+        (1.0 - jnp.cos(safe_theta)) / safe_theta_sq,
+    )
+    C = jnp.where(
+        theta < SMALL_ANGLE_THRESHOLD,
+        1.0 / 6.0 - theta_sq / 120.0,
+        (safe_theta - jnp.sin(safe_theta)) / safe_theta_cu,
+    )
+
+    return jnp.eye(3) + B * K + C * K_sq
+
+
+@jit
+def se3_log(T: jnp.ndarray) -> jnp.ndarray:
+    """
+    SE(3) logarithm map from group element to algebra (twist) in 6D representation.
+
+    Input pose is represented as a 6-vector [t(3), rotvec(3)] where rotvec is an
+    axis-angle rotation vector parameterization of R.
+
+    Output is the se(3) twist [rho(3), phi(3)] such that:
+
+        se3_exp([rho;phi]) == [t;rotvec]   (up to rotation-vector canonicalization)
+
+    Critically, the translational twist component is:
+
+        rho = V(phi)^{-1} t
+
+    not just rho=t. This replaces the previous stub logic.
+    """
+    T = jnp.asarray(T, dtype=jnp.float64).reshape(-1)
+    t = T[:3]
+    rotvec = T[3:6]
+
+    # Canonicalize rotation via Log(Exp(rotvec)) for robustness near pi.
+    R = so3_exp(rotvec)
+    phi = so3_log(R)
+
+    V = se3_V(phi)
+    rho = jnp.linalg.solve(V, t)
+
+    return jnp.concatenate([rho, phi])
+
+
+@jit
 def so3_exp(omega: jnp.ndarray) -> jnp.ndarray:
     """
     SO(3) exponential map via Rodrigues formula.
@@ -344,8 +497,11 @@ __all__ = [
     "SMALL_ANGLE_THRESHOLD",
     "NEAR_PI_THRESHOLD",
     "skew",
+    "vee",
     "so3_exp",
     "so3_log",
+    "so3_right_jacobian",
+    "so3_right_jacobian_inv",
     "so3_adjoint",
     "se3_plus",
     "se3_minus",
@@ -354,6 +510,8 @@ __all__ = [
     "se3_relative",
     "se3_cov_compose",
     "se3_exp",
+    "se3_log",
+    "se3_V",
     "se3_adjoint",
     "so3_exp_batch",
     "so3_log_batch",

@@ -5,7 +5,7 @@ Branch-free compositional inference backend per docs/GOLDEN_CHILD_INTERFACE_SPEC
 
 Structure:
 - operators/: Branch-free operators (predict, fuse, recompose, etc.)
-- structures/: Data structures (BinAtlas, UTCache)
+- structures/: Data structures (BinAtlas, adaptive-noise states)
 - pipeline.py: Main pipeline functions
 - backend_node.py: ROS2 node entry point
 

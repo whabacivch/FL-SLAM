@@ -165,9 +165,8 @@ def se3_log(pose: jnp.ndarray) -> jnp.ndarray:
     Returns:
         6D tangent vector
     """
-    # For 6D representation, log is identity for small poses
-    # For full implementation, use se3_jax
-    return pose
+    # Full SE(3) Log: xi = [rho;phi] with rho = V(phi)^{-1} t (no stub).
+    return se3_jax.se3_log(pose)
 
 
 # =============================================================================

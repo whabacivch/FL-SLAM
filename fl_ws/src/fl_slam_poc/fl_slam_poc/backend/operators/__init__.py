@@ -15,13 +15,16 @@ from fl_slam_poc.backend.operators.point_budget import (
 
 from fl_slam_poc.backend.operators.predict import (
     predict_diffusion,
-    build_default_process_noise,
 )
 
-from fl_slam_poc.backend.operators.deskew import (
-    deskew_ut_moment_match,
-    DeskewResult,
-    UTCache,
+from fl_slam_poc.backend.operators.imu_preintegration import (
+    smooth_window_weights,
+    preintegrate_imu_relative_pose_jax,
+)
+
+from fl_slam_poc.backend.operators.deskew_constant_twist import (
+    deskew_constant_twist,
+    DeskewConstantTwistResult,
 )
 
 from fl_slam_poc.backend.operators.binning import (
@@ -51,6 +54,16 @@ from fl_slam_poc.backend.operators.lidar_evidence import (
     lidar_quadratic_evidence,
     LidarEvidenceResult,
     MapBinStats as LidarMapBinStats,
+)
+
+from fl_slam_poc.backend.operators.odom_evidence import (
+    odom_quadratic_evidence,
+    OdomEvidenceResult,
+)
+
+from fl_slam_poc.backend.operators.imu_evidence import (
+    imu_vmf_gravity_evidence,
+    ImuEvidenceResult,
 )
 
 from fl_slam_poc.backend.operators.fusion import (
@@ -85,11 +98,12 @@ __all__ = [
     "PointBudgetResult",
     # Predict
     "predict_diffusion",
-    "build_default_process_noise",
+    # IMU preintegration
+    "smooth_window_weights",
+    "preintegrate_imu_relative_pose_jax",
     # Deskew
-    "deskew_ut_moment_match",
-    "DeskewResult",
-    "UTCache",
+    "deskew_constant_twist",
+    "DeskewConstantTwistResult",
     # Binning
     "bin_soft_assign",
     "scan_bin_moment_match",
@@ -109,6 +123,12 @@ __all__ = [
     "lidar_quadratic_evidence",
     "LidarEvidenceResult",
     "LidarMapBinStats",
+    # Odom evidence
+    "odom_quadratic_evidence",
+    "OdomEvidenceResult",
+    # IMU evidence
+    "imu_vmf_gravity_evidence",
+    "ImuEvidenceResult",
     # Fusion
     "fusion_scale_from_certificates",
     "info_fusion_additive",
