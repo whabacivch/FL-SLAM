@@ -90,6 +90,7 @@ class ScanDiagnostics:
     # Certificate summaries
     total_trigger_magnitude: float = 0.0
     conditioning_number: float = 1.0
+    conditioning_pose6: float = 1.0
     
     # IMU discretization diagnostics
     dt_scan: float = 0.0  # LiDAR scan duration
@@ -141,6 +142,7 @@ class ScanDiagnostics:
             "fusion_alpha": self.fusion_alpha,
             "total_trigger_magnitude": self.total_trigger_magnitude,
             "conditioning_number": self.conditioning_number,
+            "conditioning_pose6": self.conditioning_pose6,
             "dt_scan": self.dt_scan,
             "dt_int": self.dt_int,
             "num_imu_samples": self.num_imu_samples,
@@ -190,6 +192,7 @@ class ScanDiagnostics:
             fusion_alpha=d.get("fusion_alpha", 1.0),
             total_trigger_magnitude=d.get("total_trigger_magnitude", 0.0),
             conditioning_number=d.get("conditioning_number", 1.0),
+            conditioning_pose6=d.get("conditioning_pose6", 1.0),
             dt_scan=d.get("dt_scan", 0.0),
             dt_int=d.get("dt_int", 0.0),
             num_imu_samples=d.get("num_imu_samples", 0),

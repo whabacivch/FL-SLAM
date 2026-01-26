@@ -19,6 +19,7 @@ from fl_slam_poc.common.belief import BeliefGaussianInfo, D_Z, HypothesisSet
 from fl_slam_poc.common.certificates import (
     CertBundle,
     ExpectedEffect,
+    ConditioningCert,
     aggregate_certificates,
     InfluenceCert,
 )
@@ -129,6 +130,10 @@ class PipelineConfig:
     Sigma_meas: jnp.ndarray = None
     Sigma_g: jnp.ndarray = None  # (3,3) gyro covariance proxy (from measurement IW)
     Sigma_a: jnp.ndarray = None  # (3,3) accel covariance proxy (from measurement IW)
+
+    # No-TF extrinsics: LiDAR origin expressed in base frame. Used to compute
+    # ray directions from the sensor origin (not the base origin).
+    lidar_origin_base: jnp.ndarray = None  # (3,)
     
     def __post_init__(self):
         if self.Sigma_meas is None:
@@ -138,6 +143,8 @@ class PipelineConfig:
             self.Sigma_g = constants.GC_IMU_GYRO_NOISE_DENSITY * jnp.eye(3, dtype=jnp.float64)
         if self.Sigma_a is None:
             self.Sigma_a = constants.GC_IMU_ACCEL_NOISE_DENSITY * jnp.eye(3, dtype=jnp.float64)
+        if self.lidar_origin_base is None:
+            self.lidar_origin_base = jnp.zeros((3,), dtype=jnp.float64)
 
 
 # =============================================================================
@@ -326,10 +333,19 @@ def process_scan_single_hypothesis(
     _mu_pred, Sigma_pred, _lift = belief_pred.to_moments(eps_lift=config.eps_lift)
     dt_std = jnp.sqrt(Sigma_pred[15, 15])
     sigma_warp = float(jnp.maximum(dt_std, 0.01))
-    w_imu = smooth_window_weights(
+    # Two IMU membership windows:
+    # - w_imu_scan: within-scan window for deskew (uses per-point timestamps)
+    # - w_imu_int:  scan-to-scan window for gyro evidence / noise updates (uses header stamps)
+    w_imu_scan = smooth_window_weights(
         imu_stamps=imu_stamps,
         scan_start_time=scan_start_time,
         scan_end_time=scan_end_time,
+        sigma=sigma_warp,
+    )
+    w_imu_int = smooth_window_weights(
+        imu_stamps=imu_stamps,
+        scan_start_time=t_last_scan,
+        scan_end_time=t_scan,
         sigma=sigma_warp,
     )
 
@@ -342,17 +358,18 @@ def process_scan_single_hypothesis(
     rotvec0 = pose0[3:6]
     gravity_W = jnp.array(constants.GC_GRAVITY_W, dtype=jnp.float64)
 
-    delta_pose, _R_end, _p_end, ess_imu = preintegrate_imu_relative_pose_jax(
+    # Preintegration for deskew (within-scan).
+    delta_pose_scan, _R_end_scan, _p_end_scan, ess_imu_scan = preintegrate_imu_relative_pose_jax(
         imu_stamps=imu_stamps,
         imu_gyro=imu_gyro,
         imu_accel=imu_accel,
-        weights=w_imu,
+        weights=w_imu_scan,
         rotvec_start_WB=rotvec0,
         gyro_bias=gyro_bias,
         accel_bias=accel_bias,
         gravity_W=gravity_W,
     )
-    xi_body = se3_jax.se3_log(delta_pose)  # (6,) twist over interval
+    xi_body = se3_jax.se3_log(delta_pose_scan)  # (6,) twist over scan (used for deskew)
 
     # =====================================================================
     # IMU INTEGRATION TIME: dt_int = Σ_i Δt_i over (t_last_scan, t_scan)
@@ -365,18 +382,39 @@ def process_scan_single_hypothesis(
         t_start=t_last_scan,
         t_end=t_scan,
     )
+
+    # Preintegration for scan-to-scan interval (used for gyro evidence + IMU noise updates).
+    delta_pose_int, _R_end_int, _p_end_int, ess_imu_int = preintegrate_imu_relative_pose_jax(
+        imu_stamps=imu_stamps,
+        imu_gyro=imu_gyro,
+        imu_accel=imu_accel,
+        weights=w_imu_int,
+        rotvec_start_WB=rotvec0,
+        gyro_bias=gyro_bias,
+        accel_bias=accel_bias,
+        gravity_W=gravity_W,
+    )
     
     # IMU measurement-noise IW sufficient stats (Σg, Σa) from commutative residuals
     # Average IMU sampling period for PSD mapping (Var * dt -> PSD).
-    m_imu = imu_stamps.shape[0]
-    dt_imu = (imu_stamps[-1] - imu_stamps[0]) / jnp.maximum(jnp.array(m_imu - 1, dtype=jnp.float64), 1.0)
-    dt_imu = jnp.maximum(dt_imu, 1e-12)
+    # imu_stamps is padded with zeros; compute span only over valid stamps.
+    import numpy as np
+    imu_stamps_np = np.asarray(imu_stamps, dtype=np.float64).reshape(-1)
+    valid_mask = imu_stamps_np > 0.0
+    n_valid = int(np.sum(valid_mask))
+    if n_valid >= 2:
+        valid = np.sort(imu_stamps_np[valid_mask])
+        dt_imu = float((valid[-1] - valid[0]) / max(n_valid - 1, 1))
+    else:
+        dt_imu = 0.0
+    dt_imu = jnp.maximum(jnp.array(dt_imu, dtype=jnp.float64), 1e-12)
 
-    dt_scan = jnp.maximum(jnp.array(scan_end_time - scan_start_time, dtype=jnp.float64), 1e-12)
-    omega_avg = delta_pose[3:6] / dt_scan
+    # Use scan-to-scan dt_int for average angular rate (omega_avg) since delta_rotvec is interval-integrated.
+    dt_int_j = jnp.maximum(jnp.array(dt_int, dtype=jnp.float64), 1e-12)
+    omega_avg = delta_pose_int[3:6] / dt_int_j
     iw_meas_gyro_dPsi, iw_meas_gyro_dnu = imu_gyro_meas_iw_suffstats_from_avg_rate_jax(
         imu_gyro=imu_gyro,
-        weights=w_imu,
+        weights=w_imu_int,
         gyro_bias=gyro_bias,
         omega_avg=omega_avg,
         dt_imu_sec=dt_imu,
@@ -385,7 +423,7 @@ def process_scan_single_hypothesis(
     iw_meas_accel_dPsi, iw_meas_accel_dnu = imu_accel_meas_iw_suffstats_from_gravity_dir_jax(
         rotvec_world_body=rotvec0,
         imu_accel=imu_accel,
-        weights=w_imu,
+        weights=w_imu_int,
         accel_bias=accel_bias,
         gravity_W=gravity_W,
         dt_imu_sec=dt_imu,
@@ -399,7 +437,7 @@ def process_scan_single_hypothesis(
         scan_start_time=scan_start_time,
         scan_end_time=scan_end_time,
         xi_body=xi_body,
-        ess_imu=float(ess_imu),
+        ess_imu=float(ess_imu_scan),
         chart_id=belief_pred.chart_id,
         anchor_id=belief_pred.anchor_id,
     )
@@ -410,9 +448,11 @@ def process_scan_single_hypothesis(
     # Point covariances are not used by the new deskew. Keep zeros (deterministic).
     deskewed_covs = jnp.zeros((deskewed_points.shape[0], 3, 3), dtype=jnp.float64)
     
-    # Compute point directions for binning (batched, no per-point host sync)
-    norms = jnp.linalg.norm(deskewed_points, axis=1, keepdims=True)
-    point_directions = deskewed_points / (norms + config.eps_mass)
+    # Compute point directions for binning from the LiDAR origin (not base origin).
+    # points are in base frame; subtract sensor origin to recover true ray directions.
+    rays = deskewed_points - config.lidar_origin_base[None, :]
+    norms = jnp.linalg.norm(rays, axis=1, keepdims=True)
+    point_directions = rays / (norms + config.eps_mass)
     
     # =========================================================================
     # Step 4: BinSoftAssign
@@ -437,6 +477,7 @@ def process_scan_single_hypothesis(
         weights=deskewed_weights,
         responsibilities=responsibilities,
         point_lambda=point_lambda,
+        direction_origin=config.lidar_origin_base,
         eps_psd=config.eps_psd,
         eps_mass=config.eps_mass,
         chart_id=belief_pred.chart_id,
@@ -550,7 +591,7 @@ def process_scan_single_hypothesis(
     imu_result, imu_cert, imu_effect = imu_vmf_gravity_evidence(
         rotvec_world_body=pose_pred[3:6],
         imu_accel=imu_accel,
-        weights=w_imu,
+        weights=w_imu_int,
         accel_bias=accel_bias,
         gravity_W=gravity_W,
         eps_psd=config.eps_psd,
@@ -566,7 +607,7 @@ def process_scan_single_hypothesis(
     gyro_result, gyro_cert, gyro_effect = imu_gyro_rotation_evidence(
         rotvec_start_WB=rotvec0,
         rotvec_end_pred_WB=pose_pred[3:6],
-        delta_rotvec_meas=delta_pose[3:6],
+        delta_rotvec_meas=delta_pose_int[3:6],
         Sigma_g=Sigma_g,
         dt_int=dt_int,  # CORRECT: IMU integration time, not scan duration
         eps_psd=config.eps_psd,
@@ -635,6 +676,44 @@ def process_scan_single_hypothesis(
     # =========================================================================
     # Use a combined certificate for fusion scale (single-path, includes IMU+odom+lidar).
     combined_evidence_cert = aggregate_certificates([evidence_cert, odom_cert, imu_cert, gyro_cert])
+
+    # Effective conditioning for trust alpha should be evaluated on the subspace we intend to update.
+    # Using the full 22x22 conditioning can be dominated by physically-null directions (e.g., yaw under gravity,
+    # weak bias/extrinsic blocks), pinning alpha at floor even when pose evidence is strong.
+    import numpy as np
+
+    eps_cond = float(config.eps_psd)
+    L_pose = np.array(L_evidence[0:6, 0:6], dtype=np.float64)
+    L_pose = 0.5 * (L_pose + L_pose.T)
+
+    eig_pose: np.ndarray | None = None
+    if np.all(np.isfinite(L_pose)) and float(np.trace(np.abs(L_pose))) > 1e-12:
+        try:
+            eig_pose = np.linalg.eigvalsh(L_pose)
+        except (np.linalg.LinAlgError, ValueError):
+            # Fall back to singular values: robust proxy for "strength" and conditioning.
+            try:
+                eig_pose = np.linalg.svd(L_pose, compute_uv=False)
+            except (np.linalg.LinAlgError, ValueError):
+                eig_pose = None
+
+    if eig_pose is None or eig_pose.shape != (6,) or (not np.all(np.isfinite(eig_pose))):
+        eig_pose = np.full((6,), eps_cond, dtype=np.float64)
+    eig_pose = np.sort(eig_pose)
+
+    eig_pose_clipped = np.maximum(eig_pose, eps_cond)
+    eig_min_pose = float(eig_pose_clipped[0])
+    eig_max_pose = float(eig_pose_clipped[-1])
+    cond_pose6 = float(eig_max_pose / eig_min_pose)
+
+    combined_evidence_cert.conditioning = ConditioningCert(
+        eig_min=eig_min_pose,
+        eig_max=eig_max_pose,
+        cond=cond_pose6,
+        near_null_count=int(np.sum(eig_pose <= eps_cond)),
+    )
+    combined_evidence_cert.approximation_triggers.append("FusionScaleConditioningPose6")
+
     fusion_scale_result, fusion_scale_cert, fusion_scale_effect = fusion_scale_from_certificates(
         cert_evidence=combined_evidence_cert,
         cert_belief=pred_cert,
@@ -755,7 +834,7 @@ def process_scan_single_hypothesis(
 
     # IMU gravity direction coherence probe (in body frame).
     imu_accel_np = np.array(imu_accel, dtype=np.float64)
-    w_imu_np = np.array(w_imu, dtype=np.float64).reshape(-1)
+    w_imu_np = np.array(w_imu_int, dtype=np.float64).reshape(-1)
     accel_bias_np = np.array(accel_bias, dtype=np.float64).reshape(-1)
     a_corr = imu_accel_np - accel_bias_np[None, :]
     a_norm = np.linalg.norm(a_corr, axis=1)
@@ -799,7 +878,15 @@ def process_scan_single_hypothesis(
         scan_number=0,  # Will be set by backend_node
         timestamp=scan_end_time,
         dt_sec=dt_sec,
+        dt_scan=float(scan_end_time - scan_start_time),
         dt_int=dt_int,  # IMU integration time: sum of sample intervals in (t_last_scan, t_scan)
+        num_imu_samples=int(
+            np.sum(
+                (np.asarray(imu_stamps, dtype=np.float64) > (float(t_last_scan) - 1e-9))
+                & (np.asarray(imu_stamps, dtype=np.float64) <= (float(t_scan) + 1e-9))
+                & (np.asarray(imu_stamps, dtype=np.float64) > 0.0)
+            )
+        ),
         n_points_raw=int(raw_points.shape[0]),
         n_points_budget=int(points.shape[0]),
         p_W=trans_final,
@@ -833,6 +920,7 @@ def process_scan_single_hypothesis(
         fusion_alpha=float(alpha),
         total_trigger_magnitude=total_trigger_mag,
         conditioning_number=cond_number,
+        conditioning_pose6=float(cond_pose6),
     )
 
     return ScanPipelineResult(

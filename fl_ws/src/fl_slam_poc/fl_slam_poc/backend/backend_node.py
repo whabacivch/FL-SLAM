@@ -292,6 +292,23 @@ class GoldenChildBackend(Node):
         self.R_base_imu, self.t_base_imu = _parse_T_base_sensor_6d(
             self.get_parameter("T_base_imu").value
         )
+
+        # Log extrinsics for runtime audit (verifies config is applied correctly)
+        from scipy.spatial.transform import Rotation as R_scipy
+        lidar_rotvec = R_scipy.from_matrix(self.R_base_lidar).as_rotvec()
+        imu_rotvec = R_scipy.from_matrix(self.R_base_imu).as_rotvec()
+        self.get_logger().info("=" * 60)
+        self.get_logger().info("EXTRINSICS (T_{base<-sensor})")
+        self.get_logger().info("=" * 60)
+        self.get_logger().info(f"T_base_lidar: t=({self.t_base_lidar[0]:.6f}, {self.t_base_lidar[1]:.6f}, {self.t_base_lidar[2]:.6f}) rotvec=({lidar_rotvec[0]:.6f}, {lidar_rotvec[1]:.6f}, {lidar_rotvec[2]:.6f})")
+        self.get_logger().info(f"T_base_imu:   t=({self.t_base_imu[0]:.6f}, {self.t_base_imu[1]:.6f}, {self.t_base_imu[2]:.6f}) rotvec=({imu_rotvec[0]:.6f}, {imu_rotvec[1]:.6f}, {imu_rotvec[2]:.6f})")
+        imu_angle_deg = np.linalg.norm(imu_rotvec) * 180.0 / np.pi
+        self.get_logger().info(f"IMU rotation angle: {imu_angle_deg:.3f}° (should be ~28° if gravity-aligned)")
+        self.get_logger().info("=" * 60)
+
+        # Wire LiDAR origin (in base frame) into the pipeline so direction features are computed
+        # from the sensor origin, not the base origin.
+        self.config.lidar_origin_base = jnp.array(self.t_base_lidar, dtype=jnp.float64)
         
         # Initialize hypotheses with identity prior
         self.hypotheses: List[BeliefGaussianInfo] = []
@@ -563,6 +580,10 @@ class GoldenChildBackend(Node):
         # Per-point offsets are for deskew INSIDE the scan, not scan-to-scan dt
         # =====================================================================
         t_scan = stamp_sec  # CORRECT: scan time is header.stamp, not per-point timestamps
+
+        # Preserve previous scan time for scan-to-scan interval handling.
+        # This must be captured BEFORE updating self.last_scan_stamp.
+        t_prev_scan = float(self.last_scan_stamp) if self.last_scan_stamp > 0.0 else 0.0
         
         # Derive scan bounds from per-point timestamps for deskew (within-scan only)
         stamp_j = jnp.array(stamp_sec, dtype=jnp.float64)
@@ -571,8 +592,8 @@ class GoldenChildBackend(Node):
 
         # Compute dt since last scan (using t_scan, not scan_end_time)
         dt_raw = (
-            t_scan - self.last_scan_stamp
-            if self.last_scan_stamp > 0
+            t_scan - t_prev_scan
+            if t_prev_scan > 0.0
             else (scan_end_time - scan_start_time)
         )
         eps_dt = np.finfo(np.float64).eps
@@ -582,7 +603,9 @@ class GoldenChildBackend(Node):
         # =====================================================================
         # TIMESTAMP AUDIT LOGGING (before IMU processing)
         # =====================================================================
-        t_last_scan = self.last_scan_stamp if self.last_scan_stamp > 0 else t_scan
+        # Scan-to-scan IMU integration interval is (t_prev_scan, t_scan).
+        # For the first scan, the interval is empty by definition.
+        t_last_scan = t_prev_scan if t_prev_scan > 0.0 else t_scan
         self.get_logger().info(
             f"Scan #{self.scan_count} timestamp audit: "
             f"header.stamp=({header_stamp_sec}.{header_stamp_nsec:09d}) "
@@ -609,6 +632,18 @@ class GoldenChildBackend(Node):
         imu_stamps_j = jnp.array(imu_stamps, dtype=jnp.float64)
         imu_gyro_j = jnp.array(imu_gyro, dtype=jnp.float64)
         imu_accel_j = jnp.array(imu_accel, dtype=jnp.float64)
+        
+        # Diagnostic: log IMU buffer state
+        n_valid_imu = int(np.sum(imu_stamps > 0.0))
+        if n_valid_imu > 0:
+            valid_stamps = imu_stamps[imu_stamps > 0.0]
+            t_imu_min = float(np.min(valid_stamps))
+            t_imu_max = float(np.max(valid_stamps))
+            self.get_logger().info(
+                f"Scan #{self.scan_count} IMU buffer: {n_valid_imu}/{len(self.imu_buffer)} valid, "
+                f"stamp_range=[{t_imu_min:.6f}, {t_imu_max:.6f}], "
+                f"integration_window=({t_last_scan:.6f}, {t_scan:.6f})"
+            )
         
         # =====================================================================
         # IMU INTEGRATION TIME COMPUTATION (after IMU arrays are built)

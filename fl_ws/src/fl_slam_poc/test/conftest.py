@@ -2,8 +2,15 @@
 collect_ignore = ['test_end_to_end_launch.py']
 
 import os
+import sys
 import pytest
 from typing import Dict, Any
+
+# Ensure local package import works for pytest collection.
+_TEST_DIR = os.path.dirname(__file__)
+_PKG_ROOT = os.path.abspath(os.path.join(_TEST_DIR, ".."))
+if _PKG_ROOT not in sys.path:
+    sys.path.insert(0, _PKG_ROOT)
 
 # =============================================================================
 # Production Config Fixtures

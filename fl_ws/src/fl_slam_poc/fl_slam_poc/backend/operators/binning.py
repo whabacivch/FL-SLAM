@@ -160,6 +160,7 @@ def scan_bin_moment_match(
     weights: jnp.ndarray,
     responsibilities: jnp.ndarray,
     point_lambda: jnp.ndarray | None = None,
+    direction_origin: jnp.ndarray | None = None,
     eps_psd: float = constants.GC_EPS_PSD,
     eps_mass: float = constants.GC_EPS_MASS,
     chart_id: str = constants.GC_CHART_ID,
@@ -189,6 +190,13 @@ def scan_bin_moment_match(
     point_covariances = jnp.asarray(point_covariances, dtype=jnp.float64)
     weights = jnp.asarray(weights, dtype=jnp.float64)
     responsibilities = jnp.asarray(responsibilities, dtype=jnp.float64)
+
+    if direction_origin is None:
+        direction_origin = jnp.zeros((3,), dtype=jnp.float64)
+    else:
+        direction_origin = jnp.asarray(direction_origin, dtype=jnp.float64).reshape(-1)
+        if direction_origin.shape[0] != 3:
+            raise ValueError(f"direction_origin must be (3,), got {direction_origin.shape}")
     
     n_points = points.shape[0]
     n_bins = responsibilities.shape[1]
@@ -205,9 +213,10 @@ def scan_bin_moment_match(
     w_eff = weights * point_lambda
     w_r = w_eff[:, None] * responsibilities
 
-    # Normalize point directions (batched, branch-free)
-    norms = jnp.linalg.norm(points, axis=1, keepdims=True)
-    d = points / (norms + eps_mass)  # (N,3)
+    # Normalize point directions (batched, branch-free) from the sensor origin.
+    rays = points - direction_origin[None, :]
+    norms = jnp.linalg.norm(rays, axis=1, keepdims=True)
+    d = rays / (norms + eps_mass)  # (N,3)
 
     # Sufficient statistics (batched; avoids O(N*B) Python loops)
     N = jnp.sum(w_r, axis=0)  # (B,)

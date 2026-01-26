@@ -4,6 +4,18 @@ Project: Frobenius-Legendre SLAM POC (Impact Project_v1)
 
 This file tracks all significant changes, design decisions, and implementation milestones for the FL-SLAM project.
 
+## 2026-01-26: Fix Pose6 Conditioning Robustness + Fail-Fast Run Script
+
+### Summary
+
+- **Fixed early-run crashes in GC backend** caused by `np.linalg.eigvalsh()` nonconvergence during the pose6 conditioning estimate used for fusion trust scaling.
+- **Hardened the evaluation runner** to fail fast when `gc_backend_node` dies, avoiding misleading “SLAM complete” reports with only a handful of poses.
+
+### Changes
+
+- `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/pipeline.py`: make the pose6 conditioning computation robust to non-finite matrices and eigen solver failures (fallback to SVD; final fallback to `eps_psd`).
+- `tools/run_and_evaluate_gc.sh`: detect backend death/pipeline errors from logs and abort; enforce a minimum pose count before evaluation.
+
 ## 2026-01-26: LiDAR Evidence Fix — Apply SE(3) Residual (Not Absolute Pose)
 
 ### Summary
@@ -63,6 +75,25 @@ This file tracks all significant changes, design decisions, and implementation m
 
 - `PYTHONPATH=fl_ws/src/fl_slam_poc .venv/bin/python -m pytest -q fl_ws/src/fl_slam_poc/test` passes.
 - `bash tools/run_and_evaluate_gc.sh` runs end-to-end; results captured under `results/gc_20260126_161004/`.
+
+## 2026-01-26: LiDAR Ray-Direction Coherence — Compute Directions From Sensor Origin
+
+### Summary
+
+- **Fixed a frame-geometry mismatch in LiDAR direction features**: after moving points into `base` via `p_base = R_base<-lidar p_lidar + t_base<-lidar`, the code was normalizing `p_base` directly to get ray directions. This incorrectly treats rays as emanating from the base origin instead of the LiDAR origin, biasing directional statistics and Wahba rotation.
+- **Now computes directions from the LiDAR origin in base**: uses `(p_base - t_base<-lidar) / ||p_base - t_base<-lidar||` consistently for soft binning responsibilities and scan directional sufficient statistics.
+- **Empirical effect**: `rot_err_lidar_deg_post - rot_err_lidar_deg_pred` becomes negative on average (LiDAR rotation evidence starts “pulling the right way”).
+
+### Changes
+
+- `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/pipeline.py`: compute `point_directions` from rays `points - lidar_origin_base`.
+- `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/operators/binning.py`: `scan_bin_moment_match()` now accepts `direction_origin` and computes `s_dir` from sensor-origin rays.
+- `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/backend_node.py`: wires `config.lidar_origin_base = t_base_lidar` so the pipeline stays “no-TF” but frame-coherent.
+
+### Verification
+
+- `PYTHONPATH=fl_ws/src/fl_slam_poc .venv/bin/python -m pytest -q fl_ws/src/fl_slam_poc/test` passes.
+- `bash tools/run_and_evaluate_gc.sh` runs end-to-end; results captured under `results/gc_20260126_162411/`.
 
 ## 2026-01-26: Principled Missing-Data Handling — OU Propagation + IMU Evidence Scaling
 

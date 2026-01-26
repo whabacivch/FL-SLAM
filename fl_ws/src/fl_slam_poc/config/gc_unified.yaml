@@ -71,9 +71,12 @@ gc_backend:
     base_frame: base_footprint
 
     # No-TF extrinsics (T_{base<-sensor}) in [x, y, z, rx, ry, rz] (rotvec, radians).
-    # Bag truth has LiDAR+IMU in livox_frame; default assumes identity rotation.
+    # Estimated from Dynamic01 bag gravity alignment (tools/estimate_imu_base_extrinsic_rotation.py):
+    #   IMU accel direction in livox_frame: [-0.47, -0.015, 0.88]
+    #   Expected in base_footprint (Z-up):   [0, 0, 1]
+    #   Rotation: ~28° misalignment → rotvec [-0.015586, 0.489293, 0.0] rad
     T_base_lidar: [-0.011, 0.0, 0.778, 0.0, 0.0, 0.0]
-    T_base_imu:   [0.0,   0.0, 0.0,   0.0, 0.0, 0.0]
+    T_base_imu:   [0.0,   0.0, 0.0,   -0.015586, 0.489293, 0.0]
 
     # Trajectory export
     trajectory_export_path: /tmp/gc_slam_trajectory.tum

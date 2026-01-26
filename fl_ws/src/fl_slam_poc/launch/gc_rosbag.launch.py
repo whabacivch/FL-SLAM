@@ -131,9 +131,10 @@ def generate_launch_description():
                 # Bag truth for M3DGR Dynamic01: odom child_frame_id is base_footprint.
                 "base_frame": "base_footprint",
                 # No-TF extrinsics (T_{base<-sensor}) in [x,y,z,rx,ry,rz] rotvec (rad).
-                # Defaults from docs/BAG_TOPICS_AND_USAGE.md (MID-360 mount; identity rotation).
+                # IMU rotation estimated from Dynamic01 bag gravity alignment (~28° misalignment).
+                # See: tools/estimate_imu_base_extrinsic_rotation.py
                 "T_base_lidar": [-0.011, 0.0, 0.778, 0.0, 0.0, 0.0],
-                "T_base_imu": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                "T_base_imu": [0.0, 0.0, 0.0, -0.015586, 0.489293, 0.0],
                 "status_check_period_sec": 5.0,
                 "forgetting_factor": 0.99,
             }

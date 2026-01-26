@@ -261,6 +261,7 @@ LAST_ODOM=0
 LAST_SCAN=0
 LAST_IMU=0
 ALIVE=true
+BACKEND_DIED=false
 
 while [ $ALIVE = true ]; do
     sleep 2
@@ -275,6 +276,18 @@ while [ $ALIVE = true ]; do
     
     # Parse status from log
     if [ -f "$LOG_FILE" ]; then
+        # Fail fast if the backend node died; otherwise we can "complete" with only a few poses.
+        if grep -q "process has died.*gc_backend_node" "$LOG_FILE" 2>/dev/null; then
+            BACKEND_DIED=true
+            ALIVE=false
+            break
+        fi
+        if grep -q "Pipeline error on scan" "$LOG_FILE" 2>/dev/null; then
+            BACKEND_DIED=true
+            ALIVE=false
+            break
+        fi
+
         STATUS_LINE=$(grep -o 'GC Status: odom=[0-9]*, scans=[0-9]*, imu=[0-9]*' "$LOG_FILE" 2>/dev/null | tail -1 || echo "")
         if [ -n "$STATUS_LINE" ]; then
             LAST_ODOM=$(echo "$STATUS_LINE" | grep -o 'odom=[0-9]*' | cut -d= -f2)
@@ -326,6 +339,22 @@ if [ ! -f "$EST_FILE" ]; then
 fi
 
 POSE_COUNT=$(grep -v '^#' "$EST_FILE" | wc -l)
+if [ "$BACKEND_DIED" = true ]; then
+    print_fail "SLAM backend crashed (trajectory has ${CYAN}$POSE_COUNT${NC} poses)"
+    echo ""
+    echo -e "${YELLOW}Log tail:${NC}"
+    tail -50 "$LOG_FILE"
+    exit 1
+fi
+
+if [ "$POSE_COUNT" -lt 10 ]; then
+    print_fail "Too few poses (${CYAN}$POSE_COUNT${NC}) — likely an early backend failure"
+    echo ""
+    echo -e "${YELLOW}Log tail:${NC}"
+    tail -50 "$LOG_FILE"
+    exit 1
+fi
+
 print_ok "SLAM complete: ${CYAN}$POSE_COUNT${NC} poses"
 echo "    odom=$LAST_ODOM  scan=$LAST_SCAN  imu=$LAST_IMU"
 

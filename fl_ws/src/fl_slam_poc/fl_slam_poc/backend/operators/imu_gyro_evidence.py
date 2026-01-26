@@ -72,15 +72,14 @@ def imu_gyro_rotation_evidence(
     # 0.5 (r - 0)^T Σ^{-1} (r - 0) drives R_end_pred toward R_end_imu.
     r_rot = se3_jax.so3_log(R_end_pred.T @ R_end_imu)
 
-    # dt_int is bag-agnostic: sum of actual IMU sample intervals
-    # Continuous mass check: if dt_int ≈ 0 (no samples), evidence becomes ~0 without boolean gates
-    # Use continuous scaling: mass_scale = dt_int / (dt_int + eps_mass)
-    # When dt_int ≈ 0, mass_scale ≈ 0, so evidence is scaled to ~0
+    # dt_int is bag-agnostic: sum of actual IMU sample intervals.
+    # Continuous mass check: when dt_int -> 0, evidence weight -> 0 (no boolean gates).
     eps_mass = constants.GC_EPS_MASS
-    dt_safe = jnp.maximum(jnp.array(dt_int, dtype=jnp.float64), 1e-12)
-    mass_scale = dt_safe / (dt_safe + eps_mass)  # Continuous: 0 when dt_int≈0, 1 when dt_int>>eps_mass
-    
-    Sigma_rot = Sigma_g * dt_safe
+    dt_pos = jnp.maximum(jnp.array(dt_int, dtype=jnp.float64), 0.0)
+    dt_eff = dt_pos + eps_mass  # strictly-positive for PSD/inversion stability
+    mass_scale = dt_pos / dt_eff
+
+    Sigma_rot = Sigma_g * dt_eff
     Sigma_rot_psd = domain_projection_psd(Sigma_rot, eps_psd).M_psd
     L_rot, lift_strength = spd_cholesky_inverse_lifted(Sigma_rot_psd, eps_lift)
     

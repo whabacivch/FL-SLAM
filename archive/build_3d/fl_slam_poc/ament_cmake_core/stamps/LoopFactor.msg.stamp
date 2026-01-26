@@ -1,6 +1,0 @@
-std_msgs/Header header
-int32 anchor_id
-float64 weight
-geometry_msgs/Pose rel_pose
-float64[36] covariance
-string[] approximation_triggers
