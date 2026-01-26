@@ -33,7 +33,14 @@ GC_EPS_DEN = 1e-12  # Denominator regularization in kappa
 GC_EXC_EPS = 1e-12  # Domain guard for excitation ratios
 
 # World gravity (m/s^2) in the odom/world frame used by evidence extraction.
-GC_GRAVITY_W = (0.0, 0.0, -9.81)
+# M3DGR uses Z-UP convention (GT Z ≈ 0.86m), so gravity points down: (0, 0, -9.81)
+# NOTE: If world frame is Z-DOWN, use (0, 0, +9.81) instead.
+GC_GRAVITY_W = (0.0, 0.0, -9.81)  # Z-UP convention: gravity points in -Z direction
+
+# IMU acceleration scale factor (g → m/s² conversion)
+# Livox Mid-360 IMU (ICM40609) outputs acceleration in g's, needs scaling to m/s².
+# Set to 9.81 for Livox sensors, 1.0 for sensors that output m/s² directly.
+GC_IMU_ACCEL_SCALE = 9.81  # g to m/s² conversion
 
 # Trust/fusion constants
 GC_ALPHA_MIN = 0.1  # Minimum fusion scale alpha
@@ -142,6 +149,21 @@ GC_PROCESS_DT_DIFFUSION = 1e-6  # s^2 / s = s
 GC_PROCESS_EXTRINSIC_DIFFUSION = 1e-8  # (se(3))^2 / s (weak; IW adapts)
 
 # =============================================================================
+# Ornstein-Uhlenbeck (OU) damping for bounded uncertainty propagation
+# =============================================================================
+# OU-style mean-reverting diffusion prevents unbounded growth during missing-data gaps.
+# The damping rate λ controls how quickly uncertainty saturates: Σ(∞) → Q/(2λ).
+# For A = -λI, the closed-form propagation is:
+#   Σ(t+Δt) = e^(-2λΔt) Σ(t) + (1 - e^(-2λΔt))/(2λ) Q
+# 
+# Choose λ so that for typical dt (0.1s), the correction is small, but for large
+# gaps (10s+), uncertainty saturates rather than exploding.
+GC_OU_DAMPING_LAMBDA = 0.1  # 1/s (damping rate; larger = faster saturation)
+# At λ=0.1, saturation time constant is 1/(2λ) = 5s, so Σ(∞) = Q/(2*0.1) = 5*Q
+# For dt=0.1s: e^(-2*0.1*0.1) ≈ 0.98, so nearly pure diffusion (correct for small dt)
+# For dt=10s: e^(-2*0.1*10) ≈ 0.135, so strong damping (prevents explosion)
+
+# =============================================================================
 # Continuous weighting / domain safeguards (no discrete gates)
 # =============================================================================
 GC_WEIGHT_FLOOR = 1e-12  # strictly positive floor for continuous weights
@@ -160,6 +182,11 @@ GC_IW_RHO_BG = 0.999
 GC_IW_RHO_BA = 0.999
 GC_IW_RHO_DT = 0.9999
 GC_IW_RHO_EX = 0.9999
+
+# IW update timing: minimum scan count before applying updates
+# Rationale: Need real deltas (scan-to-scan differences) for meaningful IW updates.
+# Scans 0 and 1 don't have sufficient history for reliable innovation residuals.
+GC_IW_UPDATE_MIN_SCAN = 2  # Start IW updates from scan 2 onwards
 
 # Measurement-noise retention (separate from process noise; deterministic per scan)
 GC_IW_RHO_MEAS_GYRO = 0.995

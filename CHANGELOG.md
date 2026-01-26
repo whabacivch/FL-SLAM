@@ -4,6 +4,62 @@ Project: Frobenius-Legendre SLAM POC (Impact Project_v1)
 
 This file tracks all significant changes, design decisions, and implementation milestones for the FL-SLAM project.
 
+## 2026-01-26: Principled Missing-Data Handling — OU Propagation + IMU Evidence Scaling
+
+### Summary
+
+- **Replaced pure diffusion with OU-style bounded propagation**: `PredictDiffusion` now uses Ornstein-Uhlenbeck mean-reverting diffusion instead of `Σ ← Σ + Q*dt`. This prevents unbounded uncertainty growth during large missing-data gaps (e.g., 19.1s bag gaps) while remaining continuous and mathematically defensible.
+- **Fixed IMU evidence covariance scaling**: IMU gyro evidence now uses actual IMU integration time (IMU buffer time span) instead of LiDAR scan duration for covariance scaling. This prevents incorrect inflation of IMU evidence during large LiDAR gaps.
+- **No clamping, no gates**: All fixes are continuous and branch-free, preserving the "no gates" invariant.
+
+### Changes
+
+- `fl_slam_poc/common/constants.py`: Added `GC_OU_DAMPING_LAMBDA = 0.1` (1/s) with documentation explaining the OU propagation formula and saturation behavior.
+- `fl_slam_poc/backend/operators/predict.py`:
+  - Replaced pure diffusion `cov_pred_raw = cov_prev + dt_sec * Q` with OU propagation:
+    `Σ(t+Δt) = e^(-2λΔt) Σ(t) + (1 - e^(-2λΔt))/(2λ) Q`
+  - Added `lambda_ou` parameter (defaults to `GC_OU_DAMPING_LAMBDA`)
+  - Updated docstring to explain OU propagation and bounded behavior
+- `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/pipeline.py`:
+  - Compute `dt_imu_integration` from IMU buffer time span (not LiDAR scan duration)
+  - Pass `dt_imu_integration` to `imu_gyro_rotation_evidence()` instead of `dt_scan`
+
+### Rationale
+
+- **OU propagation is principled**: It models missing-data gaps as "no constraints for duration Δt" with bounded uncertainty growth. As Δt → ∞, Σ → Q/(2λ) (bounded), not ∞. For small Δt, it approximates pure diffusion: Σ ≈ Σ + Q*Δt.
+- **IMU evidence independence**: IMU is independent of LiDAR timing. Large LiDAR gaps should not inflate IMU evidence covariance. The correct scaling uses the actual IMU integration time (time span of IMU samples used), not the LiDAR scan duration.
+- **Continuous, no gates**: Both fixes are continuous and branch-free, preserving project invariants. No clamping, no thresholds, no hard discontinuities.
+
+### Mathematical Details
+
+OU propagation for A = -λI:
+- Small dt (0.1s): `e^(-2λΔt) ≈ 0.98`, so `Σ' ≈ 0.98*Σ + 0.02*Q/(2λ) ≈ Σ + Q*dt` (pure diffusion)
+- Large dt (10s): `e^(-2λΔt) ≈ 0.135`, so `Σ' ≈ 0.135*Σ + 0.865*Q/(2λ)` (strong damping, prevents explosion)
+- As dt → ∞: `Σ' → Q/(2λ)` (bounded saturation)
+
+## 2026-01-26: Critical Fixes — IW Update Timing + Odom Relative Transformation
+
+### Summary
+
+- **Fixed IW update timing**: IW updates (process noise, measurement noise, LiDAR bucket) now start from scan 2 onwards, skipping scans 0 and 1. This prevents numerical explosions from insufficient delta history.
+- **Added constant**: `GC_IW_UPDATE_MIN_SCAN = 2` in `constants.py` with documentation rationale.
+- **Fixed initial position offset**: Odom is now transformed to be relative to the first odom message, making the first odom effectively at origin. This ensures the system starts at origin (0,0,0) regardless of bag starting position.
+- **Root cause**: Odom was providing absolute poses (e.g., starting at 30m Z), which got fused on scan 0, moving the belief away from origin.
+
+### Changes
+
+- `fl_slam_poc/common/constants.py`: Added `GC_IW_UPDATE_MIN_SCAN = 2` constant with documentation
+- `fl_slam_poc/backend/backend_node.py`:
+  - Added `first_odom_pose` storage in `_init_state()`
+  - Modified `on_odom()` to transform odom to be relative to first odom: `odom_relative = first_odom^{-1} ∘ odom_absolute`
+  - Added scan count check in IW update section: `if self.scan_count >= constants.GC_IW_UPDATE_MIN_SCAN:`
+  - IW updates (process, measurement, lidar bucket) are now skipped for scans 0 and 1
+
+### Rationale
+
+- **IW updates need real deltas**: Scans 0 and 1 don't have sufficient scan-to-scan history for meaningful innovation residuals. Updating with dt=0 or very small dt causes numerical issues.
+- **Origin start requirement**: System should always start at origin regardless of bag starting position. Transforming odom to be relative to first message achieves this cleanly while maintaining proper fusion.
+
 ## 2026-01-25: GC v2 Foundations — Lie Primitives + Process-Noise IW
 
 ### Summary

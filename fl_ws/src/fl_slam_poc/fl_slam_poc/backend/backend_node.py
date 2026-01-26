@@ -32,6 +32,8 @@ from fl_slam_poc.common.belief import (
     se3_identity,
     se3_from_rotvec_trans,
     se3_to_rotvec_trans,
+    se3_compose,
+    se3_inverse,
 )
 from fl_slam_poc.common.certificates import CertBundle
 from fl_slam_poc.common.certificates import InfluenceCert, aggregate_certificates
@@ -285,6 +287,10 @@ class GoldenChildBackend(Node):
         self.last_odom_stamp = 0.0
         self.last_odom_cov_se3 = None  # (6,6) in [x,y,z,roll,pitch,yaw] ~ [trans, rotvec]
         
+        # First odom pose reference (for relative transformation)
+        # All subsequent odom poses will be transformed relative to this
+        self.first_odom_pose = None  # (6,) SE3 pose [trans, rotvec]
+        
         # IMU buffer for high-rate prediction
         self.imu_buffer: List[Tuple[float, jnp.ndarray, jnp.ndarray]] = []
         self.max_imu_buffer = 200
@@ -396,10 +402,12 @@ class GoldenChildBackend(Node):
             [msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z],
             dtype=np.float64,
         )
-        accel = np.array(
+        # Apply acceleration scale: Livox Mid-360 IMU outputs in g's, convert to m/s²
+        accel_raw = np.array(
             [msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z],
             dtype=np.float64,
         )
+        accel = accel_raw * constants.GC_IMU_ACCEL_SCALE  # g → m/s²
 
         self.imu_buffer.append((stamp_sec, gyro, accel))
         
@@ -419,12 +427,28 @@ class GoldenChildBackend(Node):
         R = Rotation.from_quat(quat)
         rotvec = R.as_rotvec()
         
-        self.last_odom_pose = se3_from_rotvec_trans(
+        # Convert to SE3 pose [trans, rotvec]
+        odom_pose_absolute = se3_from_rotvec_trans(
             jnp.array(rotvec, dtype=jnp.float64),
             jnp.array([pos.x, pos.y, pos.z], dtype=jnp.float64)
         )
+        
+        # Store first odom pose as reference (makes it effectively at origin)
+        if self.first_odom_pose is None:
+            self.first_odom_pose = odom_pose_absolute
+            self.get_logger().info(
+                f"First odom pose stored as reference: trans=({pos.x:.3f}, {pos.y:.3f}, {pos.z:.3f})"
+            )
+        
+        # Transform odom to be relative to first odom pose
+        # odom_relative = first_odom^{-1} ∘ odom_absolute
+        # This makes the first odom effectively at origin
+        first_odom_inv = se3_inverse(self.first_odom_pose)
+        self.last_odom_pose = se3_compose(first_odom_inv, odom_pose_absolute)
+        
         self.last_odom_stamp = stamp_sec
         # Pose covariance is row-major 6x6: [x,y,z,roll,pitch,yaw]
+        # Note: Covariance is unchanged by the relative transformation (same uncertainty)
         cov = np.array(msg.pose.covariance, dtype=np.float64).reshape(6, 6)
         self.last_odom_cov_se3 = jnp.array(cov, dtype=jnp.float64)
 
@@ -562,31 +586,40 @@ class GoldenChildBackend(Node):
             self.current_belief = combined_belief
             self.pipeline_runs += 1
 
-            # Apply process-noise IW update ONCE per scan (after hypothesis combine)
-            self.process_noise_state, proc_iw_cert_vec = process_noise_iw_apply_suffstats_jax(
-                pn_state=self.process_noise_state,
-                dPsi=accum_dPsi,
-                dnu=accum_dnu,
-                dt_sec=dt_sec,
-                eps_psd=self.config.eps_psd,
-            )
-            self.Q = process_noise_state_to_Q_jax(self.process_noise_state)
+            # Apply IW updates ONCE per scan (after hypothesis combine)
+            # Skip first 2 scans - need real deltas for meaningful updates
+            # See constants.GC_IW_UPDATE_MIN_SCAN for rationale
+            if self.scan_count >= constants.GC_IW_UPDATE_MIN_SCAN:
+                # Apply process-noise IW update
+                self.process_noise_state, proc_iw_cert_vec = process_noise_iw_apply_suffstats_jax(
+                    pn_state=self.process_noise_state,
+                    dPsi=accum_dPsi,
+                    dnu=accum_dnu,
+                    dt_sec=dt_sec,
+                    eps_psd=self.config.eps_psd,
+                )
+                self.Q = process_noise_state_to_Q_jax(self.process_noise_state)
 
-            # Apply measurement-noise IW update ONCE per scan (after hypothesis combine)
-            self.measurement_noise_state, meas_iw_cert_vec = measurement_noise_apply_suffstats_jax(
-                mn_state=self.measurement_noise_state,
-                dPsi_blocks=accum_meas_dPsi,
-                dnu=accum_meas_dnu,
-                eps_psd=self.config.eps_psd,
-            )
+                # Apply measurement-noise IW update
+                self.measurement_noise_state, meas_iw_cert_vec = measurement_noise_apply_suffstats_jax(
+                    mn_state=self.measurement_noise_state,
+                    dPsi_blocks=accum_meas_dPsi,
+                    dnu=accum_meas_dnu,
+                    eps_psd=self.config.eps_psd,
+                )
 
-            # Apply LiDAR bucket IW update ONCE per scan (after hypothesis combine)
-            self.lidar_bucket_noise_state = lidar_bucket_iw_apply_suffstats_jax(
-                state=self.lidar_bucket_noise_state,
-                dPsi=accum_lidar_bucket_dPsi,
-                dnu=accum_lidar_bucket_dnu,
-                eps_psd=self.config.eps_psd,
-            )
+                # Apply LiDAR bucket IW update
+                self.lidar_bucket_noise_state = lidar_bucket_iw_apply_suffstats_jax(
+                    state=self.lidar_bucket_noise_state,
+                    dPsi=accum_lidar_bucket_dPsi,
+                    dnu=accum_lidar_bucket_dnu,
+                    eps_psd=self.config.eps_psd,
+                )
+            else:
+                # Skip IW updates for first 2 scans (scans 0 and 1)
+                # Use default/prior values - updates will start from scan 2
+                proc_iw_cert_vec = jnp.zeros(2, dtype=jnp.float64)
+                meas_iw_cert_vec = jnp.zeros(2, dtype=jnp.float64)
             
             # Update map statistics with weighted increments
             delta_S_dir = jnp.zeros_like(self.map_stats.S_dir)

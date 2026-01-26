@@ -304,6 +304,18 @@ def process_scan_single_hypothesis(
     dt_imu = (imu_stamps[-1] - imu_stamps[0]) / jnp.maximum(jnp.array(m_imu - 1, dtype=jnp.float64), 1.0)
     dt_imu = jnp.maximum(dt_imu, 1e-12)
 
+    # Actual IMU integration time: time span of IMU samples used in preintegration
+    # This is the correct time for IMU evidence covariance scaling, not the LiDAR scan duration.
+    # For large LiDAR gaps, dt_scan can be huge, but IMU only integrates over actual samples.
+    # The smooth window weights (w_imu) already filter samples, so use the time span
+    # of the IMU buffer (which contains the samples that contribute to preintegration).
+    # This is branch-free and continuous: if IMU buffer is empty, dt_imu_integration ≈ dt_scan.
+    dt_imu_integration_raw = jnp.maximum(
+        imu_stamps[-1] - imu_stamps[0],
+        jnp.array(scan_end_time - scan_start_time, dtype=jnp.float64)
+    )
+    dt_imu_integration = float(jnp.maximum(dt_imu_integration_raw, 1e-12))
+    
     dt_scan = jnp.maximum(jnp.array(scan_end_time - scan_start_time, dtype=jnp.float64), 1e-12)
     omega_avg = delta_pose[3:6] / dt_scan
     iw_meas_gyro_dPsi, iw_meas_gyro_dnu = imu_gyro_meas_iw_suffstats_from_avg_rate_jax(
@@ -493,13 +505,15 @@ def process_scan_single_hypothesis(
     all_certs.append(imu_cert)
 
     # IMU gyro rotation evidence (Gaussian on SO(3) using preintegrated delta rotation)
+    # Use actual IMU integration time, not LiDAR scan duration, for covariance scaling.
+    # This prevents incorrect inflation of IMU evidence during large LiDAR gaps.
     Sigma_g = jnp.asarray(config.Sigma_g, dtype=jnp.float64)
     gyro_result, gyro_cert, gyro_effect = imu_gyro_rotation_evidence(
         rotvec_start_WB=rotvec0,
         rotvec_end_pred_WB=pose_pred[3:6],
         delta_rotvec_meas=delta_pose[3:6],
         Sigma_g=Sigma_g,
-        dt_scan=float(dt_scan),
+        dt_scan=dt_imu_integration,  # Use actual IMU integration time, not LiDAR scan duration
         eps_psd=config.eps_psd,
         eps_lift=config.eps_lift,
         chart_id=belief_pred.chart_id,

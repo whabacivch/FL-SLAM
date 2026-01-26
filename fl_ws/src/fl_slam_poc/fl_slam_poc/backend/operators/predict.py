@@ -1,7 +1,15 @@
 """
 PredictDiffusion operator for Golden Child SLAM v2.
 
-dt-scaled prediction with continuous DomainProjectionPSD.
+OU-style bounded propagation with continuous DomainProjectionPSD.
+
+Replaces pure diffusion (Σ ← Σ + Q*dt) with Ornstein-Uhlenbeck mean-reverting
+propagation to prevent unbounded uncertainty growth during missing-data gaps.
+
+For A = -λI, the closed-form OU propagation is:
+  Σ(t+Δt) = e^(-2λΔt) Σ(t) + (1 - e^(-2λΔt))/(2λ) Q
+
+This is continuous, smooth, and bounded: as Δt → ∞, Σ → Q/(2λ) (not ∞).
 
 Reference: docs/GOLDEN_CHILD_INTERFACE_SPEC.md Section 5.2
 """
@@ -37,24 +45,35 @@ def predict_diffusion(
     dt_sec: float,
     eps_psd: float = constants.GC_EPS_PSD,
     eps_lift: float = constants.GC_EPS_LIFT,
+    lambda_ou: float = constants.GC_OU_DAMPING_LAMBDA,
 ) -> Tuple[BeliefGaussianInfo, CertBundle, ExpectedEffect]:
     """
-    Predict belief forward with dt-scaled process noise.
+    Predict belief forward with OU-style bounded propagation.
+    
+    Uses Ornstein-Uhlenbeck mean-reverting diffusion instead of pure diffusion
+    to prevent unbounded uncertainty growth during missing-data gaps.
+    
+    For A = -λI, the closed-form propagation is:
+      Σ(t+Δt) = e^(-2λΔt) Σ(t) + (1 - e^(-2λΔt))/(2λ) Q
+    
+    This is continuous, smooth, and bounded: as Δt → ∞, Σ → Q/(2λ).
+    For small Δt, it approximates pure diffusion: Σ ≈ Σ + Q*Δt.
     
     Always applies DomainProjectionPSD (even if Q is zero).
     
     Prediction in information form:
     1. Convert to moment form
-    2. Add dt * Q to covariance
+    2. Apply OU propagation (bounded, continuous)
     3. Convert back to information form
     4. Apply DomainProjectionPSD
     
     Args:
         belief_prev: Previous belief
         Q: Process noise matrix (D_Z, D_Z)
-        dt_sec: Time delta in seconds
+        dt_sec: Time delta in seconds (may be large for missing-data gaps)
         eps_psd: PSD projection epsilon
         eps_lift: Solve lift epsilon
+        lambda_ou: OU damping rate (1/s); larger = faster saturation
         
     Returns:
         Tuple of (predicted_belief, CertBundle, ExpectedEffect)
@@ -63,12 +82,27 @@ def predict_diffusion(
     """
     Q = jnp.asarray(Q, dtype=jnp.float64)
     dt_sec = float(dt_sec)
+    lambda_ou = float(lambda_ou)
     
     # Step 1: Convert to moment form
     mean_prev, cov_prev, lift_prev = belief_prev.to_moments(eps_lift)
     
-    # Step 2: Add scaled process noise (always, dt may be 0)
-    cov_pred_raw = cov_prev + dt_sec * Q
+    # Step 2: OU-style bounded propagation (continuous, no clamping)
+    # For A = -λI, closed form: Σ' = e^(-2λΔt) Σ + (1 - e^(-2λΔt))/(2λ) Q
+    # This prevents unbounded growth: as Δt → ∞, Σ' → Q/(2λ)
+    dt_jax = jnp.array(dt_sec, dtype=jnp.float64)
+    lambda_jax = jnp.array(lambda_ou, dtype=jnp.float64)
+    
+    # Exponential decay factor
+    exp_factor = jnp.exp(-2.0 * lambda_jax * dt_jax)
+    
+    # Diffusion contribution (bounded)
+    # For small dt: (1 - e^(-2λΔt))/(2λ) ≈ dt (pure diffusion)
+    # For large dt: (1 - e^(-2λΔt))/(2λ) → 1/(2λ) (saturation)
+    diffusion_coeff = (1.0 - exp_factor) / (2.0 * lambda_jax + jnp.finfo(jnp.float64).eps)
+    
+    # OU propagation: contractive decay + bounded diffusion
+    cov_pred_raw = exp_factor * cov_prev + diffusion_coeff * Q
     
     # Step 3: Project predicted covariance to PSD (always)
     cov_pred_result = domain_projection_psd(cov_pred_raw, eps_psd)
