@@ -39,12 +39,22 @@ After editing, regenerate the SVG using the commands above.
 
 ## Complete System Dataflow
 
+The diagram below is embedded directly for preview. You can also view the standalone SVG file: [system_dataflow.svg](system_dataflow.svg)
+
+<div align="center">
+
 ![System Dataflow Diagram](system_dataflow.svg)
+
+</div>
 
 **Source:** The diagram is generated from `system_dataflow.dot` using Graphviz. To regenerate:
 ```bash
 cd docs && dot -Tsvg system_dataflow.dot -o system_dataflow.svg
 ```
+
+**Note:** If the diagram doesn't render in your markdown preview, you can:
+- Open `docs/system_dataflow.svg` directly in your browser
+- View the PNG version: `docs/system_dataflow.png`
 
 ## Topic Flow Details
 
