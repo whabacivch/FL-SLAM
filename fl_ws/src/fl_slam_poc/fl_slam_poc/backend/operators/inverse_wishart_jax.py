@@ -147,8 +147,8 @@ def process_noise_iw_apply_suffstats_jax(
     """
     rho = jnp.array(
         [
-            C.GC_IW_RHO_ROT,
             C.GC_IW_RHO_TRANS,
+            C.GC_IW_RHO_ROT,
             C.GC_IW_RHO_VEL,
             C.GC_IW_RHO_BG,
             C.GC_IW_RHO_BA,

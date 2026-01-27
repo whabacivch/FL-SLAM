@@ -122,7 +122,8 @@ def analyze_odom_covariance(odom_cov: np.ndarray) -> dict:
     Analyze odometry covariance to determine ordering convention.
     
     ROS convention: [x, y, z, roll, pitch, yaw]
-    GC convention: [rx, ry, rz, tx, ty, tz]
+    GC convention:  [x, y, z, roll, pitch, yaw]  (same as ROS)
+    Legacy/permuted convention: [rx, ry, rz, tx, ty, tz]
     """
     if odom_cov.shape != (6, 6):
         return None
@@ -138,31 +139,38 @@ def analyze_odom_covariance(odom_cov: np.ndarray) -> dict:
     ros_xy_yaw = diag[[0, 1, 5]]  # x, y, yaw
     ros_z_rp = diag[[2, 3, 4]]    # z, roll, pitch
     
-    # Check GC ordering [rx,ry,rz,tx,ty,tz] (if permuted)
-    gc_rot = diag[[0, 1, 2]]      # rx, ry, rz
-    gc_trans = diag[[3, 4, 5]]   # tx, ty, tz
+    # Check legacy/permuted ordering [rx,ry,rz,tx,ty,tz]
+    perm_rot = diag[[0, 1, 2]]      # rx, ry, rz
+    perm_trans = diag[[3, 4, 5]]    # tx, ty, tz
     
     ros_xy_yaw_mean = np.mean(ros_xy_yaw)
     ros_z_rp_mean = np.mean(ros_z_rp)
-    gc_rot_mean = np.mean(gc_rot)
-    gc_trans_mean = np.mean(gc_trans)
+    perm_rot_mean = np.mean(perm_rot)
+    perm_trans_mean = np.mean(perm_trans)
     
     # Determine which ordering makes sense
     # For 2D robot: xy_yaw should be small, z_rp should be large
     ros_makes_sense = ros_xy_yaw_mean < ros_z_rp_mean
     
-    # For GC: trans (xy) should be small, rot (rx,ry) should be large
-    gc_makes_sense = gc_trans_mean < gc_rot_mean
+    # For permuted: trans (xy) should be small, rot (rx,ry) should be large
+    perm_makes_sense = perm_trans_mean < perm_rot_mean
+
+    if ros_makes_sense:
+        likely = 'ROS [x,y,z,roll,pitch,yaw] (GC matches ROS)'
+    elif perm_makes_sense:
+        likely = 'LEGACY PERMUTED [rx,ry,rz,tx,ty,tz]'
+    else:
+        likely = 'UNKNOWN'
     
     return {
         'diag': diag,
         'ros_xy_yaw_mean': ros_xy_yaw_mean,
         'ros_z_rp_mean': ros_z_rp_mean,
-        'gc_rot_mean': gc_rot_mean,
-        'gc_trans_mean': gc_trans_mean,
+        'perm_rot_mean': perm_rot_mean,
+        'perm_trans_mean': perm_trans_mean,
         'ros_makes_sense': ros_makes_sense,
-        'gc_makes_sense': gc_makes_sense,
-        'likely_ordering': 'ROS [x,y,z,roll,pitch,yaw]' if ros_makes_sense else 'UNKNOWN',
+        'perm_makes_sense': perm_makes_sense,
+        'likely_ordering': likely,
     }
 
 
@@ -412,10 +420,10 @@ def main() -> int:
                         print(f"    z_rp mean:   {stats['ros_z_rp_mean']:.6f}")
                         print(f"    Makes sense for 2D robot: {stats['ros_makes_sense']}")
                         print()
-                        print(f"  GC ordering [rx,ry,rz,tx,ty,tz] (if permuted):")
-                        print(f"    rot mean:    {stats['gc_rot_mean']:.6f}")
-                        print(f"    trans mean:  {stats['gc_trans_mean']:.6f}")
-                        print(f"    Makes sense: {stats['gc_makes_sense']}")
+                        print(f"  Legacy/permuted ordering [rx,ry,rz,tx,ty,tz]:")
+                        print(f"    rot mean:    {stats['perm_rot_mean']:.6f}")
+                        print(f"    trans mean:  {stats['perm_trans_mean']:.6f}")
+                        print(f"    Makes sense: {stats['perm_makes_sense']}")
                         print()
                         print(f"  → INTERPRETATION: {stats['likely_ordering']}")
                         print(f"     (For 2D wheeled robot: xy_yaw should be small, z_rp should be large)")
@@ -436,7 +444,7 @@ def main() -> int:
         print("Review the interpretations above to determine:")
         print("  1. LiDAR frame convention (Z-up vs Z-down)")
         print("  2. IMU rotation correction needed")
-        print("  3. Odom covariance ordering (ROS vs GC)")
+        print("  3. Odom covariance ordering (ROS standard vs legacy-permuted)")
         print()
         
         rclpy.shutdown()

@@ -113,7 +113,7 @@ flowchart LR
 **15-Step Pipeline (per scan, per hypothesis):**
 1. PointBudgetResample → 2. PredictDiffusion → 3. DeskewUTMomentMatch → 4. BinSoftAssign → 5. ScanBinMomentMatch → 6. KappaFromResultant → 7. WahbaSVD → 8. TranslationWLS → 9. LidarQuadraticEvidence → 10. FusionScaleFromCertificates → 11. InfoFusionAdditive → 12. PoseUpdateFrobeniusRecompose → 13. PoseCovInflationPushforward → 14. AnchorDriftUpdate → 15. HypothesisBarycenterProjection
 
-**Current status:** LiDAR-only (IMU/odom subscribed but not fused into belief). See `docs/Fusion_issues.md` for details.
+**Current status:** All three sensor modalities (LiDAR + IMU + Odom) are now fused into belief. (See `archive/docs/Fusion_issues.md` for historical fusion status notes.)
 
 ### Runtime Flow Diagram (File Structure)
 

@@ -27,7 +27,10 @@ This file tracks all significant changes, design decisions, and implementation m
 - `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/structures/inverse_wishart_jax.py`: process-noise block ordering and priors updated for `[trans, rot]`.
 - `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/operators/map_update.py`: pose covariance extraction updated.
 - `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/pipeline.py`: diagnostics block ordering updated to `[trans, rot]`.
+- `docs/GOLDEN_CHILD_INTERFACE_SPEC.md`: state ordering table updated to `[trans, rot]`.
 - `docs/FRAME_AND_QUATERNION_CONVENTIONS.md`, `docs/Fusion_issues.md`, `docs/CODE_DIFF_SUMMARY.md`, `tools/DIAGNOSTIC_TOOLS.md`: documentation updated to the unified convention.
+- `tools/diagnose_coordinate_frames.py`: odom covariance ordering analysis updated for ROS-standard vs legacy-permuted ordering.
+- `tools/slam_dashboard.py`: pose heatmap labels updated to `[trans, rot]`.
 
 ## 2026-01-27: Fix Critical T_base_imu Mismatch Causing Yaw Drift
 
@@ -110,7 +113,7 @@ Previous IMU rotation estimate (~28°) was incorrect. Actual IMU gravity directi
 ### Summary
 
 - **Fixed a hard SE(3) semantics bug in LiDAR evidence application**: `LidarQuadraticEvidence` previously treated the absolute pose estimate from `(R_hat, t_hat)` as a tangent-space increment, effectively composing an already-world-frame pose again and driving large orientation errors and translation blow-ups.
-- **Now uses right-perturbation log error**: `δ = Log(X_pred^{-1} ∘ X_lidar)` is embedded into the GC pose slice `[rot, trans]`, so LiDAR evidence targets the correct local state coordinates.
+- **Now uses right-perturbation log error**: `δ = Log(X_pred^{-1} ∘ X_lidar)` is embedded into the GC pose slice `[trans, rot]`, so LiDAR evidence targets the correct local state coordinates.
 - **Added per-scan rotation-binding diagnostics**: `rot_err_{lidar,odom}_deg_{pred,post}` are exported in `diagnostics.npz` to directly verify whether rotation residuals decrease after fusion.
 
 ### Changes

@@ -30,6 +30,8 @@ Use `tools/inspect_rosbag_deep.py` to regenerate counts/frames when bags change.
 
 The M3DGR dataset uses a ground robot platform with the following sensor configuration:
 
+**Reference Diagram:** See `docs/car.jpg` for a detailed schematic diagram showing the robot platform, sensor mounting positions, coordinate frames, and physical dimensions.
+
 **Platform Overview:**
 - Lower main platform: 35 cm × 84 cm, 26 cm from ground
 - Upper platform: 35 cm × 35 cm, 45 cm above lower platform

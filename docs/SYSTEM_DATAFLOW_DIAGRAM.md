@@ -166,5 +166,5 @@ Canonical topic mappings are configured in:
 - **Topic usage**: `docs/BAG_TOPICS_AND_USAGE.md`
 - **Dataflow details**: `docs/DATAFLOW_AND_SELF_ADAPTIVE_COMPLIANCE_2026-01-23.md`
 - **Wiring audit**: `AUDIT_WIRING_REPORT.md`
-- **Fusion status**: `docs/Fusion_issues.md`
+- **Fusion status**: All sensors (LiDAR + IMU + Odom) are fused. (Historical notes: `archive/docs/Fusion_issues.md`)
 - **Golden Child spec**: `docs/GOLDEN_CHILD_INTERFACE_SPEC.md`

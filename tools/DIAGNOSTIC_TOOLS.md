@@ -12,7 +12,7 @@ python3 tools/diagnose_coordinate_frames.py rosbags/m3dgr/Dynamic01_ros2
 This will tell you:
 1. **LiDAR frame convention** (Z-up vs Z-down) from raw point cloud analysis
 2. **IMU gravity direction** in sensor frame vs expected base frame
-3. **Odom covariance ordering** (ROS vs GC convention)
+3. **Odom covariance ordering** (ROS standard; GC now matches ROS)
 
 ## Available Tools
 
@@ -23,7 +23,7 @@ This will tell you:
 **What it checks**:
 - LiDAR Z-convention by analyzing ground plane normal
 - IMU gravity direction vs expected base frame
-- Odom covariance ordering (ROS [x,y,z,roll,pitch,yaw] vs GC [rx,ry,rz,tx,ty,tz])
+- Odom covariance ordering (ROS [x,y,z,roll,pitch,yaw]; GC uses the same `[trans, rot]` ordering)
 
 **Usage**:
 ```bash

@@ -394,9 +394,9 @@ def create_full_dashboard(data: dict, selected_scan: int = 0, output_path: str =
     let currentScan = {selected_scan};
     const nScans = {n_scans};
 
-    // Block labels for pose heatmap (6x6: rotation + translation)
+    // Block labels for pose heatmap (6x6: translation + rotation)
     const poseBlockBoundaries = [0, 3, 6];
-    const poseBlockLabels = ['rot', 'trans'];
+    const poseBlockLabels = ['trans', 'rot'];
 
     // Dark theme layout
     const darkLayout = {{
@@ -477,7 +477,7 @@ def create_full_dashboard(data: dict, selected_scan: int = 0, output_path: str =
     function createHeatmap(scanIdx) {{
         const L_full = L_matrices[scanIdx];
         
-        // Extract 6x6 pose block: [rotation(3), translation(3)]
+        // Extract 6x6 pose block: [translation(3), rotation(3)]
         const L_pose = [];
         for (let i = 0; i < 6; i++) {{
             L_pose.push(L_full[i].slice(0, 6));
@@ -495,14 +495,14 @@ def create_full_dashboard(data: dict, selected_scan: int = 0, output_path: str =
             }});
         }}
 
-        // Create shapes for block boundaries (between rotation and translation)
+        // Create shapes for block boundaries (between translation and rotation)
         const shapes = [];
-        const b = 2.5; // Boundary between rot(0-2) and trans(3-5)
+        const b = 2.5; // Boundary between trans(0-2) and rot(3-5)
         shapes.push({{ type: 'line', x0: b, x1: b, y0: -0.5, y1: 5.5, line: {{color: '#555', width: 2, dash: 'dot'}} }});
         shapes.push({{ type: 'line', x0: -0.5, x1: 5.5, y0: b, y1: b, line: {{color: '#555', width: 2, dash: 'dot'}} }});
 
         // Axis labels for individual components
-        const axisLabels = ['rx', 'ry', 'rz', 'tx', 'ty', 'tz'];
+        const axisLabels = ['tx', 'ty', 'tz', 'rx', 'ry', 'rz'];
         for (let i = 0; i < 6; i++) {{
             annotations.push({{
                 x: i, y: -0.8, text: axisLabels[i], showarrow: false, font: {{size: 9, color: '#aaa'}}
