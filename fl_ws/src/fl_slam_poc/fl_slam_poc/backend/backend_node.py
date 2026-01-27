@@ -262,6 +262,12 @@ class GoldenChildBackend(Node):
         # Hard single-path enforcement: if enabled, missing topics are hard errors.
         self.declare_parameter("use_imu", True)
         self.declare_parameter("use_odom", True)
+        # IMU gravity scaling (1.0 = nominal; 0.0 disables gravity contribution)
+        self.declare_parameter("imu_gravity_scale", 1.0)
+        # IMU preintegration-only gravity scaling (1.0 = nominal; 0.0 disables in preintegration)
+        self.declare_parameter("imu_preintegration_gravity_scale", 1.0)
+        # Deskew rotation-only mode: removes hidden IMU translation leak through deskew
+        self.declare_parameter("deskew_rotation_only", False)
 
     def _init_state(self):
         """Initialize Golden Child state."""
@@ -310,7 +316,17 @@ class GoldenChildBackend(Node):
         # Wire LiDAR origin (in base frame) into the pipeline so direction features are computed
         # from the sensor origin, not the base origin.
         self.config.lidar_origin_base = jnp.array(self.t_base_lidar, dtype=jnp.float64)
-        
+        self.config.imu_gravity_scale = float(self.get_parameter("imu_gravity_scale").value)
+        self.config.imu_preintegration_gravity_scale = float(
+            self.get_parameter("imu_preintegration_gravity_scale").value
+        )
+        self.get_logger().info(f"IMU gravity scale: {self.config.imu_gravity_scale:.6f}")
+        self.get_logger().info(
+            f"IMU preintegration gravity scale: {self.config.imu_preintegration_gravity_scale:.6f}"
+        )
+        self.config.deskew_rotation_only = bool(self.get_parameter("deskew_rotation_only").value)
+        self.get_logger().info(f"Deskew rotation-only: {self.config.deskew_rotation_only}")
+
         # Initialize hypotheses with identity prior
         self.hypotheses: List[BeliefGaussianInfo] = []
         self.hyp_weights = jnp.ones(self.config.K_HYP) / self.config.K_HYP
@@ -433,7 +449,10 @@ class GoldenChildBackend(Node):
 
     def _publish_runtime_manifest(self):
         """Publish RuntimeManifest at startup."""
-        manifest = RuntimeManifest()
+        manifest = RuntimeManifest(
+            imu_gravity_scale=float(self.config.imu_gravity_scale),
+            imu_preintegration_gravity_scale=float(self.config.imu_preintegration_gravity_scale),
+        )
         manifest_dict = manifest.to_dict()
         
         self.get_logger().info("=" * 60)

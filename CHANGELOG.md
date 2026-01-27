@@ -4,6 +4,41 @@ Project: Frobenius-Legendre SLAM POC (Impact Project_v1)
 
 This file tracks all significant changes, design decisions, and implementation milestones for the FL-SLAM project.
 
+## 2026-01-27: Yaw Increment Invariant Test for Sign Mismatch Diagnosis
+
+### Summary
+
+- Added invariant test to compare yaw increments from three sources (gyro, odom, LiDAR/Wahba) to diagnose sign convention mismatches.
+- Created analysis script to identify whether sign errors are in gyro processing (IMU→base rotation, axis sign, or left/right convention) or LiDAR extrinsic.
+- Diagnostic data now includes per-scan yaw increments from all three sources for post-run analysis.
+
+### Changes
+
+- `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/diagnostics.py`: Added `dyaw_gyro`, `dyaw_odom`, `dyaw_wahba` fields to `ScanDiagnostics`; updated serialization/deserialization.
+- `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/pipeline.py`: Enhanced invariant test to compute and log yaw increments from gyro-integrated rotation, odom pose, and Wahba (LiDAR) rotation; stores values in diagnostics.
+- `tools/analyze_yaw_invariants.py`: New analysis script to load diagnostic data, compare sign consistency between sources, compute correlations, and identify problematic scans with interpretation guide.
+
+### Purpose
+
+This diagnostic helps pinpoint the root cause of yaw sign mismatches that cause trajectory spiraling:
+- **Gyro ↔ Wahba mismatch**: Indicates sign error in gyro processing (A: IMU→base rotation, B: axis sign flip, C: left/right convention)
+- **Odom ↔ Wahba mismatch**: Indicates sign error in LiDAR extrinsic (D: T_base_lidar rotation)
+
+## 2026-01-27: IMU Propagation Diagnostics + Gravity Scale Hook
+
+### Summary
+
+- Added per-scan IMU propagation probes (weighted mean accel in body/world frames) and IMU dt diagnostics to the diagnostics log.
+- Added `imu_gravity_scale` parameter to scale gravity contribution during IMU propagation, and logged it in the runtime manifest.
+- Added `imu_preintegration_gravity_scale` parameter to independently scale gravity inside IMU preintegration (for gravity-off tests without affecting evidence).
+
+### Changes
+
+- `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/operators/imu_preintegration.py`: accumulate and return weighted mean accel diagnostics during preintegration.
+- `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/pipeline.py`: plumb IMU diagnostic outputs, compute dt stats, and apply gravity scale.
+- `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/diagnostics.py`: store and serialize new IMU propagation and dt diagnostics.
+- `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/backend_node.py`: add `imu_gravity_scale` ROS parameter and publish in runtime manifest.
+
 ## 2026-01-27: GC Pose Ordering Migration to [trans, rot]
 
 ### Summary

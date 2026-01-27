@@ -129,11 +129,11 @@ digraph G {
         fontcolor="#cccccc";
         fontsize=11;
 
-        ST_BELIEF [label="BeliefGaussianInfo\n22D × 8 Hypotheses\n(Info form: L, h)", 
+        ST_BELIEF [label="BeliefGaussianInfo\n22D × 4 Hypotheses\n(Info form: L, h)", 
                    fillcolor="#1e1e2e", color="#6666aa", fontcolor="#ffffff"];
         ST_MAP [label="MapBinStats\n48 Bins\n(S_dir, N_dir, μ_dir, κ)", 
                  fillcolor="#1e1e2e", color="#6666aa", fontcolor="#ffffff"];
-        ST_PROC [label="ProcessNoiseIW\nQ (22×22)\n(rot, trans, vel, biases, dt, ex)", 
+        ST_PROC [label="ProcessNoiseIW\nQ (22×22)\n(trans, rot, vel, biases, dt, ex)", 
                  fillcolor="#1e1e2e", color="#6666aa", fontcolor="#aaaaaa"];
         ST_MEAS [label="MeasNoiseIW\nΣg, Σa, Σlidar\n(Per-sensor IW)", 
                   fillcolor="#1e1e2e", color="#6666aa", fontcolor="#aaaaaa"];
@@ -155,7 +155,7 @@ digraph G {
         fontcolor="#cccccc";
         fontsize=11;
 
-        IMU_BUF [label="IMU Buffer\n(stamp, gyro, accel)\nMax: 200 msgs\nUsed for: Deskew + Evidence", 
+        IMU_BUF [label="IMU Buffer\n(stamp, gyro, accel)\nMax: 4000 msgs\nUsed for: Deskew + Evidence", 
                  fillcolor="#1e3e1e", color="#66aa66", fontcolor="#ffffff"];
     }
 
@@ -163,7 +163,7 @@ digraph G {
     // LAYER 5: BACKEND - PIPELINE (Per-Hypothesis)
     // ============================================================================
     subgraph cluster_pipeline {
-        label="🧠 gc_backend_node - Pipeline (14 Steps × 8 Hypotheses)";
+        label="🧠 gc_backend_node - Pipeline (15 Steps × 4 Hypotheses)";
         style="filled,rounded";
         fillcolor="#1a1a2a";
         color="#666666";
@@ -280,7 +280,7 @@ digraph G {
         fontcolor="#cccccc";
         fontsize=11;
 
-        S15 [label="S15: HypothesisBarycenter\n8 Hypotheses → 1 Belief\n(Closed-form)", 
+        S15 [label="S15: HypothesisBarycenter\n4 Hypotheses → 1 Belief\n(Closed-form)", 
               fillcolor="#4a2a2a", color="#ff6666", fontcolor="#ffffff"];
     }
 

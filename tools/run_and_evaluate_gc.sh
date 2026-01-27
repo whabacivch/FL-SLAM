@@ -11,6 +11,10 @@ cd "$PROJECT_ROOT"
 
 # ============================================================================
 # CONFIGURATION
+IMU_GRAVITY_SCALE="${IMU_GRAVITY_SCALE:-1.0}"
+IMU_PREINT_GRAV_SCALE="${IMU_PREINT_GRAV_SCALE:-1.0}"
+DESKEW_ROTATION_ONLY="${DESKEW_ROTATION_ONLY:-false}"
+
 # ============================================================================
 BAG_PATH="$PROJECT_ROOT/rosbags/m3dgr/Dynamic01_ros2"
 GT_FILE="$PROJECT_ROOT/rosbags/m3dgr/Dynamic01.txt"
@@ -217,6 +221,9 @@ ros2 launch fl_slam_poc gc_rosbag.launch.py \
   trajectory_export_path:="$EST_FILE" \
   wiring_summary_path:="$WIRING_SUMMARY" \
   diagnostics_export_path:="$DIAGNOSTICS_FILE" \
+  imu_gravity_scale:="$IMU_GRAVITY_SCALE" \
+  imu_preintegration_gravity_scale:="$IMU_PREINT_GRAV_SCALE" \
+  deskew_rotation_only:="$DESKEW_ROTATION_ONLY" \
   > "$LOG_FILE" 2>&1 &
 LAUNCH_PID=$!
 

@@ -52,6 +52,7 @@ class ScanDiagnostics:
     L_odom: Optional[np.ndarray] = None   # (22, 22)
     L_imu: Optional[np.ndarray] = None    # (22, 22)
     L_gyro: Optional[np.ndarray] = None   # (22, 22)
+    L_imu_preint: Optional[np.ndarray] = None  # (22, 22) IMU preintegration factor
 
     # Diagnostic scalars
     logdet_L_total: float = 0.0
@@ -101,6 +102,32 @@ class ScanDiagnostics:
     accel_dir_dot_mu0: float = 0.0  # xbar · mu0 in body frame (should be near +1 when consistent)
     accel_mag_mean: float = 0.0     # mean ||a|| (m/s^2), should be near 9.81 when stationary
 
+    # IMU propagation probes (weighted by dt_eff over scan-to-scan window)
+    imu_a_body_mean: np.ndarray = field(default_factory=lambda: np.zeros((3,), dtype=np.float64))
+    imu_a_world_nog_mean: np.ndarray = field(default_factory=lambda: np.zeros((3,), dtype=np.float64))
+    imu_a_world_mean: np.ndarray = field(default_factory=lambda: np.zeros((3,), dtype=np.float64))
+    imu_dt_eff_sum: float = 0.0
+
+    # IMU dt diagnostics (scan-to-scan window; raw + weighted)
+    imu_dt_valid_min: float = 0.0
+    imu_dt_valid_max: float = 0.0
+    imu_dt_valid_mean: float = 0.0
+    imu_dt_valid_median: float = 0.0
+    imu_dt_valid_std: float = 0.0
+    imu_dt_valid_nonpos: int = 0
+    imu_dt_weighted_mean: float = 0.0
+    imu_dt_weighted_std: float = 0.0
+    imu_dt_weighted_sum: float = 0.0
+
+    # IMU preintegration factor residuals
+    preint_r_vel: np.ndarray = field(default_factory=lambda: np.zeros((3,), dtype=np.float64))
+    preint_r_pos: np.ndarray = field(default_factory=lambda: np.zeros((3,), dtype=np.float64))
+
+    # Invariant test: yaw increments from different sources (degrees)
+    dyaw_gyro: float = 0.0   # Gyro-integrated yaw change
+    dyaw_odom: float = 0.0   # Odom yaw change
+    dyaw_wahba: float = 0.0  # Wahba (LiDAR) yaw change
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         return {
@@ -120,6 +147,7 @@ class ScanDiagnostics:
             "L_odom": self.L_odom.tolist() if self.L_odom is not None else None,
             "L_imu": self.L_imu.tolist() if self.L_imu is not None else None,
             "L_gyro": self.L_gyro.tolist() if self.L_gyro is not None else None,
+            "L_imu_preint": self.L_imu_preint.tolist() if self.L_imu_preint is not None else None,
             "logdet_L_total": self.logdet_L_total,
             "trace_L_total": self.trace_L_total,
             "L_dt": self.L_dt,
@@ -148,6 +176,24 @@ class ScanDiagnostics:
             "num_imu_samples": self.num_imu_samples,
             "accel_dir_dot_mu0": self.accel_dir_dot_mu0,
             "accel_mag_mean": self.accel_mag_mean,
+            "imu_a_body_mean": self.imu_a_body_mean.tolist(),
+            "imu_a_world_nog_mean": self.imu_a_world_nog_mean.tolist(),
+            "imu_a_world_mean": self.imu_a_world_mean.tolist(),
+            "imu_dt_eff_sum": self.imu_dt_eff_sum,
+            "imu_dt_valid_min": self.imu_dt_valid_min,
+            "imu_dt_valid_max": self.imu_dt_valid_max,
+            "imu_dt_valid_mean": self.imu_dt_valid_mean,
+            "imu_dt_valid_median": self.imu_dt_valid_median,
+            "imu_dt_valid_std": self.imu_dt_valid_std,
+            "imu_dt_valid_nonpos": self.imu_dt_valid_nonpos,
+            "imu_dt_weighted_mean": self.imu_dt_weighted_mean,
+            "imu_dt_weighted_std": self.imu_dt_weighted_std,
+            "imu_dt_weighted_sum": self.imu_dt_weighted_sum,
+            "preint_r_vel": self.preint_r_vel.tolist(),
+            "preint_r_pos": self.preint_r_pos.tolist(),
+            "dyaw_gyro": self.dyaw_gyro,
+            "dyaw_odom": self.dyaw_odom,
+            "dyaw_wahba": self.dyaw_wahba,
         }
 
     @classmethod
@@ -170,6 +216,7 @@ class ScanDiagnostics:
             L_odom=np.array(d["L_odom"]) if d.get("L_odom") is not None else None,
             L_imu=np.array(d["L_imu"]) if d.get("L_imu") is not None else None,
             L_gyro=np.array(d["L_gyro"]) if d.get("L_gyro") is not None else None,
+            L_imu_preint=np.array(d["L_imu_preint"]) if d.get("L_imu_preint") is not None else None,
             logdet_L_total=d.get("logdet_L_total", 0.0),
             trace_L_total=d.get("trace_L_total", 0.0),
             L_dt=d.get("L_dt", 0.0),
@@ -198,6 +245,24 @@ class ScanDiagnostics:
             num_imu_samples=d.get("num_imu_samples", 0),
             accel_dir_dot_mu0=d.get("accel_dir_dot_mu0", 0.0),
             accel_mag_mean=d.get("accel_mag_mean", 0.0),
+            imu_a_body_mean=np.array(d.get("imu_a_body_mean", [0.0, 0.0, 0.0])),
+            imu_a_world_nog_mean=np.array(d.get("imu_a_world_nog_mean", [0.0, 0.0, 0.0])),
+            imu_a_world_mean=np.array(d.get("imu_a_world_mean", [0.0, 0.0, 0.0])),
+            imu_dt_eff_sum=d.get("imu_dt_eff_sum", 0.0),
+            imu_dt_valid_min=d.get("imu_dt_valid_min", 0.0),
+            imu_dt_valid_max=d.get("imu_dt_valid_max", 0.0),
+            imu_dt_valid_mean=d.get("imu_dt_valid_mean", 0.0),
+            imu_dt_valid_median=d.get("imu_dt_valid_median", 0.0),
+            imu_dt_valid_std=d.get("imu_dt_valid_std", 0.0),
+            imu_dt_valid_nonpos=d.get("imu_dt_valid_nonpos", 0),
+            imu_dt_weighted_mean=d.get("imu_dt_weighted_mean", 0.0),
+            imu_dt_weighted_std=d.get("imu_dt_weighted_std", 0.0),
+            imu_dt_weighted_sum=d.get("imu_dt_weighted_sum", 0.0),
+            preint_r_vel=np.array(d.get("preint_r_vel", [0.0, 0.0, 0.0])),
+            preint_r_pos=np.array(d.get("preint_r_pos", [0.0, 0.0, 0.0])),
+            dyaw_gyro=float(d.get("dyaw_gyro", 0.0)),
+            dyaw_odom=float(d.get("dyaw_odom", 0.0)),
+            dyaw_wahba=float(d.get("dyaw_wahba", 0.0)),
         )
 
 
@@ -308,6 +373,22 @@ class DiagnosticsLog:
             "conditioning_pose6": np.array([s.conditioning_pose6 for s in self.scans]),
             "accel_dir_dot_mu0": np.array([s.accel_dir_dot_mu0 for s in self.scans]),
             "accel_mag_mean": np.array([s.accel_mag_mean for s in self.scans]),
+            "imu_a_body_mean": np.stack([s.imu_a_body_mean for s in self.scans]),
+            "imu_a_world_nog_mean": np.stack([s.imu_a_world_nog_mean for s in self.scans]),
+            "imu_a_world_mean": np.stack([s.imu_a_world_mean for s in self.scans]),
+            "imu_dt_eff_sum": np.array([s.imu_dt_eff_sum for s in self.scans]),
+            "imu_dt_valid_min": np.array([s.imu_dt_valid_min for s in self.scans]),
+            "imu_dt_valid_max": np.array([s.imu_dt_valid_max for s in self.scans]),
+            "imu_dt_valid_mean": np.array([s.imu_dt_valid_mean for s in self.scans]),
+            "imu_dt_valid_median": np.array([s.imu_dt_valid_median for s in self.scans]),
+            "imu_dt_valid_std": np.array([s.imu_dt_valid_std for s in self.scans]),
+            "imu_dt_valid_nonpos": np.array([s.imu_dt_valid_nonpos for s in self.scans]),
+            "imu_dt_weighted_mean": np.array([s.imu_dt_weighted_mean for s in self.scans]),
+            "imu_dt_weighted_std": np.array([s.imu_dt_weighted_std for s in self.scans]),
+            "imu_dt_weighted_sum": np.array([s.imu_dt_weighted_sum for s in self.scans]),
+            "dyaw_gyro": np.array([s.dyaw_gyro for s in self.scans]),
+            "dyaw_odom": np.array([s.dyaw_odom for s in self.scans]),
+            "dyaw_wahba": np.array([s.dyaw_wahba for s in self.scans]),
         }
 
         # Optional individual evidence components
@@ -381,6 +462,22 @@ class DiagnosticsLog:
                 conditioning_pose6=float(data["conditioning_pose6"][i]) if "conditioning_pose6" in data else 1.0,
                 accel_dir_dot_mu0=float(data["accel_dir_dot_mu0"][i]) if "accel_dir_dot_mu0" in data else 0.0,
                 accel_mag_mean=float(data["accel_mag_mean"][i]) if "accel_mag_mean" in data else 0.0,
+                imu_a_body_mean=data["imu_a_body_mean"][i] if "imu_a_body_mean" in data else np.zeros((3,), dtype=np.float64),
+                imu_a_world_nog_mean=data["imu_a_world_nog_mean"][i] if "imu_a_world_nog_mean" in data else np.zeros((3,), dtype=np.float64),
+                imu_a_world_mean=data["imu_a_world_mean"][i] if "imu_a_world_mean" in data else np.zeros((3,), dtype=np.float64),
+                imu_dt_eff_sum=float(data["imu_dt_eff_sum"][i]) if "imu_dt_eff_sum" in data else 0.0,
+                imu_dt_valid_min=float(data["imu_dt_valid_min"][i]) if "imu_dt_valid_min" in data else 0.0,
+                imu_dt_valid_max=float(data["imu_dt_valid_max"][i]) if "imu_dt_valid_max" in data else 0.0,
+                imu_dt_valid_mean=float(data["imu_dt_valid_mean"][i]) if "imu_dt_valid_mean" in data else 0.0,
+                imu_dt_valid_median=float(data["imu_dt_valid_median"][i]) if "imu_dt_valid_median" in data else 0.0,
+                imu_dt_valid_std=float(data["imu_dt_valid_std"][i]) if "imu_dt_valid_std" in data else 0.0,
+                imu_dt_valid_nonpos=int(data["imu_dt_valid_nonpos"][i]) if "imu_dt_valid_nonpos" in data else 0,
+                imu_dt_weighted_mean=float(data["imu_dt_weighted_mean"][i]) if "imu_dt_weighted_mean" in data else 0.0,
+                imu_dt_weighted_std=float(data["imu_dt_weighted_std"][i]) if "imu_dt_weighted_std" in data else 0.0,
+                imu_dt_weighted_sum=float(data["imu_dt_weighted_sum"][i]) if "imu_dt_weighted_sum" in data else 0.0,
+                dyaw_gyro=float(data["dyaw_gyro"][i]) if "dyaw_gyro" in data else 0.0,
+                dyaw_odom=float(data["dyaw_odom"][i]) if "dyaw_odom" in data else 0.0,
+                dyaw_wahba=float(data["dyaw_wahba"][i]) if "dyaw_wahba" in data else 0.0,
             )
             log.scans.append(diag)
 

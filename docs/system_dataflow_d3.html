@@ -162,8 +162,8 @@
     <div class="header">
         <h1>Golden Child SLAM v2 — System Dataflow</h1>
         <div class="header-info">
-            <span>14 Pipeline Steps</span>
-            <span>8 Hypotheses</span>
+            <span>15 Pipeline Steps</span>
+            <span>4 Hypotheses</span>
             <span>M3DGR Dynamic01</span>
         </div>
     </div>
@@ -284,7 +284,7 @@
             { id: "BAG_IMU", label: "/livox/mid360/imu", sub: "200 Hz", x: 550, y: 40, w: 150, h: 45, type: "active" },
             { id: "IMU_NORM", label: "imu_normalizer", sub: "→ livox_frame", x: 550, y: 110, w: 150, h: 55, type: "active" },
             { id: "CAN_IMU", label: "/gc/sensors/imu", sub: "Imu", x: 550, y: 190, w: 150, h: 45, type: "active" },
-            { id: "IMU_BUF", label: "IMU Buffer", sub: "200 msgs", x: 847, y: 177, w: 130, h: 65, type: "buffer" },
+            { id: "IMU_BUF", label: "IMU Buffer", sub: "4000 msgs", x: 847, y: 177, w: 130, h: 65, type: "buffer" },
             
             // Evidence from IMU
             { id: "S09B", label: "S09b: ImuVMFGravity", sub: "vMF S²", x: 332, y: 577, w: 170, h: 55, type: "approx" },
@@ -298,10 +298,10 @@
             { id: "S14", label: "S14: AnchorDrift", sub: "Anchor maint", x: 387, y: 791, w: 150, h: 55, type: "exact" },
             
             // === HYPOTHESIS ===
-            { id: "S15", label: "S15: HypothesisBarycenter", sub: "8 Hyp → 1 Belief", x: 765, y: 791, w: 200, h: 55, type: "hypothesis" },
+            { id: "S15", label: "S15: HypothesisBarycenter", sub: "4 Hyp → 1 Belief", x: 765, y: 791, w: 200, h: 55, type: "hypothesis" },
             
             // === STATE STORAGE ===
-            { id: "ST_BELIEF", label: "BeliefGaussianInfo", sub: "22D × 8 Hyp", x: 804, y: 981, w: 170, h: 60, type: "state" },
+            { id: "ST_BELIEF", label: "BeliefGaussianInfo", sub: "22D × 4 Hyp", x: 804, y: 981, w: 170, h: 60, type: "state" },
             { id: "ST_MAP", label: "MapBinStats", sub: "48 bins", x: 638, y: 992, w: 150, h: 60, type: "state" },
             { id: "ST_PROC", label: "ProcessNoiseIW", sub: "Q 22×22", x: 116, y: 981, w: 150, h: 60, type: "state_dim" },
             { id: "ST_MEAS", label: "MeasNoiseIW", sub: "Σg, Σa", x: 306, y: 976, w: 150, h: 60, type: "state_dim" },

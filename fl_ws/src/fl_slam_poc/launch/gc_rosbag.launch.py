@@ -72,6 +72,24 @@ def generate_launch_description():
         description="Path to export per-scan diagnostics for dashboard.",
     )
 
+    imu_gravity_scale_arg = DeclareLaunchArgument(
+        "imu_gravity_scale",
+        default_value="1.0",
+        description="Scale gravity used by IMU evidence/noise updates (1.0 nominal).",
+    )
+
+    imu_preint_gravity_scale_arg = DeclareLaunchArgument(
+        "imu_preintegration_gravity_scale",
+        default_value="1.0",
+        description="Scale gravity used inside IMU preintegration (1.0 nominal; 0.0 disables for ablation).",
+    )
+
+    deskew_rotation_only_arg = DeclareLaunchArgument(
+        "deskew_rotation_only",
+        default_value="false",
+        description="Use rotation-only deskew (removes hidden IMU translation leak).",
+    )
+
     # =========================================================================
     # Sensor Hub (single process)
     # =========================================================================
@@ -140,6 +158,9 @@ def generate_launch_description():
                 "T_base_imu": [0.0, 0.0, 0.0, -0.015586, 0.489293, 0.0],
                 "status_check_period_sec": 5.0,
                 "forgetting_factor": 0.99,
+                "imu_gravity_scale": LaunchConfiguration("imu_gravity_scale"),
+                "imu_preintegration_gravity_scale": LaunchConfiguration("imu_preintegration_gravity_scale"),
+                "deskew_rotation_only": LaunchConfiguration("deskew_rotation_only"),
             }
         ],
     )
@@ -169,6 +190,9 @@ def generate_launch_description():
         livox_input_msg_type_arg,
         wiring_summary_path_arg,
         diagnostics_path_arg,
+        imu_gravity_scale_arg,
+        imu_preint_gravity_scale_arg,
+        deskew_rotation_only_arg,
         # Sensor Hub (single process)
         gc_sensor_hub,
         # Audit / observability

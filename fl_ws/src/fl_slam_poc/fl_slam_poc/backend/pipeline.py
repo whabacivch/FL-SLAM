@@ -64,6 +64,7 @@ from fl_slam_poc.backend.operators.measurement_noise_iw_jax import (
 from fl_slam_poc.backend.operators.odom_evidence import odom_quadratic_evidence
 from fl_slam_poc.backend.operators.imu_evidence import imu_vmf_gravity_evidence
 from fl_slam_poc.backend.operators.imu_gyro_evidence import imu_gyro_rotation_evidence
+from fl_slam_poc.backend.operators.imu_preintegration_factor import imu_preintegration_factor
 from fl_slam_poc.backend.operators.lidar_evidence import (
     lidar_quadratic_evidence,
     MapBinStats as LidarMapBinStats,
@@ -130,6 +131,16 @@ class PipelineConfig:
     Sigma_meas: jnp.ndarray = None
     Sigma_g: jnp.ndarray = None  # (3,3) gyro covariance proxy (from measurement IW)
     Sigma_a: jnp.ndarray = None  # (3,3) accel covariance proxy (from measurement IW)
+
+    # IMU gravity scaling (1.0 = nominal; 0.0 disables gravity contribution)
+    imu_gravity_scale: float = 1.0
+    # IMU preintegration-only gravity scaling (1.0 = nominal; 0.0 disables in preintegration)
+    imu_preintegration_gravity_scale: float = 0.0
+
+    # Deskew translation control: if True, zero out translation in deskew twist (rotation-only).
+    # This removes the hidden IMU translation leak through deskew → LiDAR evidence.
+    # Use for A/B testing; proper fix is Gaussian twist marginalization.
+    deskew_rotation_only: bool = False
 
     # No-TF extrinsics: LiDAR origin expressed in base frame. Used to compute
     # ray directions from the sensor origin (not the base origin).
@@ -356,10 +367,13 @@ def process_scan_single_hypothesis(
 
     pose0 = belief_prev.mean_world_pose(eps_lift=config.eps_lift)
     rotvec0 = pose0[3:6]
-    gravity_W = jnp.array(constants.GC_GRAVITY_W, dtype=jnp.float64)
+    gravity_W = jnp.array(constants.GC_GRAVITY_W, dtype=jnp.float64) * float(config.imu_gravity_scale)
+    gravity_W_preint = jnp.array(constants.GC_GRAVITY_W, dtype=jnp.float64) * float(
+        config.imu_preintegration_gravity_scale
+    )
 
     # Preintegration for deskew (within-scan).
-    delta_pose_scan, _R_end_scan, _p_end_scan, ess_imu_scan = preintegrate_imu_relative_pose_jax(
+    delta_pose_scan, _R_end_scan, _p_end_scan, _v_end_scan, ess_imu_scan, _, _, _, _ = preintegrate_imu_relative_pose_jax(
         imu_stamps=imu_stamps,
         imu_gyro=imu_gyro,
         imu_accel=imu_accel,
@@ -367,9 +381,14 @@ def process_scan_single_hypothesis(
         rotvec_start_WB=rotvec0,
         gyro_bias=gyro_bias,
         accel_bias=accel_bias,
-        gravity_W=gravity_W,
+        gravity_W=gravity_W_preint,
     )
     xi_body = se3_jax.se3_log(delta_pose_scan)  # (6,) twist over scan (used for deskew)
+    # Rotation-only deskew: zero out translation component [rho, phi] -> [0, phi]
+    # This removes the hidden IMU translation leak through deskew → LiDAR evidence.
+    # Branch-free: uses continuous scaling (0.0 vs 1.0) instead of if-statement.
+    trans_scale = jnp.where(config.deskew_rotation_only, 0.0, 1.0)
+    xi_body = xi_body.at[:3].set(xi_body[:3] * trans_scale)
 
     # =====================================================================
     # IMU INTEGRATION TIME: dt_int = Σ_i Δt_i over (t_last_scan, t_scan)
@@ -384,7 +403,17 @@ def process_scan_single_hypothesis(
     )
 
     # Preintegration for scan-to-scan interval (used for gyro evidence + IMU noise updates).
-    delta_pose_int, _R_end_int, _p_end_int, ess_imu_int = preintegrate_imu_relative_pose_jax(
+    (
+        delta_pose_int,
+        _R_end_int,
+        delta_p_int,
+        delta_v_int,
+        ess_imu_int,
+        imu_a_body_mean,
+        imu_a_world_nog_mean,
+        imu_a_world_mean,
+        imu_dt_eff_sum,
+    ) = preintegrate_imu_relative_pose_jax(
         imu_stamps=imu_stamps,
         imu_gyro=imu_gyro,
         imu_accel=imu_accel,
@@ -392,7 +421,7 @@ def process_scan_single_hypothesis(
         rotvec_start_WB=rotvec0,
         gyro_bias=gyro_bias,
         accel_bias=accel_bias,
-        gravity_W=gravity_W,
+        gravity_W=gravity_W_preint,
     )
     
     # IMU measurement-noise IW sufficient stats (Σg, Σa) from commutative residuals
@@ -402,6 +431,41 @@ def process_scan_single_hypothesis(
     imu_stamps_np = np.asarray(imu_stamps, dtype=np.float64).reshape(-1)
     valid_mask_np = imu_stamps_np > 0.0
     n_valid = int(np.sum(valid_mask_np))
+    if n_valid >= 2:
+        valid_stamps_raw = imu_stamps_np[valid_mask_np]
+        dt_valid = np.diff(valid_stamps_raw)
+        imu_dt_valid_min = float(np.min(dt_valid))
+        imu_dt_valid_max = float(np.max(dt_valid))
+        imu_dt_valid_mean = float(np.mean(dt_valid))
+        imu_dt_valid_median = float(np.median(dt_valid))
+        imu_dt_valid_std = float(np.std(dt_valid, ddof=1)) if dt_valid.size > 1 else 0.0
+        imu_dt_valid_nonpos = int(np.sum(dt_valid <= 0.0))
+    else:
+        imu_dt_valid_min = 0.0
+        imu_dt_valid_max = 0.0
+        imu_dt_valid_mean = 0.0
+        imu_dt_valid_median = 0.0
+        imu_dt_valid_std = 0.0
+        imu_dt_valid_nonpos = 0
+
+    dt_full = np.concatenate([imu_stamps_np[1:] - imu_stamps_np[:-1], np.zeros((1,), dtype=np.float64)], axis=0)
+    dt_full = np.maximum(dt_full, 0.0)
+    w_imu_int_np = np.asarray(w_imu_int, dtype=np.float64).reshape(-1)
+    w_floor = float(constants.GC_WEIGHT_FLOOR)
+    denom = max(1.0 - w_floor, 1e-12)
+    w_raw = (w_imu_int_np - w_floor) / denom
+    w_raw = np.maximum(w_raw, 0.0)
+    w_raw = w_raw * valid_mask_np.astype(np.float64)
+    w_sum = float(np.sum(w_raw))
+    if w_sum > 0.0:
+        imu_dt_weighted_mean = float(np.sum(w_raw * dt_full) / w_sum)
+        imu_dt_weighted_std = float(np.sqrt(np.sum(w_raw * (dt_full - imu_dt_weighted_mean) ** 2) / w_sum))
+        imu_dt_weighted_sum = float(np.sum(w_raw * dt_full))
+    else:
+        imu_dt_weighted_mean = 0.0
+        imu_dt_weighted_std = 0.0
+        imu_dt_weighted_sum = 0.0
+
     if n_valid >= 2:
         valid = np.sort(imu_stamps_np[valid_mask_np])
         dt_imu = float((valid[-1] - valid[0]) / max(n_valid - 1, 1))
@@ -642,6 +706,89 @@ def process_scan_single_hypothesis(
     )
     all_certs.append(gyro_cert)
 
+    # =====================================================================
+    # INVARIANT TEST: Compare yaw increments from three sources
+    # =====================================================================
+    # This diagnostic compares the yaw direction from three sources:
+    # 1. Gyro-integrated: R_start @ Exp(delta_rotvec_meas)
+    # 2. Odom: odom_pose rotation
+    # 3. Wahba (LiDAR): R_hat
+    # If they have opposite signs, we have a sign convention mismatch.
+    R_start_mat = se3_jax.so3_exp(rotvec0)
+    R_delta_gyro = se3_jax.so3_exp(delta_pose_int[3:6])
+    R_gyro_end = R_start_mat @ R_delta_gyro  # Gyro-predicted end orientation
+
+    # Extract yaw (rotation about Z) using atan2
+    def _yaw_from_R(R):
+        return float(jnp.arctan2(R[1, 0], R[0, 0]))
+
+    yaw_start = np.degrees(_yaw_from_R(R_start_mat))
+    yaw_gyro = np.degrees(_yaw_from_R(R_gyro_end))
+    yaw_wahba = np.degrees(_yaw_from_R(R_hat))
+    
+    # Compute odom yaw (need to convert odom_pose rotation to matrix)
+    R_odom_mat = se3_jax.so3_exp(odom_pose[3:6])
+    yaw_odom = np.degrees(_yaw_from_R(R_odom_mat))
+    
+    # Compute yaw increments (handle wraparound)
+    dyaw_gyro = yaw_gyro - yaw_start
+    dyaw_odom = yaw_odom - yaw_start
+    dyaw_wahba = yaw_wahba - yaw_start
+    
+    # Normalize to [-180, 180]
+    def normalize_angle(angle):
+        while angle > 180:
+            angle -= 360
+        while angle < -180:
+            angle += 360
+        return angle
+    
+    dyaw_gyro = normalize_angle(dyaw_gyro)
+    dyaw_odom = normalize_angle(dyaw_odom)
+    dyaw_wahba = normalize_angle(dyaw_wahba)
+
+    # Log only first 10 scans for brevity
+    if hasattr(config, '_scan_count'):
+        config._scan_count += 1
+    else:
+        config._scan_count = 1
+    if config._scan_count <= 10:
+        sign_match_gyro_wahba = 'YES' if dyaw_gyro * dyaw_wahba > 0 else 'NO'
+        sign_match_gyro_odom = 'YES' if dyaw_gyro * dyaw_odom > 0 else 'NO'
+        sign_match_odom_wahba = 'YES' if dyaw_odom * dyaw_wahba > 0 else 'NO'
+        print(f"[INVARIANT] Scan {config._scan_count}: "
+              f"yaw_start={yaw_start:+7.2f}°, "
+              f"Δyaw_gyro={dyaw_gyro:+7.2f}°, "
+              f"Δyaw_odom={dyaw_odom:+7.2f}°, "
+              f"Δyaw_wahba={dyaw_wahba:+7.2f}°, "
+              f"gyro↔wahba={sign_match_gyro_wahba}, "
+              f"gyro↔odom={sign_match_gyro_odom}, "
+              f"odom↔wahba={sign_match_odom_wahba}")
+
+    # IMU preintegration factor for velocity and position evidence
+    # Get velocities from state (indices 6:9)
+    mu_prev = belief_prev.mean_increment(eps_lift=config.eps_lift)
+    v_start_world = mu_prev[6:9]  # Previous velocity in world frame
+    v_pred_world = mu_inc[6:9]    # Predicted velocity in world frame (mu_inc already computed above)
+    Sigma_a = jnp.asarray(config.Sigma_a, dtype=jnp.float64)
+
+    preint_result, preint_cert, preint_effect = imu_preintegration_factor(
+        p_start_world=pose0[0:3],
+        rotvec_start_WB=rotvec0,
+        v_start_world=v_start_world,
+        p_end_pred_world=pose_pred[0:3],
+        v_end_pred_world=v_pred_world,
+        delta_v_body=delta_v_int,
+        delta_p_body=delta_p_int,
+        Sigma_a=Sigma_a,
+        dt_int=dt_int,
+        eps_psd=config.eps_psd,
+        eps_lift=config.eps_lift,
+        chart_id=belief_pred.chart_id,
+        anchor_id=belief_pred.anchor_id,
+    )
+    all_certs.append(preint_cert)
+
     evidence_result, evidence_cert, evidence_effect = lidar_quadratic_evidence(
         belief_pred=belief_pred,
         scan_bins=scan_bins,
@@ -657,12 +804,15 @@ def process_scan_single_hypothesis(
     all_certs.append(evidence_cert)
 
     # Combine evidence terms additively before fusion scaling
-    L_evidence = evidence_result.L_lidar + odom_result.L_odom + imu_result.L_imu + gyro_result.L_gyro
-    h_evidence = evidence_result.h_lidar + odom_result.h_odom + imu_result.h_imu + gyro_result.h_gyro
+    L_evidence = (evidence_result.L_lidar + odom_result.L_odom + imu_result.L_imu +
+                  gyro_result.L_gyro + preint_result.L_imu_preint)
+    h_evidence = (evidence_result.h_lidar + odom_result.h_odom + imu_result.h_imu +
+                  gyro_result.h_gyro + preint_result.h_imu_preint)
 
     # Diagnostic: check which evidence component has NaN
     for name, L in [("L_lidar", evidence_result.L_lidar), ("L_odom", odom_result.L_odom),
-                    ("L_imu", imu_result.L_imu), ("L_gyro", gyro_result.L_gyro)]:
+                    ("L_imu", imu_result.L_imu), ("L_gyro", gyro_result.L_gyro),
+                    ("L_imu_preint", preint_result.L_imu_preint)]:
         L_np = np.array(L)
         if not np.all(np.isfinite(L_np)):
             nan_pos = np.argwhere(~np.isfinite(L_np))[:5]
@@ -981,6 +1131,7 @@ def process_scan_single_hypothesis(
         L_odom=np.array(odom_result.L_odom),
         L_imu=np.array(imu_result.L_imu),
         L_gyro=np.array(gyro_result.L_gyro),
+        L_imu_preint=np.array(preint_result.L_imu_preint),
         logdet_L_total=logdet_L,
         trace_L_total=trace_L,
         L_dt=L_dt_val,
@@ -998,10 +1149,28 @@ def process_scan_single_hypothesis(
         rot_err_odom_deg_post=rot_err_odom_deg_post,
         accel_dir_dot_mu0=accel_dir_dot_mu0,
         accel_mag_mean=accel_mag_mean,
+        imu_a_body_mean=np.array(imu_a_body_mean),
+        imu_a_world_nog_mean=np.array(imu_a_world_nog_mean),
+        imu_a_world_mean=np.array(imu_a_world_mean),
+        imu_dt_eff_sum=float(imu_dt_eff_sum),
+        imu_dt_valid_min=imu_dt_valid_min,
+        imu_dt_valid_max=imu_dt_valid_max,
+        imu_dt_valid_mean=imu_dt_valid_mean,
+        imu_dt_valid_median=imu_dt_valid_median,
+        imu_dt_valid_std=imu_dt_valid_std,
+        imu_dt_valid_nonpos=imu_dt_valid_nonpos,
+        imu_dt_weighted_mean=imu_dt_weighted_mean,
+        imu_dt_weighted_std=imu_dt_weighted_std,
+        imu_dt_weighted_sum=imu_dt_weighted_sum,
         fusion_alpha=float(alpha),
         total_trigger_magnitude=total_trigger_mag,
         conditioning_number=cond_number,
         conditioning_pose6=float(cond_pose6),
+        preint_r_vel=np.array(preint_result.r_vel),
+        preint_r_pos=np.array(preint_result.r_pos),
+        dyaw_gyro=float(dyaw_gyro),
+        dyaw_odom=float(dyaw_odom),
+        dyaw_wahba=float(dyaw_wahba),
     )
 
     return ScanPipelineResult(
@@ -1086,6 +1255,8 @@ class RuntimeManifest:
     c_dt: float = constants.GC_C_DT
     c_ex: float = constants.GC_C_EX
     c_frob: float = constants.GC_C_FROB
+    imu_gravity_scale: float = 1.0
+    imu_preintegration_gravity_scale: float = 0.0
 
     # Explicit backend/operator selections (single-path; no fallback).
     # This is required for auditability of the "no multipaths" invariant.
@@ -1139,5 +1310,7 @@ class RuntimeManifest:
             "c_dt": self.c_dt,
             "c_ex": self.c_ex,
             "c_frob": self.c_frob,
+            "imu_gravity_scale": self.imu_gravity_scale,
+            "imu_preintegration_gravity_scale": self.imu_preintegration_gravity_scale,
             "backends": dict(self.backends),
         }
