@@ -10,9 +10,8 @@ export PROJECT_ROOT
 cd "$PROJECT_ROOT"
 
 # ============================================================================
-# CONFIGURATION
+# CONFIGURATION (single IMU gravity scale for evidence + preintegration)
 IMU_GRAVITY_SCALE="${IMU_GRAVITY_SCALE:-1.0}"
-IMU_PREINT_GRAV_SCALE="${IMU_PREINT_GRAV_SCALE:-1.0}"
 DESKEW_ROTATION_ONLY="${DESKEW_ROTATION_ONLY:-false}"
 
 # ============================================================================
@@ -222,7 +221,6 @@ ros2 launch fl_slam_poc gc_rosbag.launch.py \
   wiring_summary_path:="$WIRING_SUMMARY" \
   diagnostics_export_path:="$DIAGNOSTICS_FILE" \
   imu_gravity_scale:="$IMU_GRAVITY_SCALE" \
-  imu_preintegration_gravity_scale:="$IMU_PREINT_GRAV_SCALE" \
   deskew_rotation_only:="$DESKEW_ROTATION_ONLY" \
   > "$LOG_FILE" 2>&1 &
 LAUNCH_PID=$!
@@ -386,12 +384,14 @@ print_stage 4 5 "Results Summary"
 
 echo ""
 if [ -f "$RESULTS_DIR/metrics.txt" ]; then
-    # Extract key metrics
-    ATE=$(grep "ATE RMSE" "$RESULTS_DIR/metrics.txt" | head -1 | awk '{print $NF}')
-    RPE=$(grep "RPE.*@ 1m" "$RESULTS_DIR/metrics.txt" | head -1 | awk '{print $NF}')
+    # Extract key metrics from SUMMARY (parsable) section
+    ATE_TRANS=$(grep "ATE translation RMSE" "$RESULTS_DIR/metrics.txt" | head -1 | awk '{print $NF}')
+    ATE_ROT=$(grep "ATE rotation RMSE" "$RESULTS_DIR/metrics.txt" | head -1 | awk '{print $NF}')
+    RPE_1M=$(grep "RPE translation @ 1m" "$RESULTS_DIR/metrics.txt" | head -1 | awk '{print $NF}')
     
-    echo -e "  ${BOLD}ATE RMSE:${NC}  ${CYAN}$ATE${NC}"
-    echo -e "  ${BOLD}RPE @ 1m:${NC}  ${CYAN}$RPE${NC}"
+    echo -e "  ${BOLD}ATE translation RMSE (m):${NC}   ${CYAN}${ATE_TRANS:-N/A}${NC}"
+    echo -e "  ${BOLD}ATE rotation RMSE (deg):${NC}   ${CYAN}${ATE_ROT:-N/A}${NC}"
+    echo -e "  ${BOLD}RPE translation @ 1m (m/m):${NC} ${CYAN}${RPE_1M:-N/A}${NC}"
 fi
 
 # Display wiring summary if available

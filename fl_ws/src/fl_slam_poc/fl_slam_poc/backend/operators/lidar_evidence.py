@@ -44,7 +44,8 @@ from fl_slam_poc.common.geometry import se3_jax
 @dataclass
 class MapBinStats:
     """Map bin sufficient statistics."""
-    S_dir: jnp.ndarray  # (B_BINS, 3) directional resultants
+    S_dir: jnp.ndarray  # (B_BINS, 3) directional resultants Σ w u
+    S_dir_scatter: jnp.ndarray  # (B_BINS, 3, 3) directional scatter Σ w u u^T
     N_dir: jnp.ndarray  # (B_BINS,) directional mass
     N_pos: jnp.ndarray  # (B_BINS,) position mass
     sum_p: jnp.ndarray  # (B_BINS, 3) position sums

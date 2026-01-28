@@ -75,13 +75,7 @@ def generate_launch_description():
     imu_gravity_scale_arg = DeclareLaunchArgument(
         "imu_gravity_scale",
         default_value="1.0",
-        description="Scale gravity used by IMU evidence/noise updates (1.0 nominal).",
-    )
-
-    imu_preint_gravity_scale_arg = DeclareLaunchArgument(
-        "imu_preintegration_gravity_scale",
-        default_value="1.0",
-        description="Scale gravity used inside IMU preintegration (1.0 nominal; 0.0 disables for ablation).",
+        description="Scale gravity for IMU evidence and preintegration (1.0 = correct cancellation; 0.0 = ablation).",
     )
 
     deskew_rotation_only_arg = DeclareLaunchArgument(
@@ -159,7 +153,6 @@ def generate_launch_description():
                 "status_check_period_sec": 5.0,
                 "forgetting_factor": 0.99,
                 "imu_gravity_scale": LaunchConfiguration("imu_gravity_scale"),
-                "imu_preintegration_gravity_scale": LaunchConfiguration("imu_preintegration_gravity_scale"),
                 "deskew_rotation_only": LaunchConfiguration("deskew_rotation_only"),
             }
         ],
@@ -191,7 +184,6 @@ def generate_launch_description():
         wiring_summary_path_arg,
         diagnostics_path_arg,
         imu_gravity_scale_arg,
-        imu_preint_gravity_scale_arg,
         deskew_rotation_only_arg,
         # Sensor Hub (single process)
         gc_sensor_hub,

@@ -37,6 +37,7 @@ class MapUpdateResult:
     """Result of PoseCovInflationPushforward operator."""
     # Increments to add to map sufficient statistics
     delta_S_dir: jnp.ndarray  # (B_BINS, 3)
+    delta_S_dir_scatter: jnp.ndarray  # (B_BINS, 3, 3) directional scatter Σ w u u^T
     delta_N_dir: jnp.ndarray  # (B_BINS,)
     delta_N_pos: jnp.ndarray  # (B_BINS,)
     delta_sum_p: jnp.ndarray  # (B_BINS, 3)
@@ -62,6 +63,7 @@ def _skew_matrix(v: jnp.ndarray) -> jnp.ndarray:
 def _map_update_core(
     scan_N: jnp.ndarray,
     scan_s_dir: jnp.ndarray,
+    scan_S_dir_scatter: jnp.ndarray,
     scan_p_bar: jnp.ndarray,
     scan_Sigma_p: jnp.ndarray,
     R_hat: jnp.ndarray,
@@ -69,13 +71,14 @@ def _map_update_core(
     Sigma_rot: jnp.ndarray,
     Sigma_trans: jnp.ndarray,
     eps_psd: float,
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
     Vectorized core computation for map update (JIT-compiled).
 
     Args:
         scan_N: Bin masses (B,)
         scan_s_dir: Direction resultants (B, 3)
+        scan_S_dir_scatter: Directional scatter tensors (B, 3, 3)
         scan_p_bar: Centroids (B, 3)
         scan_Sigma_p: Centroid covariances (B, 3, 3)
         R_hat: Estimated rotation (3, 3)
@@ -86,6 +89,7 @@ def _map_update_core(
 
     Returns:
         delta_S_dir: (B, 3)
+        delta_S_dir_scatter: (B, 3, 3)
         delta_N_dir: (B,)
         delta_N_pos: (B,)
         delta_sum_p: (B, 3)
@@ -96,10 +100,20 @@ def _map_update_core(
     # Transform centroids to map frame: p_map = R @ p_bar + t
     # scan_p_bar: (B, 3), R_hat: (3, 3)
     p_rotated = jnp.einsum("ij,bj->bi", R_hat, scan_p_bar)  # (B, 3)
-    p_map = p_rotated + t_hat[None, :]  # (B, 3)
+
+    # PLANAR FIX: Zero out t_hat[2] before map update.
+    # This prevents the belief's z coordinate from being placed into the map,
+    # breaking the z feedback loop that causes drift to -50 to -80m.
+    # The map stays in the z=0 plane, while the belief's z is constrained
+    # by the planar prior (z ≈ z_ref).
+    t_hat_planar = t_hat.at[2].set(0.0)
+    p_map = p_rotated + t_hat_planar[None, :]  # (B, 3)
 
     # Transform directions to map frame: s_dir_map = R @ s_dir
     s_dir_map = jnp.einsum("ij,bj->bi", R_hat, scan_s_dir)  # (B, 3)
+
+    # Transform directional scatter tensors: S_scatter_map = R @ S_scatter @ R^T
+    S_dir_scatter_map = jnp.einsum("ij,bjk,lk->bil", R_hat, scan_S_dir_scatter, R_hat)  # (B, 3, 3)
 
     # Transform measurement covariances: R @ Sigma_p @ R^T
     # scan_Sigma_p: (B, 3, 3)
@@ -145,13 +159,14 @@ def _map_update_core(
     delta_N_dir = scan_N  # (B,)
     delta_N_pos = scan_N  # (B,)
     delta_S_dir = s_dir_map  # (B, 3)
+    delta_S_dir_scatter = S_dir_scatter_map  # (B, 3, 3)
     delta_sum_p = scan_N[:, None] * p_map  # (B, 3)
 
     # For scatter: sum_ppT increment = N * (Sigma + p @ p^T)
     p_outer = jnp.einsum("bi,bj->bij", p_map, p_map)  # (B, 3, 3)
     delta_sum_ppT = scan_N[:, None, None] * (Sigma_map + p_outer)  # (B, 3, 3)
 
-    return delta_S_dir, delta_N_dir, delta_N_pos, delta_sum_p, delta_sum_ppT, total_inflation, total_psd_projection_delta
+    return delta_S_dir, delta_S_dir_scatter, delta_N_dir, delta_N_pos, delta_sum_p, delta_sum_ppT, total_inflation, total_psd_projection_delta
 
 
 # =============================================================================
@@ -163,6 +178,7 @@ def pos_cov_inflation_pushforward(
     belief_post: BeliefGaussianInfo,
     scan_N: jnp.ndarray,
     scan_s_dir: jnp.ndarray,
+    scan_S_dir_scatter: jnp.ndarray,
     scan_p_bar: jnp.ndarray,
     scan_Sigma_p: jnp.ndarray,
     R_hat: jnp.ndarray,
@@ -182,6 +198,7 @@ def pos_cov_inflation_pushforward(
         belief_post: Posterior belief
         scan_N: Scan bin masses (B,)
         scan_s_dir: Scan direction resultants (B, 3)
+        scan_S_dir_scatter: Scan directional scatter tensors (B, 3, 3)
         scan_p_bar: Scan centroids (B, 3)
         scan_Sigma_p: Scan centroid covariances (B, 3, 3)
         R_hat: Estimated rotation (3, 3)
@@ -196,6 +213,7 @@ def pos_cov_inflation_pushforward(
     """
     scan_N = jnp.asarray(scan_N, dtype=jnp.float64)
     scan_s_dir = jnp.asarray(scan_s_dir, dtype=jnp.float64)
+    scan_S_dir_scatter = jnp.asarray(scan_S_dir_scatter, dtype=jnp.float64)
     scan_p_bar = jnp.asarray(scan_p_bar, dtype=jnp.float64)
     scan_Sigma_p = jnp.asarray(scan_Sigma_p, dtype=jnp.float64)
     R_hat = jnp.asarray(R_hat, dtype=jnp.float64)
@@ -216,10 +234,11 @@ def pos_cov_inflation_pushforward(
     Sigma_rot = Sigma_pose[3:6, 3:6]  # Rotation covariance
 
     # Call vectorized core
-    delta_S_dir, delta_N_dir, delta_N_pos, delta_sum_p, delta_sum_ppT, total_inflation, total_psd_projection_delta = (
+    delta_S_dir, delta_S_dir_scatter, delta_N_dir, delta_N_pos, delta_sum_p, delta_sum_ppT, total_inflation, total_psd_projection_delta = (
         _map_update_core(
             scan_N,
             scan_s_dir,
+            scan_S_dir_scatter,
             scan_p_bar,
             scan_Sigma_p,
             R_hat,
@@ -233,6 +252,7 @@ def pos_cov_inflation_pushforward(
     # Build result
     result = MapUpdateResult(
         delta_S_dir=delta_S_dir,
+        delta_S_dir_scatter=delta_S_dir_scatter,
         delta_N_dir=delta_N_dir,
         delta_N_pos=delta_N_pos,
         delta_sum_p=delta_sum_p,

@@ -63,7 +63,9 @@ from fl_slam_poc.backend.operators.odom_evidence import (
 
 from fl_slam_poc.backend.operators.imu_evidence import (
     imu_vmf_gravity_evidence,
+    imu_vmf_gravity_evidence_time_resolved,
     ImuEvidenceResult,
+    TimeResolvedImuResult,
 )
 
 from fl_slam_poc.backend.operators.fusion import (
@@ -128,7 +130,9 @@ __all__ = [
     "OdomEvidenceResult",
     # IMU evidence
     "imu_vmf_gravity_evidence",
+    "imu_vmf_gravity_evidence_time_resolved",
     "ImuEvidenceResult",
+    "TimeResolvedImuResult",
     # Fusion
     "fusion_scale_from_certificates",
     "info_fusion_additive",

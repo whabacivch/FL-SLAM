@@ -59,6 +59,9 @@ rosbags/**
 # User-specific RViz configs
 config/*.rviz
 
+# Code Graph RAG MCP (per-repo SQLite DB)
+.code-graph-rag/
+
 # Temporary files
 *.tmp
 *.bak

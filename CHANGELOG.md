@@ -4,6 +4,139 @@ Project: Frobenius-Legendre SLAM POC (Impact Project_v1)
 
 This file tracks all significant changes, design decisions, and implementation milestones for the FL-SLAM project.
 
+## 2026-01-28: SLAM Pipeline Upgrade - Planar Constraints and Odom Twist
+
+### Summary
+
+Major pipeline upgrade implementing Phase 1 (planar z fix) and Phase 2 (odom twist factors) from the SLAM upgrade plan. These changes address z drift and add kinematic coupling from wheel odometry.
+
+### New Operators (No Gates, Principled Math)
+
+1. **`planar_prior.py`** - Soft constraints for ground-hugging robots:
+   - `planar_z_prior()`: Soft constraint z ≈ z_ref with variance σ_z². Injects L[2,2] = 1/σ_z² to pull z toward reference height.
+   - `velocity_z_prior()`: Soft constraint vel_z ≈ 0 with variance σ_vz². Injects L[8,8] = 1/σ_vz² to prevent vertical velocity drift.
+
+2. **`odom_twist_evidence.py`** - Kinematic constraints from wheel odometry twist:
+   - `odom_velocity_evidence()`: Compares predicted velocity (body frame) with odometry velocity. Writes to L[6:9, 6:9].
+   - `odom_yawrate_evidence()`: Compares predicted yaw rate with odometry angular.z. Writes to L[5,5].
+
+### Constants Added (`constants.py`)
+
+```python
+GC_PLANAR_Z_REF = 0.86       # M3DGR reference height (meters)
+GC_PLANAR_Z_SIGMA = 0.1      # Soft z constraint std dev (meters)
+GC_PLANAR_VZ_SIGMA = 0.01    # Soft vel_z=0 constraint std dev (m/s)
+GC_PROCESS_Z_DIFFUSION = 1e-8 # Reduced z diffusion
+GC_ODOM_TWIST_VEL_SIGMA = 0.1 # Velocity std dev (m/s)
+GC_ODOM_TWIST_WZ_SIGMA = 0.01 # Yaw rate std dev (rad/s)
+```
+
+### Map Update Z Fix (`map_update.py`)
+
+- Set `t_hat[2] = 0` before map update to prevent belief z from being placed into map
+- Breaks the z feedback loop: map stays in z=0 plane, belief z constrained by planar prior
+
+### Backend Node Changes (`backend_node.py`)
+
+- Read odom twist from `msg.twist.twist` and store in `last_odom_twist` (6D) and `last_odom_twist_cov` (6x6)
+- Initialize odom twist to zeros with huge covariance (1e12) - by construction, not by gate
+- Pass odom_twist and odom_twist_cov to pipeline
+
+### Pipeline Integration (`pipeline.py`)
+
+- Added planar config params: `planar_z_ref`, `planar_z_sigma`, `planar_vz_sigma`
+- Added odom twist config: `odom_twist_vel_sigma`, `odom_twist_wz_sigma`
+- Removed `enable_planar_prior` and `enable_odom_twist` gates (violated "no gates" rule)
+- All operators run every scan; influence controlled by covariance (huge cov = negligible precision)
+
+### Sign Mismatch Fix (First Scan Map Placement)
+
+- Changed first scan map placement to use `belief_recomposed` (posterior) instead of `belief_pred` (prior)
+- Rationale: The posterior incorporates gyro evidence which pulls toward END-of-scan rotation. Since the next scan's prior IS the previous posterior, the map must be at the same rotation for consistency.
+- Without this fix: dyaw_wahba ≈ -dyaw_gyro (opposite signs) because map lags behind prior by one scan's gyro increment
+
+### Design Principles Followed
+
+- **No gates**: Removed all `if config.enable_*` gates. Operators always run.
+- **By construction**: Missing data handled by huge covariance (negligible precision), not boolean checks
+- **Principled math**: All evidence uses standard Gaussian information form (L, h)
+
+### Remaining Issues (To Investigate)
+
+1. **Planar prior may be too weak**: L[2,2] = 100 (from σ=0.1) vs LiDAR L[2,2] = 66000+
+   - Consider reducing σ_z to 0.01-0.03 for stronger constraint
+
+2. **Gyro vs Wahba sign disagreement persists**: Even after fix, diagnostics may show:
+   - dyaw_gyro ≈ +40° (positive)
+   - dyaw_wahba ≈ -60° (negative)
+   - Root cause: Wahba estimates START-of-scan rotation, but gyro evidence pulls posterior toward END
+   - The comparison is conceptually mismatched (different time references)
+
+3. **Odom provides near-zero rotation constraint**: L_odom[3:6, 3:6] ≈ 1e-6
+   - Odom covariance for rotation is huge in input data
+   - Cannot help arbitrate gyro vs Wahba disagreement
+
+4. **Catastrophic divergence at scan 56+**: Position suddenly jumps 2-5m per scan
+   - Likely triggered by accumulated errors or numerical instability
+   - Need to investigate what changes at that point
+
+### Test After Implementation
+
+```bash
+cd /home/will/Documents/Coding/Phantom\ Fellowship\ MIT/Impact_Project_v1
+./tools/run_and_evaluate_gc.sh
+tail -20 /tmp/gc_slam_trajectory.tum | awk '{print $4}'  # Check z values
+```
+
+**Success criteria:**
+- Z bounded within ±2m of ground truth (~0.86m)
+- ATE translation RMSE < 15m (was ~47m)
+- ATE rotation RMSE < 45° (was ~116°)
+
+## 2026-01-27: README updated (GC v2 current state)
+
+- **README.md**: Rewritten to reflect current GC v2 implementation. Removed outdated legacy structure (15-step pipeline, DeskewUTMomentMatch, /sim/ topics, separate Evidence Extractors, old code layout). Now documents: 22D state, IMU+Odom+LiDAR fusion, IW adaptive noise, 14-step pipeline with correct operator names (DeskewConstantTwist, WahbaSVD, TranslationWLS, etc.), gc_sensor_hub → gc_backend_node flow, actual fl_slam_poc layout (frontend hub/sensors/audit, backend pipeline/operators/structures), primary eval `run_and_evaluate_gc.sh` and `results/gc_*`. Notes known limitations (PIPELINE_DESIGN_GAPS, TRACE_Z) and points to PIPELINE_TRACE_SINGLE_DOC, BAG_TOPICS_AND_USAGE, and key docs.
+
+## 2026-01-27: Pipeline trace — single document (value as object, causality)
+
+- **docs/PIPELINE_TRACE_SINGLE_DOC.md**: Single trace document. Treats each value as an object and follows it through the deterministic pipeline (radioactive-signature style: trace where raw values "contaminate" final outputs). Contains: (1) pipeline spine (L1–L21 step order); (2) IMU message 5 from raw → on_imu → buffer → L5 → preintegration P1–P8 (gravity subtracted at P5 only) → deskew, gyro/vMF/preint evidence → fusion → trajectory; (3) Odom message 5 from raw → on_odom → last_odom_pose/cov → L15 odom evidence → fusion → trajectory; (4) LiDAR representative point from raw → parse → base → L7–L14 → R_hat, t_hat (3D) → LiDAR evidence → fusion → trajectory and map. Combined flow and units summary at end.
+- **Removed:** docs/PIPELINE_MESSAGE_TRACE.md, docs/PIPELINE_MESSAGE_TRACE_MESSAGE_5.md (content merged into PIPELINE_TRACE_SINGLE_DOC.md). PREINTEGRATION_STEP_BY_STEP.md kept as expanded reference for P1–P8.
+
+## 2026-01-27: Trace: where z in pose/trajectory comes from
+
+- **docs/TRACE_Z_EVIDENCE_AND_TRAJECTORY.md**: Traces how z in the pose evidence and estimated trajectory arises from raw data and pipeline math. Odom z is very weak (cov 1e6 m² → L[2,2] = 1e-6); LiDAR translation evidence is full 3D (t_hat, t_cov) with isotropic Sigma_meas and no z-downweighting, so L_lidar[2,2] dominates; map–scan feedback reinforces belief_z; process Q and velocity treat z like x,y. Conclusion: z is driven primarily by LiDAR translation evidence and feedback, not by odom.
+
+## 2026-01-27: Pipeline design gaps + operator-by-operator improvement plan
+
+- **docs/PIPELINE_DESIGN_GAPS.md**: (1) Existing gaps: underuse of raw info (odom twist, IMU message covariances, LiDAR intensity); independence assumption; 6D pose evidence without twist/kinematics. (2) **New §6:** Operator-by-operator improvement plan: §6.0 current pipeline and failure modes (model-class errors); §6.1 production-safe upgrades (SE(2.5)/planar z, odom twist factors, time-resolved accel evidence, evidence strength from quality); §6.2 MHT (hypothesis = pose+map+noise+calibration, when to branch, scoring/prune/merge, bounded B); §6.3 2nd/3rd-order tensors (Riemannian trust-region, cubic-regularized Newton / 3rd-order correction for vMF); §6.4 high-risk research (Monge–Ampère/OT map updates, dually flat fusion, Amari–Chentsov bias, jerk-informed branching); §6.5 implementation checklist keyed to pipeline steps; §6.6 ROI sequence (planarize z → odom twist → accel evidence → MHT). References updated to PIPELINE_TRACE_SINGLE_DOC and TRACE_Z_EVIDENCE_AND_TRAJECTORY.
+
+## 2026-01-27: Pipeline design gaps (documented known limitations)
+
+- **docs/PIPELINE_DESIGN_GAPS.md**: New doc recording known design gaps: (1) underuse of raw info (odom twist, IMU message covariances, LiDAR intensity); (2) treatment of measurements as independent despite kinematic coupling (pose ↔ twist; “moving forward + yaw” implies x/y motion); (3) 6D pose evidence = inverse(message covariance) on pose residual with no twist, no pose–twist coupling, no forward/lateral structure. Doc ties to RAW_MEASUREMENTS_VS_PIPELINE and message-trace docs and lists what a better observation model would need (twist, pose–twist coupling, kinematics, consistency).
+
+## 2026-01-28: Single IMU gravity config (one entry point)
+
+- **Config cleanup:** Removed `imu_preintegration_gravity_scale`; one parameter `imu_gravity_scale` now controls gravity for both vMF evidence and preintegration. Single source: ROS param `imu_gravity_scale` (default 1.0), set from launch; PipelineConfig and RuntimeManifest use it only. Eval script and launch file no longer pass a second gravity scale.
+- **Rationale:** Avoid multiple overlapping config entry points; 1.0 = correct gravity cancellation everywhere.
+
+## 2026-01-28: IW readiness weight instead of gates (branch-free, no if/else)
+
+- **backend_node.py**: Removed all IW min-scan **gates** (if/else). IW updates run **every scan** for process, measurement, and lidar_bucket. Readiness is a **weight** on sufficient stats: process weight = min(1, scan_count) (0 at scan 0, 1 from scan 1); meas and lidar weight = 1. So we always call all three IW apply functions; at scan 0 process contributes zero suff stats (weight 0). Aligns with AGENTS.md: "No hard gates; startup is not a mode; constants are priors/budgets" and "Branch-free: IW updates happen every scan."
+- **constants.py**: Removed `GC_IW_UPDATE_MIN_SCAN_*` constants; documented that IW uses readiness weights (no MIN_SCAN thresholds).
+- **Rationale:** Per-evidence adaptive noise (process from scan 1, meas/lidar from scan 0) without thresholds or branches.
+
+## 2026-01-28: Do not skip scans when odom/IMU missing — use LiDAR when we have it
+
+- **backend_node.py**: Removed "sensor warmup" skip that discarded LiDAR scans until odom (and IMU) were available. We should not discard evidence for no reason; if we have LiDAR we use it.
+- When odom is missing we now pass identity pose + **large** covariance (`1e12 * I`) so odom evidence is negligible (no strong "pose is identity" pull). Previously we passed `I` covariance, which would add strong incorrect evidence.
+- When IMU buffer is empty we already pass zero arrays (deskew no-op, IMU evidence near zero). No change.
+- First odom message still sets `first_odom_pose` as reference when it arrives; early LiDAR-only scans run with negligible odom evidence until then.
+
+## 2026-01-28: Code Graph RAG MCP — GitHub-only install
+
+- **docs/MCP_CODE_GRAPH_SETUP.md**: Setup instructions for code-graph-rag-mcp using **GitHub Releases only** (no npm registry); Cursor MCP config uses global `code-graph-rag-mcp` binary.
+- **tools/install_code_graph_rag_mcp.sh**: Script to download latest release `.tgz` from GitHub and run `npm install -g`.
+
 ## 2026-01-28: Critical Fix - Wahba Sign Flip (First Scan Frame Mismatch)
 
 ### Summary

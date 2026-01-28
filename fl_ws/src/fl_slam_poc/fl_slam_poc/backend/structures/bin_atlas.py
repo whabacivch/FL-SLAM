@@ -80,16 +80,17 @@ def create_fibonacci_atlas(n_bins: int = constants.GC_B_BINS) -> BinAtlas:
 class MapBinStats:
     """
     Map bin sufficient statistics (additive, associative).
-    
+
     All statistics are stored as sufficient statistics that can be
     additively updated without losing information.
-    
+
     Reference: docs/GOLDEN_CHILD_INTERFACE_SPEC.md Section 4.2
     """
     # Directional sufficient stats
     S_dir: jnp.ndarray  # (B_BINS, 3) resultant vectors Σ w u
+    S_dir_scatter: jnp.ndarray  # (B_BINS, 3, 3) directional scatter Σ w u u^T
     N_dir: jnp.ndarray  # (B_BINS,) mass / ESS
-    
+
     # Spatial sufficient stats
     N_pos: jnp.ndarray  # (B_BINS,)
     sum_p: jnp.ndarray  # (B_BINS, 3) Σ w p
@@ -108,6 +109,7 @@ def create_empty_map_stats(n_bins: int = constants.GC_B_BINS) -> MapBinStats:
     """
     return MapBinStats(
         S_dir=jnp.zeros((n_bins, 3), dtype=jnp.float64),
+        S_dir_scatter=jnp.zeros((n_bins, 3, 3), dtype=jnp.float64),
         N_dir=jnp.zeros(n_bins, dtype=jnp.float64),
         N_pos=jnp.zeros(n_bins, dtype=jnp.float64),
         sum_p=jnp.zeros((n_bins, 3), dtype=jnp.float64),
@@ -118,6 +120,7 @@ def create_empty_map_stats(n_bins: int = constants.GC_B_BINS) -> MapBinStats:
 def update_map_stats(
     map_stats: MapBinStats,
     increments_S_dir: jnp.ndarray,
+    increments_S_dir_scatter: jnp.ndarray,
     increments_N_dir: jnp.ndarray,
     increments_N_pos: jnp.ndarray,
     increments_sum_p: jnp.ndarray,
@@ -125,16 +128,17 @@ def update_map_stats(
 ) -> MapBinStats:
     """
     Update map statistics additively.
-    
+
     Args:
         map_stats: Current map statistics
         increments_*: Increments to add
-        
+
     Returns:
         Updated MapBinStats
     """
     return MapBinStats(
         S_dir=map_stats.S_dir + increments_S_dir,
+        S_dir_scatter=map_stats.S_dir_scatter + increments_S_dir_scatter,
         N_dir=map_stats.N_dir + increments_N_dir,
         N_pos=map_stats.N_pos + increments_N_pos,
         sum_p=map_stats.sum_p + increments_sum_p,
@@ -219,20 +223,21 @@ def apply_forgetting(
 ) -> MapBinStats:
     """
     Apply exponential forgetting to map statistics.
-    
+
     This implements the "all accumulators must use forgetting" requirement.
-    
+
     Args:
         map_stats: Current map statistics
         forgetting_factor: Factor in (0, 1), closer to 1 = slower forgetting
-        
+
     Returns:
         Map statistics with forgetting applied
     """
     gamma = float(forgetting_factor)
-    
+
     return MapBinStats(
         S_dir=gamma * map_stats.S_dir,
+        S_dir_scatter=gamma * map_stats.S_dir_scatter,
         N_dir=gamma * map_stats.N_dir,
         N_pos=gamma * map_stats.N_pos,
         sum_p=gamma * map_stats.sum_p,

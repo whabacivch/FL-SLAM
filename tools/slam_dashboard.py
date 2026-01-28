@@ -19,6 +19,10 @@ Usage:
     
     # Start at specific scan
     .venv/bin/python tools/slam_dashboard.py /tmp/gc_slam_diagnostics.npz --scan 50
+    
+    # With ground truth in 3D view (auto if diagnostics are in results dir with ground_truth_aligned.tum)
+    .venv/bin/python tools/slam_dashboard.py results/gc_20260128_172635/diagnostics.npz --output dashboard.html
+    .venv/bin/python tools/slam_dashboard.py diagnostics.npz --ground-truth path/to/ground_truth_aligned.tum
 """
 
 import argparse
@@ -56,6 +60,31 @@ def load_diagnostics_npz(path: str) -> dict:
     """Load diagnostics from NPZ file into a dictionary."""
     data = np.load(path, allow_pickle=True)
     return {key: data[key] for key in data.files}
+
+
+def load_tum_positions(path: str):
+    """
+    Load x, y, z positions from a TUM trajectory file.
+    TUM format: timestamp x y z qx qy qz qw (space-separated, # for comments).
+    Returns (x, y, z) as 1D numpy arrays, or None if file missing/unreadable.
+    """
+    try:
+        rows = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) >= 7:
+                    rows.append((float(parts[1]), float(parts[2]), float(parts[3])))
+        if not rows:
+            return None
+        arr = np.array(rows, dtype=np.float64)
+        return arr[:, 0], arr[:, 1], arr[:, 2]
+    except (OSError, ValueError) as e:
+        print(f"Warning: Could not load ground truth from {path}: {e}")
+        return None
 
 
 def numpy_to_json(obj):
@@ -127,7 +156,12 @@ def open_browser_wayland_compatible(file_path: str) -> bool:
     return False
 
 
-def create_full_dashboard(data: dict, selected_scan: int = 0, output_path: str = None) -> str:
+def create_full_dashboard(
+    data: dict,
+    selected_scan: int = 0,
+    output_path: str = None,
+    ground_truth_path: str = None,
+) -> str:
     """
     Create and display the fully interactive dashboard.
 
@@ -137,6 +171,9 @@ def create_full_dashboard(data: dict, selected_scan: int = 0, output_path: str =
         data: Diagnostics data dictionary
         selected_scan: Initial scan index to display
         output_path: Optional path to save HTML file. If None, uses temp file.
+        ground_truth_path: Optional path to ground truth TUM file. If provided,
+            loads GT and adds it to the 3D trajectory plot, both trajectories
+            shifted so origin = first estimated pose.
     
     Returns:
         Path to the created HTML file
@@ -202,17 +239,62 @@ def create_full_dashboard(data: dict, selected_scan: int = 0, output_path: str =
 
     timeline_data["sum_N"] = np.sum(N_bins, axis=1).tolist()
     timeline_data["mean_kappa"] = np.mean(kappa_bins, axis=1).tolist()
+    timeline_data["mf_kappa"] = np.mean(kappa_bins, axis=1).tolist()
 
-    # Trajectory data
+    # MF + degeneracy + posterior subspace health (Panel A)
+    L_total_arr = np.array(data.get("L_total", np.zeros((n_scans, 22, 22))))
+    s1_list, s2_list, s3_list = [], [], []
+    logdet_L_pose6_list, eigmin_L_pose6_list = [], []
+    for i in range(n_scans):
+        L_pose6 = L_total_arr[i, 0:6, 0:6]
+        eigvals = np.linalg.eigvalsh(L_pose6)
+        eigvals = np.sort(eigvals)[::-1]  # descending
+        s1_list.append(float(eigvals[0]) if len(eigvals) > 0 else 0.0)
+        s2_list.append(float(eigvals[1]) if len(eigvals) > 1 else 0.0)
+        s3_list.append(float(eigvals[2]) if len(eigvals) > 2 else 0.0)
+        eigvals_pos = np.maximum(eigvals, 1e-12)
+        logdet_L_pose6_list.append(float(np.sum(np.log(eigvals_pos))))
+        eigmin_L_pose6_list.append(float(np.min(eigvals)))
+    timeline_data["s1"] = s1_list
+    timeline_data["s2"] = s2_list
+    timeline_data["s3"] = s3_list
+    timeline_data["logdet_L_pose6"] = logdet_L_pose6_list
+    timeline_data["eigmin_L_pose6"] = eigmin_L_pose6_list
+    timeline_data["log10_mf_cond"] = timeline_data["log10_cond_pose6"]
+
+    # Factor influence (trace of pose6 block per factor) for Panel D stacked area
+    for key, name in [("L_lidar", "trace_L_pose6_lidar"), ("L_odom", "trace_L_pose6_odom"),
+                      ("L_imu", "trace_L_pose6_imu"), ("L_gyro", "trace_L_pose6_gyro")]:
+        if key in data:
+            L_fac = np.array(data[key])  # (n_scans, 22, 22)
+            timeline_data[name] = [float(np.trace(L_fac[i, 0:6, 0:6])) for i in range(n_scans)]
+        else:
+            timeline_data[name] = [0.0] * n_scans
+
+    # Trajectory data (estimated from diagnostics)
     p_W = data.get("p_W", np.zeros((n_scans, 3)))
     if hasattr(p_W, 'tolist'):
         p_W = np.array(p_W)
+    origin = np.array(p_W[0], dtype=np.float64)
+    est_x = (p_W[:, 0] - origin[0]).tolist()
+    est_y = (p_W[:, 1] - origin[1]).tolist()
+    est_z = (p_W[:, 2] - origin[2]).tolist()
     trajectory_data = {
-        "x": p_W[:, 0].tolist(),
-        "y": p_W[:, 1].tolist(),
-        "z": p_W[:, 2].tolist(),
+        "x": est_x,
+        "y": est_y,
+        "z": est_z,
         "logdet": timeline_data["logdet_L_total"],
     }
+    # Optional ground truth (same origin = first estimated pose)
+    if ground_truth_path:
+        gt_xyz = load_tum_positions(ground_truth_path)
+        if gt_xyz is not None:
+            gt_x_arr = gt_xyz[0] - origin[0]
+            gt_y_arr = gt_xyz[1] - origin[1]
+            gt_z_arr = gt_xyz[2] - origin[2]
+            trajectory_data["gt_x"] = gt_x_arr.tolist()
+            trajectory_data["gt_y"] = gt_y_arr.tolist()
+            trajectory_data["gt_z"] = gt_z_arr.tolist()
 
     # L matrices for heatmap (all scans)
     L_total = data.get("L_total", np.zeros((n_scans, 22, 22)))
@@ -310,6 +392,18 @@ def create_full_dashboard(data: dict, selected_scan: int = 0, output_path: str =
             color: #00d4ff;
             font-weight: bold;
         }}
+        #z-leak-display {{
+            font-size: 1.1rem;
+            font-weight: bold;
+            padding: 8px 12px;
+            margin-bottom: 8px;
+            background: #0f3460;
+            border-radius: 6px;
+            color: #f7b731;
+        }}
+        #z-leak-display .value {{
+            color: #4ecdc4;
+        }}
         #scan-display {{
             font-size: 24px;
             color: #00d4ff;
@@ -365,11 +459,12 @@ def create_full_dashboard(data: dict, selected_scan: int = 0, output_path: str =
 
     <div class="dashboard-grid">
         <div class="panel full-width">
-            <div class="panel-title">Panel A: Timeline Diagnostics</div>
+            <div class="panel-title">Panel A: MF + degeneracy + posterior subspace health</div>
             <div id="timeline"></div>
         </div>
         <div class="panel">
-            <div class="panel-title">Panel B: Pose Information Matrix L_pose (6×6)</div>
+            <div class="panel-title">Panel B: L_pose6 / L_xy_yaw (toggle) + Z leak</div>
+            <div id="z-leak-display"><span id="z-leak-value"></span></div>
             <div id="heatmap"></div>
         </div>
         <div class="panel">
@@ -377,8 +472,9 @@ def create_full_dashboard(data: dict, selected_scan: int = 0, output_path: str =
             <div id="trajectory"></div>
         </div>
         <div class="panel full-width">
-            <div class="panel-title">Panel D: Excitation & Fusion Diagnostics</div>
-            <div id="excitation"></div>
+            <div class="panel-title">Panel D: Factor influence ledger + top-K bin anatomy</div>
+            <div id="factor-stacked"></div>
+            <div id="topk-bins"></div>
         </div>
     </div>
 
@@ -390,6 +486,7 @@ def create_full_dashboard(data: dict, selected_scan: int = 0, output_path: str =
     const S_bins = {json.dumps(S_bins.tolist())};
     const R_WL = {json.dumps(R_WL.tolist())};
     const kappa_bins = {json.dumps(kappa_bins.tolist())};
+    const N_bins = {json.dumps(N_bins.tolist())};
 
     let currentScan = {selected_scan};
     const nScans = {n_scans};
@@ -397,6 +494,7 @@ def create_full_dashboard(data: dict, selected_scan: int = 0, output_path: str =
     // Block labels for pose heatmap (6x6: translation + rotation)
     const poseBlockBoundaries = [0, 3, 6];
     const poseBlockLabels = ['trans', 'rot'];
+    let heatmapMode = 'pose6';  // 'pose6' | 'xy_yaw'
 
     // Dark theme layout
     const darkLayout = {{
@@ -408,48 +506,33 @@ def create_full_dashboard(data: dict, selected_scan: int = 0, output_path: str =
     }};
 
     // =====================================================================
-    // Panel A: Timeline
+    // Panel A: MF + degeneracy + posterior subspace health
     // =====================================================================
 	    function createTimeline() {{
 	        const traces = [
-            // Row 1: Evidence strength
-            {{ x: timelineData.scan_idx, y: timelineData.logdet_L_total, name: 'log|L|', line: {{color: '#00d4ff'}}, xaxis: 'x', yaxis: 'y' }},
-            {{ x: timelineData.scan_idx, y: timelineData.trace_L_total, name: 'tr(L)', line: {{color: '#ff6b6b'}}, xaxis: 'x', yaxis: 'y2' }},
-            // Row 2: Observability
-            {{ x: timelineData.scan_idx, y: timelineData.L_dt, name: 'L[dt,dt]', line: {{color: '#4ecdc4'}}, xaxis: 'x2', yaxis: 'y3' }},
-            {{ x: timelineData.scan_idx, y: timelineData.trace_L_ex, name: 'tr(L_ex)', line: {{color: '#f7b731'}}, xaxis: 'x2', yaxis: 'y3' }},
-	            // Row 3: Numerical health
-	            {{ x: timelineData.scan_idx, y: timelineData.psd_delta_fro, name: 'PSD Δ', line: {{color: '#a55eea'}}, xaxis: 'x3', yaxis: 'y4' }},
-	            {{ x: timelineData.scan_idx, y: timelineData.psd_min_eig_after, name: 'min λ', line: {{color: '#26de81'}}, xaxis: 'x3', yaxis: 'y4' }},
-	            {{ x: timelineData.scan_idx, y: timelineData.log10_cond_pose6, name: 'log10 κ_pose6', line: {{color: '#45aaf2'}}, xaxis: 'x3', yaxis: 'y4' }},
-            // Row 4: Noise adaptation
-            {{ x: timelineData.scan_idx, y: timelineData.trace_Q_mode, name: 'tr(Q)', line: {{color: '#fd9644'}}, xaxis: 'x4', yaxis: 'y5' }},
-            {{ x: timelineData.scan_idx, y: timelineData.trace_Sigma_lidar_mode, name: 'tr(Σ_lidar)', line: {{color: '#fc5c65'}}, xaxis: 'x4', yaxis: 'y5' }},
-            // Row 5: Bin statistics
-            {{ x: timelineData.scan_idx, y: timelineData.sum_N, name: 'Σ N', line: {{color: '#778ca3'}}, xaxis: 'x5', yaxis: 'y6' }},
-            {{ x: timelineData.scan_idx, y: timelineData.mean_kappa, name: 'mean(κ)', line: {{color: '#a5b1c2'}}, xaxis: 'x5', yaxis: 'y6' }},
+            // Row 1: s1, s2, s3 (singular/value strength)
+            {{ x: timelineData.scan_idx, y: timelineData.s1, name: 's1', line: {{color: '#00d4ff'}}, xaxis: 'x', yaxis: 'y' }},
+            {{ x: timelineData.scan_idx, y: timelineData.s2, name: 's2', line: {{color: '#4ecdc4'}}, xaxis: 'x', yaxis: 'y' }},
+            {{ x: timelineData.scan_idx, y: timelineData.s3, name: 's3', line: {{color: '#45aaf2'}}, xaxis: 'x', yaxis: 'y' }},
+            // Row 2: log10(mf_cond), mf_kappa, logdet(L_pose6), eigmin(L_pose6)
+            {{ x: timelineData.scan_idx, y: timelineData.log10_mf_cond, name: 'log10(mf_cond)', line: {{color: '#a55eea'}}, xaxis: 'x2', yaxis: 'y2' }},
+            {{ x: timelineData.scan_idx, y: timelineData.mf_kappa, name: 'mf_kappa', line: {{color: '#f7b731'}}, xaxis: 'x2', yaxis: 'y2' }},
+            {{ x: timelineData.scan_idx, y: timelineData.logdet_L_pose6, name: 'logdet(L_pose6)', line: {{color: '#26de81'}}, xaxis: 'x2', yaxis: 'y2' }},
+            {{ x: timelineData.scan_idx, y: timelineData.eigmin_L_pose6, name: 'eigmin(L_pose6)', line: {{color: '#ff6b6b'}}, xaxis: 'x2', yaxis: 'y2' }},
         ];
 
         const layout = {{
             ...darkLayout,
-            height: 500,
+            height: 420,
             showlegend: true,
-            legend: {{ orientation: 'h', y: 1.12, x: 0.5, xanchor: 'center' }},
-            grid: {{ rows: 5, columns: 1, pattern: 'independent', roworder: 'top to bottom' }},
+            legend: {{ orientation: 'h', y: 1.08, x: 0.5, xanchor: 'center' }},
+            grid: {{ rows: 2, columns: 1, pattern: 'independent', roworder: 'top to bottom' }},
             xaxis: {{ ...darkLayout.xaxis, anchor: 'y', domain: [0, 1], showticklabels: false }},
-            xaxis2: {{ ...darkLayout.xaxis, anchor: 'y3', domain: [0, 1], showticklabels: false }},
-            xaxis3: {{ ...darkLayout.xaxis, anchor: 'y4', domain: [0, 1], showticklabels: false }},
-            xaxis4: {{ ...darkLayout.xaxis, anchor: 'y5', domain: [0, 1], showticklabels: false }},
-            xaxis5: {{ ...darkLayout.xaxis, anchor: 'y6', domain: [0, 1], title: 'Scan Index' }},
-            yaxis: {{ ...darkLayout.yaxis, domain: [0.84, 1], title: 'Evidence' }},
-            yaxis2: {{ ...darkLayout.yaxis, overlaying: 'y', side: 'right' }},
-            yaxis3: {{ ...darkLayout.yaxis, domain: [0.63, 0.79], title: 'Observability' }},
-	            yaxis4: {{ ...darkLayout.yaxis, domain: [0.42, 0.58], title: 'PSD / Cond' }},
-            yaxis5: {{ ...darkLayout.yaxis, domain: [0.21, 0.37], title: 'Noise' }},
-            yaxis6: {{ ...darkLayout.yaxis, domain: [0, 0.16], title: 'Bins' }},
-            margin: {{ t: 60, b: 40, l: 60, r: 40 }},
-            // Shapes for vertical line (will be updated)
-            shapes: createVerticalLines(currentScan, 5),
+            xaxis2: {{ ...darkLayout.xaxis, anchor: 'y2', domain: [0, 1], title: 'Scan Index' }},
+            yaxis: {{ ...darkLayout.yaxis, domain: [0.5, 1], title: 's1, s2, s3' }},
+            yaxis2: {{ ...darkLayout.yaxis, domain: [0, 0.46], title: 'log10(mf_cond), mf_κ, logdet, λmin' }},
+            margin: {{ t: 50, b: 40, l: 60, r: 40 }},
+            shapes: createVerticalLines(currentScan, 2),
         }};
 
         Plotly.newPlot('timeline', traces, layout, {{responsive: true}});
@@ -457,7 +540,6 @@ def create_full_dashboard(data: dict, selected_scan: int = 0, output_path: str =
 
     function createVerticalLines(scanIdx, numRows) {{
         const shapes = [];
-        const yDomains = [[0.84, 1], [0.63, 0.79], [0.42, 0.58], [0.21, 0.37], [0, 0.16]];
         for (let i = 0; i < numRows; i++) {{
             shapes.push({{
                 type: 'line',
@@ -472,48 +554,53 @@ def create_full_dashboard(data: dict, selected_scan: int = 0, output_path: str =
     }}
 
     // =====================================================================
-    // Panel B: Pose Information Matrix (6x6)
+    // Panel B: L_pose6 (6x6) / L_xy_yaw (3x3) toggle + Z leak indicator
     // =====================================================================
+    function updateZLeakDisplay(scanIdx) {{
+        const L_full = L_matrices[scanIdx];
+        const L_pose = [];
+        for (let i = 0; i < 6; i++) L_pose.push(L_full[i].slice(0, 6));
+        const Lzz = L_pose[2][2];
+        const Lxx = L_pose[0][0], Lyy = L_pose[1][1];
+        const xy_mean = (Lxx + Lyy) / 2 + 1e-10;
+        const zLeakRatio = Lzz / xy_mean;
+        const el = document.getElementById('z-leak-value');
+        if (el) {{
+            el.innerHTML = 'Z leak (L[z,z]/mean(L[x,x],L[y,y])): <span class="value">' + zLeakRatio.toFixed(4) + '</span> &nbsp; L_zz=' + Lzz.toFixed(4);
+        }}
+    }}
+
     function createHeatmap(scanIdx) {{
         const L_full = L_matrices[scanIdx];
-        
-        // Extract 6x6 pose block: [translation(3), rotation(3)]
-        const L_pose = [];
-        for (let i = 0; i < 6; i++) {{
-            L_pose.push(L_full[i].slice(0, 6));
+        let L_plot, axisLabels, title, rows, cols;
+        const idx_xy_yaw = [0, 1, 5];  // x, y, yaw
+
+        if (heatmapMode === 'xy_yaw') {{
+            rows = 3; cols = 3;
+            L_plot = [];
+            for (let i = 0; i < 3; i++) {{
+                const row = [];
+                for (let j = 0; j < 3; j++) row.push(L_full[idx_xy_yaw[i]][idx_xy_yaw[j]]);
+                L_plot.push(row);
+            }}
+            axisLabels = ['x', 'y', 'yaw'];
+            title = 'L_xy_yaw (3×3) - Scan ' + scanIdx;
+        }} else {{
+            rows = 6; cols = 6;
+            L_plot = [];
+            for (let i = 0; i < 6; i++) L_plot.push(L_full[i].slice(0, 6));
+            axisLabels = ['tx', 'ty', 'tz', 'rx', 'ry', 'rz'];
+            title = 'L_pose6 (6×6) - Scan ' + scanIdx;
         }}
 
-        // Create annotations for block labels
         const annotations = [];
-        for (let i = 0; i < poseBlockLabels.length; i++) {{
-            const mid = (poseBlockBoundaries[i] + poseBlockBoundaries[i+1]) / 2 - 0.5;
-            annotations.push({{
-                x: mid, y: 6.5, text: poseBlockLabels[i], showarrow: false, font: {{size: 12, color: '#888'}}
-            }});
-            annotations.push({{
-                x: -1.5, y: mid, text: poseBlockLabels[i], showarrow: false, font: {{size: 12, color: '#888'}}
-            }});
-        }}
-
-        // Create shapes for block boundaries (between translation and rotation)
-        const shapes = [];
-        const b = 2.5; // Boundary between trans(0-2) and rot(3-5)
-        shapes.push({{ type: 'line', x0: b, x1: b, y0: -0.5, y1: 5.5, line: {{color: '#555', width: 2, dash: 'dot'}} }});
-        shapes.push({{ type: 'line', x0: -0.5, x1: 5.5, y0: b, y1: b, line: {{color: '#555', width: 2, dash: 'dot'}} }});
-
-        // Axis labels for individual components
-        const axisLabels = ['tx', 'ty', 'tz', 'rx', 'ry', 'rz'];
-        for (let i = 0; i < 6; i++) {{
-            annotations.push({{
-                x: i, y: -0.8, text: axisLabels[i], showarrow: false, font: {{size: 9, color: '#aaa'}}
-            }});
-            annotations.push({{
-                x: -0.8, y: i, text: axisLabels[i], showarrow: false, font: {{size: 9, color: '#aaa'}}
-            }});
+        for (let i = 0; i < rows; i++) {{
+            annotations.push({{ x: i, y: -0.8, text: axisLabels[i], showarrow: false, font: {{size: 9, color: '#aaa'}} }});
+            annotations.push({{ x: -0.8, y: i, text: axisLabels[i], showarrow: false, font: {{size: 9, color: '#aaa'}} }});
         }}
 
         const trace = {{
-            z: L_pose,
+            z: L_plot,
             type: 'heatmap',
             colorscale: 'RdBu',
             zmid: 0,
@@ -522,51 +609,82 @@ def create_full_dashboard(data: dict, selected_scan: int = 0, output_path: str =
 
         const layout = {{
             ...darkLayout,
-            height: 450,
-            title: {{ text: `L_pose (6×6) - Scan ${{scanIdx}}`, font: {{color: '#00d4ff'}} }},
+            height: 420,
+            title: {{ text: title, font: {{color: '#00d4ff'}} }},
             xaxis: {{ ...darkLayout.xaxis, title: 'Column', scaleanchor: 'y', constrain: 'domain' }},
             yaxis: {{ ...darkLayout.yaxis, title: 'Row', autorange: 'reversed', constrain: 'domain' }},
             annotations: annotations,
-            shapes: shapes,
             margin: {{ t: 50, b: 50, l: 50, r: 30 }},
         }};
 
         Plotly.react('heatmap', [trace], layout, {{responsive: true}});
+        updateZLeakDisplay(scanIdx);
+    }}
+
+    function setupHeatmapToggle() {{
+        const container = document.getElementById('z-leak-display');
+        if (!container) return;
+        const btn = document.createElement('button');
+        btn.textContent = 'Toggle L_pose6 / L_xy_yaw';
+        btn.style.marginLeft = '12px';
+        btn.style.padding = '4px 8px';
+        btn.style.cursor = 'pointer';
+        btn.style.background = '#0f3460';
+        btn.style.color = '#00d4ff';
+        btn.style.border = '1px solid #00d4ff';
+        btn.style.borderRadius = '4px';
+        btn.onclick = function() {{
+            heatmapMode = heatmapMode === 'pose6' ? 'xy_yaw' : 'pose6';
+            createHeatmap(currentScan);
+        }};
+        container.appendChild(btn);
     }}
 
     // =====================================================================
     // Panel C: 3D Trajectory
     // =====================================================================
     function createTrajectory(scanIdx) {{
-        const traces = [
-            // Main trajectory
-            {{
-                x: trajectoryData.x, y: trajectoryData.y, z: trajectoryData.z,
-                mode: 'lines+markers',
+        const traces = [];
+        // Ground truth (if present; draw first so it appears behind estimated)
+        if (trajectoryData.gt_x && trajectoryData.gt_y && trajectoryData.gt_z) {{
+            traces.push({{
+                x: trajectoryData.gt_x,
+                y: trajectoryData.gt_y,
+                z: trajectoryData.gt_z,
+                mode: 'lines',
                 type: 'scatter3d',
-                marker: {{
-                    size: 3,
-                    color: trajectoryData.logdet,
-                    colorscale: 'Viridis',
-                    colorbar: {{ title: 'log|L|', x: 1.02, tickfont: {{color: '#eee'}} }},
-                    showscale: true
-                }},
-                line: {{ color: '#555', width: 2 }},
-                name: 'Trajectory',
-                hovertemplate: 'Scan %{{text}}<br>X: %{{x:.2f}}<br>Y: %{{y:.2f}}<br>Z: %{{z:.2f}}<extra></extra>',
-                text: timelineData.scan_idx.map(i => i.toString())
+                line: {{ color: '#4ecdc4', width: 4 }},
+                name: 'Ground truth',
+                hovertemplate: 'Ground truth<br>X: %{{x:.2f}}<br>Y: %{{y:.2f}}<br>Z: %{{z:.2f}}<extra></extra>'
+            }});
+        }}
+        // Estimated trajectory
+        traces.push({{
+            x: trajectoryData.x, y: trajectoryData.y, z: trajectoryData.z,
+            mode: 'lines+markers',
+            type: 'scatter3d',
+            marker: {{
+                size: 3,
+                color: trajectoryData.logdet,
+                colorscale: 'Viridis',
+                colorbar: {{ title: 'log|L|', x: 1.02, tickfont: {{color: '#eee'}} }},
+                showscale: true
             }},
-            // Selected point marker
-            {{
-                x: [trajectoryData.x[scanIdx]],
-                y: [trajectoryData.y[scanIdx]],
-                z: [trajectoryData.z[scanIdx]],
-                mode: 'markers',
-                type: 'scatter3d',
-                marker: {{ size: 10, color: '#ff6b6b', symbol: 'diamond' }},
-                name: `Scan ${{scanIdx}}`
-            }}
-        ];
+            line: {{ color: '#555', width: 2 }},
+            name: 'Estimated',
+            hovertemplate: 'Scan %{{text}}<br>X: %{{x:.2f}}<br>Y: %{{y:.2f}}<br>Z: %{{z:.2f}}<extra></extra>',
+            text: timelineData.scan_idx.map(i => i.toString())
+        }});
+        // Selected point marker
+        traces.push({{
+            x: [trajectoryData.x[scanIdx]],
+            y: [trajectoryData.y[scanIdx]],
+            z: [trajectoryData.z[scanIdx]],
+            mode: 'markers',
+            type: 'scatter3d',
+            marker: {{ size: 10, color: '#ff6b6b', symbol: 'diamond' }},
+            name: `Scan ${{scanIdx}}`
+        }});
 
         // Add direction glyphs for top-6 bins by kappa
         const kappaArr = kappa_bins[scanIdx];
@@ -624,62 +742,54 @@ def create_full_dashboard(data: dict, selected_scan: int = 0, output_path: str =
     }}
 
     // =====================================================================
-    // Panel D: Excitation
+    // Panel D: Factor influence (stacked area) + top-K bins bar chart
     // =====================================================================
-	    function createExcitation() {{
-	        const traces = [
-            // Row 1: Excitation scales
-            {{ x: timelineData.scan_idx, y: timelineData.s_dt, name: 's_dt', line: {{color: '#00d4ff'}}, xaxis: 'x', yaxis: 'y' }},
-            {{ x: timelineData.scan_idx, y: timelineData.s_ex, name: 's_ex', line: {{color: '#ff6b6b'}}, xaxis: 'x', yaxis: 'y' }},
-	            // Row 2: Fusion alpha
-	            {{ x: timelineData.scan_idx, y: timelineData.fusion_alpha, name: 'α', line: {{color: '#4ecdc4'}}, xaxis: 'x2', yaxis: 'y2' }},
-	            // Row 3: dt and diagnostics
-	            {{ x: timelineData.scan_idx, y: timelineData.dt_secs, name: 'dt_sec (s)', line: {{color: '#a55eea'}}, xaxis: 'x3', yaxis: 'y3' }},
-	            {{ x: timelineData.scan_idx, y: timelineData.dt_scan, name: 'dt_scan (s)', line: {{color: '#9b59b6'}}, xaxis: 'x3', yaxis: 'y3' }},
-	            {{ x: timelineData.scan_idx, y: timelineData.dt_int, name: 'dt_int (s)', line: {{color: '#8e44ad'}}, xaxis: 'x3', yaxis: 'y3' }},
-	            {{ x: timelineData.scan_idx, y: timelineData.wahba_cost, name: 'Wahba', line: {{color: '#f7b731'}}, xaxis: 'x3', yaxis: 'y3' }},
-	            {{ x: timelineData.scan_idx, y: timelineData.translation_residual_norm, name: 'Trans', line: {{color: '#fd9644'}}, xaxis: 'x3', yaxis: 'y3' }},
-	            // Row 4: Rotation binding errors (degrees)
-	            {{ x: timelineData.scan_idx, y: timelineData.rot_err_lidar_deg_pred, name: 'rot_lidar_pred (deg)', line: {{color: '#20bf6b'}}, xaxis: 'x4', yaxis: 'y4' }},
-	            {{ x: timelineData.scan_idx, y: timelineData.rot_err_lidar_deg_post, name: 'rot_lidar_post (deg)', line: {{color: '#0fb9b1'}}, xaxis: 'x4', yaxis: 'y4' }},
-	            {{ x: timelineData.scan_idx, y: timelineData.rot_err_odom_deg_pred, name: 'rot_odom_pred (deg)', line: {{color: '#eb3b5a'}}, xaxis: 'x4', yaxis: 'y4' }},
-	            {{ x: timelineData.scan_idx, y: timelineData.rot_err_odom_deg_post, name: 'rot_odom_post (deg)', line: {{color: '#fa8231'}}, xaxis: 'x4', yaxis: 'y4' }},
-	        ];
-
+    const TOP_K_BINS = 12;
+	    function createFactorStacked() {{
+	        const hasLidar = timelineData.trace_L_pose6_lidar && timelineData.trace_L_pose6_lidar.some(v => v !== 0);
+	        const hasOdom = timelineData.trace_L_pose6_odom && timelineData.trace_L_pose6_odom.some(v => v !== 0);
+	        const hasImu = timelineData.trace_L_pose6_imu && timelineData.trace_L_pose6_imu.some(v => v !== 0);
+	        const hasGyro = timelineData.trace_L_pose6_gyro && timelineData.trace_L_pose6_gyro.some(v => v !== 0);
+	        const traces = [];
+	        if (hasLidar) traces.push({{ x: timelineData.scan_idx, y: timelineData.trace_L_pose6_lidar, name: 'Lidar (tr L_pose6)', stackgroup: 'one', fill: 'tozeroy', line: {{color: '#00d4ff', width: 1}}, mode: 'lines' }});
+	        if (hasOdom) traces.push({{ x: timelineData.scan_idx, y: timelineData.trace_L_pose6_odom, name: 'Odom', stackgroup: 'one', fill: 'tonexty', line: {{color: '#4ecdc4', width: 1}}, mode: 'lines' }});
+	        if (hasImu) traces.push({{ x: timelineData.scan_idx, y: timelineData.trace_L_pose6_imu, name: 'IMU', stackgroup: 'one', fill: 'tonexty', line: {{color: '#f7b731', width: 1}}, mode: 'lines' }});
+	        if (hasGyro) traces.push({{ x: timelineData.scan_idx, y: timelineData.trace_L_pose6_gyro, name: 'Gyro', stackgroup: 'one', fill: 'tonexty', line: {{color: '#ff6b6b', width: 1}}, mode: 'lines' }});
+	        if (traces.length === 0) traces.push({{ x: timelineData.scan_idx, y: timelineData.scan_idx.map(() => 0), name: 'No factor data', line: {{color: '#888'}} }});
 	        const layout = {{
 	            ...darkLayout,
-	            height: 420,
+	            height: 280,
+	            title: {{ text: 'Info added per factor (tr L_pose6)', font: {{color: '#00d4ff'}} }},
+	            xaxis: {{ ...darkLayout.xaxis, title: 'Scan Index' }},
+	            yaxis: {{ ...darkLayout.yaxis, title: 'tr(L_pose6)' }},
 	            showlegend: true,
-	            legend: {{ orientation: 'h', y: 1.15, x: 0.5, xanchor: 'center' }},
-	            grid: {{ rows: 4, columns: 1, pattern: 'independent', roworder: 'top to bottom' }},
-	            xaxis: {{ ...darkLayout.xaxis, anchor: 'y', domain: [0, 1], showticklabels: false }},
-	            xaxis2: {{ ...darkLayout.xaxis, anchor: 'y2', domain: [0, 1], showticklabels: false }},
-	            xaxis3: {{ ...darkLayout.xaxis, anchor: 'y3', domain: [0, 1], showticklabels: false }},
-	            xaxis4: {{ ...darkLayout.xaxis, anchor: 'y4', domain: [0, 1], title: 'Scan Index' }},
-	            yaxis: {{ ...darkLayout.yaxis, domain: [0.78, 1], title: 'Excitation' }},
-	            yaxis2: {{ ...darkLayout.yaxis, domain: [0.52, 0.74], title: 'Fusion α' }},
-	            yaxis3: {{ ...darkLayout.yaxis, domain: [0.26, 0.48], title: 'Diagnostics' }},
-	            yaxis4: {{ ...darkLayout.yaxis, domain: [0, 0.22], title: 'Rot Err (deg)' }},
-	            margin: {{ t: 50, b: 40, l: 60, r: 40 }},
-	            shapes: createExcitationVerticalLines(currentScan),
+	            legend: {{ orientation: 'h', y: 1.02 }},
+	            margin: {{ t: 40, b: 40, l: 50, r: 30 }},
 	        }};
-
-	        Plotly.newPlot('excitation', traces, layout, {{responsive: true}});
+	        Plotly.newPlot('factor-stacked', traces, layout, {{responsive: true}});
 	    }}
 
-	    function createExcitationVerticalLines(scanIdx) {{
-	        const shapes = [];
-	        for (let i = 0; i < 4; i++) {{
-	            shapes.push({{
-	                type: 'line',
-	                x0: scanIdx, x1: scanIdx,
-	                y0: 0, y1: 1,
-	                xref: 'x' + (i === 0 ? '' : (i + 1)),
-	                yref: 'paper',
-	                line: {{ color: '#ff6b6b', width: 2, dash: 'dash' }}
-	            }});
-	        }}
-	        return shapes;
+	    function createTopKBins(scanIdx) {{
+	        const N = N_bins[scanIdx] || Array(48).fill(0);
+	        const kappa = kappa_bins[scanIdx] || Array(48).fill(0);
+	        const w_b = N.map((n, i) => n * kappa[i]);
+	        const indices = [...Array(48).keys()].sort((a, b) => w_b[b] - w_b[a]).slice(0, TOP_K_BINS);
+	        const binLabels = indices.map(i => 'b' + i);
+	        const traceW = {{ x: binLabels, y: indices.map(i => w_b[i]), name: 'w_b (N×κ)', type: 'bar', marker: {{ color: '#00d4ff' }} }};
+	        const traceN = {{ x: binLabels, y: indices.map(i => N[i]), name: 'N', type: 'bar', marker: {{ color: '#4ecdc4' }} }};
+	        const traceK = {{ x: binLabels, y: indices.map(i => kappa[i]), name: 'κ', type: 'bar', marker: {{ color: '#f7b731' }} }};
+	        const layout = {{
+	            ...darkLayout,
+	            height: 280,
+	            title: {{ text: 'Top-' + TOP_K_BINS + ' bins (scan ' + scanIdx + ') — w_b, N, κ', font: {{color: '#00d4ff'}} }},
+	            xaxis: {{ ...darkLayout.xaxis, title: 'Bin' }},
+	            yaxis: {{ ...darkLayout.yaxis, title: 'Value' }},
+	            barmode: 'group',
+	            showlegend: true,
+	            legend: {{ orientation: 'h', y: 1.02 }},
+	            margin: {{ t: 40, b: 40, l: 50, r: 30 }},
+	        }};
+	        Plotly.react('topk-bins', [traceW, traceN, traceK], layout, {{responsive: true}});
 	    }}
 
     // =====================================================================
@@ -699,14 +809,14 @@ def create_full_dashboard(data: dict, selected_scan: int = 0, output_path: str =
         // Update timeline vertical lines
         Plotly.relayout('timeline', {{ shapes: createVerticalLines(scanIdx, 5) }});
 
-        // Update excitation vertical lines
-        Plotly.relayout('excitation', {{ shapes: createExcitationVerticalLines(scanIdx) }});
-
-        // Update heatmap
+        // Update heatmap and Z leak
         createHeatmap(scanIdx);
 
         // Update trajectory
         createTrajectory(scanIdx);
+
+        // Update top-K bins bar chart
+        createTopKBins(scanIdx);
     }}
 
     // =====================================================================
@@ -714,9 +824,11 @@ def create_full_dashboard(data: dict, selected_scan: int = 0, output_path: str =
     // =====================================================================
 	    document.addEventListener('DOMContentLoaded', function() {{
         createTimeline();
+        setupHeatmapToggle();
         createHeatmap(currentScan);
         createTrajectory(currentScan);
-        createExcitation();
+        createFactorStacked();
+        createTopKBins(currentScan);
 
         // Update info display
 	        document.getElementById('info-dt').textContent = timelineData.dt_secs[currentScan].toFixed(3);
@@ -740,8 +852,8 @@ def create_full_dashboard(data: dict, selected_scan: int = 0, output_path: str =
             }}
         }});
 
-        // Click on excitation panel too
-        document.getElementById('excitation').on('plotly_click', function(data) {{
+        // Click on timeline or factor-stacked to select scan
+        document.getElementById('factor-stacked').on('plotly_click', function(data) {{
             if (data.points && data.points.length > 0) {{
                 const scanIdx = data.points[0].x;
                 slider.value = scanIdx;
@@ -806,6 +918,12 @@ def main():
         default=None,
         help="Save HTML file to specified path (does not auto-open browser)",
     )
+    parser.add_argument(
+        "--ground-truth",
+        type=str,
+        default=None,
+        help="Path to ground truth TUM file. If omitted and diagnostics are in a results dir, uses ground_truth_aligned.tum in the same directory.",
+    )
 
     args = parser.parse_args()
 
@@ -850,8 +968,22 @@ def main():
         print(f"Warning: Requested scan {args.scan} >= n_scans {n_scans}, using scan 0")
         args.scan = 0
 
+    # Resolve ground truth path (explicit, or auto from same dir as diagnostics)
+    ground_truth_path = args.ground_truth
+    if not ground_truth_path:
+        results_dir = Path(args.diagnostics_file).resolve().parent
+        auto_gt = results_dir / "ground_truth_aligned.tum"
+        if auto_gt.exists():
+            ground_truth_path = str(auto_gt)
+            print(f"Using ground truth: {ground_truth_path}")
+    elif not os.path.exists(ground_truth_path):
+        print(f"Warning: Ground truth file not found: {ground_truth_path}")
+        ground_truth_path = None
+
     # Create dashboard
-    html_path = create_full_dashboard(data, args.scan, output_path=args.output)
+    html_path = create_full_dashboard(
+        data, args.scan, output_path=args.output, ground_truth_path=ground_truth_path
+    )
     
     if html_path:
         print(f"\n✓ Dashboard ready at: {html_path}")

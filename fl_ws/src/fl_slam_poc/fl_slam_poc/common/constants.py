@@ -240,15 +240,54 @@ GC_IW_RHO_BA = 0.999
 GC_IW_RHO_DT = 0.9999
 GC_IW_RHO_EX = 0.9999
 
-# IW update timing: minimum scan count before applying updates
-# Rationale: Need real deltas (scan-to-scan differences) for meaningful IW updates.
-# Scans 0 and 1 don't have sufficient history for reliable innovation residuals.
-GC_IW_UPDATE_MIN_SCAN = 2  # Start IW updates from scan 2 onwards
+# IW updates: applied every scan (no gates). We always add the sufficient statistics we have.
+# No prediction at scan 0 -> no process innovation residuals -> zero process suff stats (weight 0).
+# "Don't have the info yet" is equivalent to "don't have the suff stats" — so we just contribute
+# what we have; no branch on "do we have enough". Process weight = min(1, scan_count); meas/lidar = 1.
 
 # Measurement-noise retention (separate from process noise; deterministic per scan)
 GC_IW_RHO_MEAS_GYRO = 0.995
 GC_IW_RHO_MEAS_ACCEL = 0.995
 GC_IW_RHO_MEAS_LIDAR = 0.99
+
+# =============================================================================
+# Planar Robot Constraints (Phase 1: z fix via soft prior)
+# =============================================================================
+# For ground-hugging robots, these constraints prevent z runaway.
+# The z feedback loop (LiDAR z treated same as x,y + map feedback) causes
+# drift to -50 to -80m without these constraints.
+
+# Reference z height for M3DGR dataset (meters)
+# Ground truth z is approximately 0.86m throughout the trajectory
+GC_PLANAR_Z_REF = 0.86
+
+# Soft z constraint std dev (meters)
+# Smaller = stronger constraint pulling z toward z_ref
+# 0.1m allows some flexibility for uneven terrain
+GC_PLANAR_Z_SIGMA = 0.1
+
+# Soft vel_z=0 constraint std dev (m/s)
+# Very tight - ground robots don't fly
+# 0.01 m/s = 1 cm/s vertical velocity tolerance
+GC_PLANAR_VZ_SIGMA = 0.01
+
+# Process diffusion for z coordinate (m^2/s)
+# Much smaller than GC_PROCESS_TRANS_DIFFUSION to prevent z random walk
+GC_PROCESS_Z_DIFFUSION = 1e-8
+
+# =============================================================================
+# Odometry Twist Constants (Phase 2: velocity factors)
+# =============================================================================
+# These control the strength of odometry twist (velocity) evidence.
+# Wheel odometry provides strong kinematic coupling that was previously unused.
+
+# Default velocity covariance scaling for odom twist (m/s)^2
+# Typical wheel encoders have ~1-5% velocity error
+GC_ODOM_TWIST_VEL_SIGMA = 0.1  # 0.1 m/s std dev
+
+# Default yaw rate covariance from odom twist (rad/s)
+# Wheel-derived yaw rate is typically accurate to ~0.01 rad/s
+GC_ODOM_TWIST_WZ_SIGMA = 0.01  # rad/s std dev
 
 # Test-only invariants still referenced by active test suite.
 N_MIN_SE3_DOF = 6  # SE(3) has 6 DOF, need at least 6 constraints

@@ -367,12 +367,16 @@ def compute_rpe_multi_scale(gt_traj: trajectory.PoseTrajectory3D, est_traj: traj
 
 def compute_per_axis_errors(gt_traj: trajectory.PoseTrajectory3D, est_traj: trajectory.PoseTrajectory3D):
     """
-    Compute per-axis translation and rotation errors.
-    
+    Compute per-axis translation and rotation errors after SE(3) alignment.
+
+    Translation: per-axis absolute difference |gt - est| in meters (X, Y, Z).
+    Rotation: at each pose, relative rotation est_inv * gt; Euler angles (XYZ order)
+    in degrees; per-axis RMSE is over roll, pitch, yaw components (absolute value).
+
     Returns:
         dict with keys:
-        - 'translation': {'x': errors, 'y': errors, 'z': errors}
-        - 'rotation': {'roll': errors, 'pitch': errors, 'yaw': errors}
+        - 'translation': {'x': errors (m), 'y': ..., 'z': ...}
+        - 'rotation': {'roll': errors (deg), 'pitch': ..., 'yaw': ...}
         - 'timestamps': aligned timestamps
     """
     # Deep copy to avoid modifying originals
@@ -774,15 +778,26 @@ def plot_cumulative_error(ate_metric, timestamps, output_path):
 
 def save_metrics_txt(ate_trans, ate_rot, rpe_results, per_axis_data, output_path, eval_diagnostics: dict | None = None):
     """Save metrics in human-readable text format."""
+    ate_t_stats = ate_trans.get_all_statistics()
+    ate_r_stats = ate_rot.get_all_statistics()
+    rpe_1m = rpe_results.get('1m', {}).get('trans')
+    rpe_1m_rmse = rpe_1m.get_all_statistics()['rmse'] if rpe_1m else float('nan')
+
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write("FL-SLAM Evaluation Metrics\n")
         f.write("=" * 60 + "\n\n")
+        f.write("SUMMARY (parsable)\n")
+        f.write("-" * 40 + "\n")
+        f.write(f"ATE translation RMSE (m):     {ate_t_stats['rmse']:.6f}\n")
+        f.write(f"ATE rotation RMSE (deg):       {ate_r_stats['rmse']:.6f}\n")
+        f.write(f"RPE translation @ 1m (m/m):    {rpe_1m_rmse:.6f}\n")
+        f.write("\n")
         
         f.write("ABSOLUTE TRAJECTORY ERROR (ATE)\n")
+        f.write("  (after SE(3) Umeyama alignment, scale fixed)\n")
         f.write("-" * 40 + "\n")
         
-        ate_t_stats = ate_trans.get_all_statistics()
-        f.write("Translation:\n")
+        f.write("Translation (m):\n")
         for key, val in ate_t_stats.items():
             f.write(f"  {key:12s}: {val:.6f} m\n")
         
@@ -801,8 +816,7 @@ def save_metrics_txt(ate_trans, ate_rot, rpe_results, per_axis_data, output_path
         if 'normality_p_value' in trans_dist and trans_dist['normality_p_value'] is not None:
             f.write(f"    Normality:    {trans_dist['normality_test']} (p={trans_dist['normality_p_value']:.6f})\n")
         
-        ate_r_stats = ate_rot.get_all_statistics()
-        f.write("\nRotation:\n")
+        f.write("\nRotation (deg, angular error):\n")
         for key, val in ate_r_stats.items():
             f.write(f"  {key:12s}: {val:.6f} deg\n")
         
@@ -834,24 +848,24 @@ def save_metrics_txt(ate_trans, ate_rot, rpe_results, per_axis_data, output_path
             if note:
                 f.write(f"  note: {note}\n")
 
-        f.write("\n\nPER-AXIS ERRORS\n")
+        f.write("\n\nPER-AXIS ATE (after SE(3) alignment)\n")
         f.write("-" * 40 + "\n")
         
         trans_errors = per_axis_data['translation']
-        f.write("Translation (per axis):\n")
+        f.write("Translation RMSE per axis (X, Y, Z in meters):\n")
         for axis in ['x', 'y', 'z']:
             errors = trans_errors[axis]
-            f.write(f"  {axis.upper()}-axis:\n")
+            f.write(f"  {axis.upper()}-axis (m):\n")
             f.write(f"    RMSE:        {np.sqrt(np.mean(errors**2)):.6f} m\n")
             f.write(f"    Mean:        {np.mean(errors):.6f} m\n")
             f.write(f"    Median:      {np.median(errors):.6f} m\n")
             f.write(f"    Max:         {np.max(errors):.6f} m\n")
         
         rot_errors = per_axis_data['rotation']
-        f.write("\nRotation (per axis):\n")
+        f.write("\nRotation RMSE per axis (roll, pitch, yaw in deg; Euler XYZ from relative rotation est_inv*gt):\n")
         for axis in ['roll', 'pitch', 'yaw']:
             errors = rot_errors[axis]
-            f.write(f"  {axis.capitalize()}:\n")
+            f.write(f"  {axis.capitalize()} (deg):\n")
             f.write(f"    RMSE:        {np.sqrt(np.mean(errors**2)):.6f} deg\n")
             f.write(f"    Mean:        {np.mean(errors):.6f} deg\n")
             f.write(f"    Median:      {np.median(errors):.6f} deg\n")
@@ -1213,18 +1227,18 @@ def main(gt_file, est_file, output_dir, op_report_path, require_imu=True):
     
     # Summary
     print("\nSUMMARY:")
-    print(f"  ATE Translation RMSE: {ate_t_stats['rmse']:.4f} m (P95: {trans_percentiles['p95']:.4f} m)")
-    print(f"  ATE Rotation RMSE:    {ate_r_stats['rmse']:.4f} deg (P95: {rot_percentiles['p95']:.4f} deg)")
+    print(f"  ATE translation RMSE (m):        {ate_t_stats['rmse']:.4f} m  (P95: {trans_percentiles['p95']:.4f} m)")
+    print(f"  ATE rotation RMSE (deg):         {ate_r_stats['rmse']:.4f} deg  (P95: {rot_percentiles['p95']:.4f} deg)")
     if '1m' in rpe_results:
-        print(f"  RPE @ 1m:             {rpe_results['1m']['trans'].get_all_statistics()['rmse']:.4f} m/m")
+        print(f"  RPE translation @ 1 m (m/m):    {rpe_results['1m']['trans'].get_all_statistics()['rmse']:.4f} m/m")
     
-    # Per-axis summary
-    print("\n  Per-Axis Translation RMSE:")
+    # Per-axis summary (after SE(3) alignment)
+    print("\n  Per-axis translation RMSE (X, Y, Z in meters):")
     for axis in ['x', 'y', 'z']:
         errors = per_axis_data['translation'][axis]
         print(f"    {axis.upper()}: {np.sqrt(np.mean(errors**2)):.4f} m")
     
-    print("\n  Per-Axis Rotation RMSE:")
+    print("\n  Per-axis rotation RMSE (roll, pitch, yaw in degrees; Euler XYZ from relative rotation est_inv*gt):")
     for axis in ['roll', 'pitch', 'yaw']:
         errors = per_axis_data['rotation'][axis]
         print(f"    {axis.capitalize()}: {np.sqrt(np.mean(errors**2)):.4f} deg")

@@ -264,8 +264,6 @@ class GoldenChildBackend(Node):
         self.declare_parameter("use_odom", True)
         # IMU gravity scaling (1.0 = nominal; 0.0 disables gravity contribution)
         self.declare_parameter("imu_gravity_scale", 1.0)
-        # IMU preintegration-only gravity scaling (1.0 = nominal; 0.0 disables in preintegration)
-        self.declare_parameter("imu_preintegration_gravity_scale", 1.0)
         # Deskew rotation-only mode: removes hidden IMU translation leak through deskew
         self.declare_parameter("deskew_rotation_only", False)
 
@@ -317,13 +315,7 @@ class GoldenChildBackend(Node):
         # from the sensor origin, not the base origin.
         self.config.lidar_origin_base = jnp.array(self.t_base_lidar, dtype=jnp.float64)
         self.config.imu_gravity_scale = float(self.get_parameter("imu_gravity_scale").value)
-        self.config.imu_preintegration_gravity_scale = float(
-            self.get_parameter("imu_preintegration_gravity_scale").value
-        )
         self.get_logger().info(f"IMU gravity scale: {self.config.imu_gravity_scale:.6f}")
-        self.get_logger().info(
-            f"IMU preintegration gravity scale: {self.config.imu_preintegration_gravity_scale:.6f}"
-        )
         self.config.deskew_rotation_only = bool(self.get_parameter("deskew_rotation_only").value)
         self.get_logger().info(f"Deskew rotation-only: {self.config.deskew_rotation_only}")
 
@@ -346,7 +338,13 @@ class GoldenChildBackend(Node):
         self.last_odom_pose = None
         self.last_odom_stamp = 0.0
         self.last_odom_cov_se3 = None  # (6,6) in [x,y,z,roll,pitch,yaw] ~ [trans, rotvec]
-        
+
+        # Odometry twist (velocity) for kinematic coupling
+        # Initialize to zeros with huge covariance (negligible precision).
+        # By construction, this means "no information" without needing a gate.
+        self.last_odom_twist = jnp.zeros(6, dtype=jnp.float64)  # (6,) [vx, vy, vz, wx, wy, wz]
+        self.last_odom_twist_cov = 1e12 * jnp.eye(6, dtype=jnp.float64)  # (6,6) huge covariance
+
         # First odom pose reference (for relative transformation)
         # All subsequent odom poses will be transformed relative to this
         self.first_odom_pose = None  # (6,) SE3 pose [trans, rotvec]
@@ -451,7 +449,6 @@ class GoldenChildBackend(Node):
         """Publish RuntimeManifest at startup."""
         manifest = RuntimeManifest(
             imu_gravity_scale=float(self.config.imu_gravity_scale),
-            imu_preintegration_gravity_scale=float(self.config.imu_preintegration_gravity_scale),
         )
         manifest_dict = manifest.to_dict()
         
@@ -547,6 +544,17 @@ class GoldenChildBackend(Node):
         cov = np.array(msg.pose.covariance, dtype=np.float64).reshape(6, 6)
         self.last_odom_cov_se3 = jnp.array(cov, dtype=jnp.float64)
 
+        # Read twist (velocity) from odometry message
+        # ROS twist is in body frame: [linear.x/y/z, angular.x/y/z]
+        twist = msg.twist.twist
+        self.last_odom_twist = jnp.array([
+            twist.linear.x, twist.linear.y, twist.linear.z,
+            twist.angular.x, twist.angular.y, twist.angular.z
+        ], dtype=jnp.float64)  # (6,) [vx, vy, vz, wx, wy, wz] in body frame
+        # Twist covariance is row-major 6x6
+        twist_cov = np.array(msg.twist.covariance, dtype=np.float64).reshape(6, 6)
+        self.last_odom_twist_cov = jnp.array(twist_cov, dtype=jnp.float64)
+
     def on_lidar(self, msg: PointCloud2):
         """
         Process LiDAR scan through the full GC pipeline.
@@ -556,22 +564,9 @@ class GoldenChildBackend(Node):
         self.scan_count += 1
         self.get_logger().info(f"on_lidar callback #{self.scan_count} received")
 
-        use_imu = bool(self.get_parameter("use_imu").value)
-        use_odom = bool(self.get_parameter("use_odom").value)
-
-        # Sensor warmup check: skip scans until required sensors have data
-        # This allows the system to warm up without crashing on startup race conditions
-        # Check BEFORE parsing pointcloud to avoid wasted computation
-        if use_odom and (self.last_odom_pose is None or self.last_odom_cov_se3 is None):
-            self.get_logger().warn(
-                f"Scan #{self.scan_count} skipped: waiting for odometry (use_odom=True)"
-            )
-            return
-        if use_imu and (len(self.imu_buffer) == 0):
-            self.get_logger().warn(
-                f"Scan #{self.scan_count} skipped: waiting for IMU (use_imu=True)"
-            )
-            return
+        # Do not skip scans when odom/IMU are missing. Use LiDAR when we have it.
+        # When odom is missing we pass identity pose + large covariance (negligible odom evidence).
+        # When IMU buffer is empty we pass zero arrays (deskew no-op, IMU evidence near zero).
 
         # =====================================================================
         # TIMESTAMP AUDIT: Log header stamp and per-point time offsets
@@ -763,7 +758,11 @@ class GoldenChildBackend(Node):
                     imu_gyro=imu_gyro_j,
                     imu_accel=imu_accel_j,
                     odom_pose=self.last_odom_pose if self.last_odom_pose is not None else se3_identity(),
-                    odom_cov_se3=self.last_odom_cov_se3 if self.last_odom_cov_se3 is not None else jnp.eye(6, dtype=jnp.float64),
+                    odom_cov_se3=(
+                        self.last_odom_cov_se3
+                        if self.last_odom_cov_se3 is not None
+                        else (1e12 * jnp.eye(6, dtype=jnp.float64))
+                    ),
                     scan_start_time=scan_start_time,
                     scan_end_time=scan_end_time,
                     dt_sec=dt_sec,
@@ -773,6 +772,8 @@ class GoldenChildBackend(Node):
                     bin_atlas=self.bin_atlas,
                     map_stats=self.map_stats,
                     config=self.config,
+                    odom_twist=self.last_odom_twist,  # Phase 2: odom twist for velocity factors
+                    odom_twist_cov=self.last_odom_twist_cov,
                 )
                 results.append(result)
                 self.hypotheses[i] = result.belief_updated
@@ -796,43 +797,35 @@ class GoldenChildBackend(Node):
             self.current_belief = combined_belief
             self.pipeline_runs += 1
 
-            # Apply IW updates ONCE per scan (after hypothesis combine)
-            # Skip first 2 scans - need real deltas for meaningful updates
-            # See constants.GC_IW_UPDATE_MIN_SCAN for rationale
-            if self.scan_count >= constants.GC_IW_UPDATE_MIN_SCAN:
-                # Apply process-noise IW update
-                self.process_noise_state, proc_iw_cert_vec = process_noise_iw_apply_suffstats_jax(
-                    pn_state=self.process_noise_state,
-                    dPsi=accum_dPsi,
-                    dnu=accum_dnu,
-                    dt_sec=dt_sec,
-                    eps_psd=self.config.eps_psd,
-                )
-                self.Q = process_noise_state_to_Q_jax(self.process_noise_state)
-
-                # Apply measurement-noise IW update
-                self.measurement_noise_state, meas_iw_cert_vec = measurement_noise_apply_suffstats_jax(
-                    mn_state=self.measurement_noise_state,
-                    dPsi_blocks=accum_meas_dPsi,
-                    dnu=accum_meas_dnu,
-                    eps_psd=self.config.eps_psd,
-                )
-
-                # Apply LiDAR bucket IW update
-                self.lidar_bucket_noise_state = lidar_bucket_iw_apply_suffstats_jax(
-                    state=self.lidar_bucket_noise_state,
-                    dPsi=accum_lidar_bucket_dPsi,
-                    dnu=accum_lidar_bucket_dnu,
-                    eps_psd=self.config.eps_psd,
-                )
-            else:
-                # Skip IW updates for first 2 scans (scans 0 and 1)
-                # Use default/prior values - updates will start from scan 2
-                proc_iw_cert_vec = jnp.zeros(2, dtype=jnp.float64)
-                meas_iw_cert_vec = jnp.zeros(2, dtype=jnp.float64)
+            # Apply IW updates ONCE per scan (after hypothesis combine). No gates: always apply;
+            # readiness is a weight on sufficient stats (process has no prediction at scan 0 -> weight 0).
+            w_process = min(1, self.scan_count)  # 0 at scan 0, 1 from scan 1 (prior/budget)
+            w_meas = 1.0
+            w_lidar = 1.0
+            self.process_noise_state, proc_iw_cert_vec = process_noise_iw_apply_suffstats_jax(
+                pn_state=self.process_noise_state,
+                dPsi=w_process * accum_dPsi,
+                dnu=w_process * accum_dnu,
+                dt_sec=dt_sec,
+                eps_psd=self.config.eps_psd,
+            )
+            self.Q = process_noise_state_to_Q_jax(self.process_noise_state)
+            self.measurement_noise_state, meas_iw_cert_vec = measurement_noise_apply_suffstats_jax(
+                mn_state=self.measurement_noise_state,
+                dPsi_blocks=w_meas * accum_meas_dPsi,
+                dnu=w_meas * accum_meas_dnu,
+                eps_psd=self.config.eps_psd,
+            )
+            self.lidar_bucket_noise_state = lidar_bucket_iw_apply_suffstats_jax(
+                state=self.lidar_bucket_noise_state,
+                dPsi=w_lidar * accum_lidar_bucket_dPsi,
+                dnu=w_lidar * accum_lidar_bucket_dnu,
+                eps_psd=self.config.eps_psd,
+            )
             
             # Update map statistics with weighted increments
             delta_S_dir = jnp.zeros_like(self.map_stats.S_dir)
+            delta_S_dir_scatter = jnp.zeros_like(self.map_stats.S_dir_scatter)
             delta_N_dir = jnp.zeros_like(self.map_stats.N_dir)
             delta_N_pos = jnp.zeros_like(self.map_stats.N_pos)
             delta_sum_p = jnp.zeros_like(self.map_stats.sum_p)
@@ -840,6 +833,7 @@ class GoldenChildBackend(Node):
             for i, result in enumerate(results):
                 w_h = float(self.hyp_weights[i])
                 delta_S_dir = delta_S_dir + w_h * result.map_increments.delta_S_dir
+                delta_S_dir_scatter = delta_S_dir_scatter + w_h * result.map_increments.delta_S_dir_scatter
                 delta_N_dir = delta_N_dir + w_h * result.map_increments.delta_N_dir
                 delta_N_pos = delta_N_pos + w_h * result.map_increments.delta_N_pos
                 delta_sum_p = delta_sum_p + w_h * result.map_increments.delta_sum_p
@@ -847,6 +841,7 @@ class GoldenChildBackend(Node):
             self.map_stats = update_map_stats(
                 self.map_stats,
                 delta_S_dir,
+                delta_S_dir_scatter,
                 delta_N_dir,
                 delta_N_pos,
                 delta_sum_p,

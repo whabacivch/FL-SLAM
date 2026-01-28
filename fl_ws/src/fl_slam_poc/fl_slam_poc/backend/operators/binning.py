@@ -41,7 +41,8 @@ class BinSoftAssignResult:
 class ScanBinStats:
     """Scan bin sufficient statistics."""
     N: jnp.ndarray  # (B_BINS,) total mass per bin
-    s_dir: jnp.ndarray  # (B_BINS, 3) direction resultant vectors
+    s_dir: jnp.ndarray  # (B_BINS, 3) direction resultant vectors Σ w u
+    S_dir_scatter: jnp.ndarray  # (B_BINS, 3, 3) directional scatter Σ w u u^T
     p_bar: jnp.ndarray  # (B_BINS, 3) centroids
     Sigma_p: jnp.ndarray  # (B_BINS, 3, 3) centroid covariances
     kappa_scan: jnp.ndarray  # (B_BINS,) concentration parameters
@@ -221,6 +222,8 @@ def scan_bin_moment_match(
     # Sufficient statistics (batched; avoids O(N*B) Python loops)
     N = jnp.sum(w_r, axis=0)  # (B,)
     s_dir = w_r.T @ d  # (B,3)
+    # Second-order directional scatter: Σ w u u^T per bin
+    S_dir_scatter = jnp.einsum("nb,ni,nj->bij", w_r, d, d)  # (B,3,3)
     sum_p = w_r.T @ points  # (B,3)
 
     ppT = points[:, :, None] * points[:, None, :]  # (N,3,3)
@@ -260,6 +263,7 @@ def scan_bin_moment_match(
     result = ScanBinStats(
         N=N,
         s_dir=s_dir,
+        S_dir_scatter=S_dir_scatter,
         p_bar=p_bar,
         Sigma_p=Sigma_p,
         kappa_scan=kappa_scan,
