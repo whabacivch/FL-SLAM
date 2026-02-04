@@ -368,6 +368,53 @@ GC_MAP_BACKEND_PRIMITIVE_MAP = "primitive_map"
 # Maximum primitives in the map (fixed budget for memory)
 GC_PRIMITIVE_MAP_MAX_SIZE = 50000
 
+# =============================================================================
+# ATLAS TILING (Phase 6 end state, spec §5.7)
+# =============================================================================
+#
+# Tiles are an indexing/budgeting structure; primitives remain stored in world frame.
+# Tile addressing uses MA-Hex 3D cell coordinates (c1, c2, cz) derived from (x,y,z).
+#
+# H_TILE is the tile scale (meters).
+# Active tile set is a fixed-size stencil around the robot tile (no gating).
+#
+# NOTE: These are fixed budgets for a run; they must appear in RuntimeManifest and
+# be asserted by tests (shape caps, fixed-cost).
+
+# Tile scale (meters). Determines MA-Hex 3D cell size for atlas indexing.
+GC_H_TILE = 2.0
+
+# Active set radii in tile coordinates (hex radius in XY, linear in Z).
+GC_R_ACTIVE_TILES_XY = 1
+GC_R_ACTIVE_TILES_Z = 0
+
+# Candidate tile stencil radii in tile coordinates (around each measurement tile).
+GC_R_STENCIL_TILES_XY = 1
+GC_R_STENCIL_TILES_Z = 0
+
+# Recency bias (AoI): continuous decay on stale primitives.
+GC_RECENCY_DECAY_LAMBDA = 0.02
+GC_RECENCY_MIN_SCALE = 0.05
+
+
+def _gc_hex_disk_count_xy(r: int) -> int:
+    # Number of hex cells in a radius-r hex disk: 1 + 3 r (r + 1).
+    rr = int(max(r, 0))
+    return int(1 + 3 * rr * (rr + 1))
+
+
+# Fixed active tile count (3D): (2Rz+1) * N_hex2d(Rxy)
+GC_N_ACTIVE_TILES = (2 * GC_R_ACTIVE_TILES_Z + 1) * _gc_hex_disk_count_xy(GC_R_ACTIVE_TILES_XY)
+
+# Fixed stencil tile count (3D): (2Rz+1) * N_hex2d(Rxy)
+GC_N_STENCIL_TILES = (2 * GC_R_STENCIL_TILES_Z + 1) * _gc_hex_disk_count_xy(GC_R_STENCIL_TILES_XY)
+
+# Per-tile view cap for association (top-by-mass with deterministic tie-break).
+GC_M_TILE_VIEW = 1024
+
+# Alias for per-tile capacity. In multi-tile mode, GC_PRIMITIVE_MAP_MAX_SIZE becomes M_TILE.
+GC_M_TILE = GC_PRIMITIVE_MAP_MAX_SIZE
+
 # Forgetting factor for primitive weights (continuous, applied every scan)
 GC_PRIMITIVE_FORGETTING_FACTOR = 0.995
 

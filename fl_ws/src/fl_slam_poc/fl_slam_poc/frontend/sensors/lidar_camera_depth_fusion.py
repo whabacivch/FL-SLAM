@@ -468,7 +468,7 @@ def backprojection_cov_camera(
 ) -> np.ndarray:
     """
     Closed-form 3x3 covariance for pinhole backprojection with independent Gaussian (u,v,z).
-    Same formula as visual_feature_extractor._backprojection_cov_closed_form.
+    Same formula as visual_feature_node (C++) backprojection covariance.
     """
     du = float(u - cx)
     dv = float(v - cy)

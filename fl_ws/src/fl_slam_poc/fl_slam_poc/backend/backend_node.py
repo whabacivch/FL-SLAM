@@ -24,10 +24,11 @@ from geometry_msgs.msg import PoseStamped, TransformStamped
 from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import PointCloud2, Imu, PointField, Image
 from std_msgs.msg import String
-from fl_slam_poc.msg import RGBDImage
+from fl_slam_poc.msg import RGBDImage, VisualFeatureBatch
 
 from fl_slam_poc.common.jax_init import jnp
 from fl_slam_poc.common import constants
+from fl_slam_poc.common.tiling import ma_hex_stencil_tile_ids
 from fl_slam_poc.common.belief import (
     BeliefGaussianInfo,
     se3_identity,
@@ -46,7 +47,6 @@ from fl_slam_poc.common.runtime_counters import (
     record_jit_recompile,
     consume_runtime_counters,
 )
-from fl_slam_poc.common.ma_hex_web import generate_candidates_ma_hex_web_jax, MAHexWebConfig
 from fl_slam_poc.backend.pipeline import (
     PipelineConfig,
     RuntimeManifest,
@@ -86,9 +86,9 @@ from fl_slam_poc.backend.operators.primitive_association import (
     _compute_sparse_cost_matrix_jax,
     _sinkhorn_unbalanced_fixed_k_jax,
 )
-from fl_slam_poc.frontend.sensors.visual_feature_extractor import (
-    VisualFeatureExtractor,
-    VisualFeatureExtractorConfig,
+from fl_slam_poc.frontend.sensors.visual_types import (
+    Feature3D,
+    ExtractionResult,
     PinholeIntrinsics,
 )
 from fl_slam_poc.frontend.sensors.splat_prep import splat_prep_fused
@@ -378,6 +378,8 @@ class GeometricCompositionalBackend(Node):
         self.declare_parameter("deskew_rotation_only", False)
         # Timing/profiling
         self.declare_parameter("enable_timing", False)
+        # Parallelize independent stages
+        self.declare_parameter("enable_parallel_stages", False)
         # JAX warmup (compile before first scan; no state mutation)
         self.declare_parameter("warmup_enable", True)
         # Numerical epsilons (domain stabilization)
@@ -419,6 +421,16 @@ class GeometricCompositionalBackend(Node):
         self.declare_parameter("primitive_map_max_size", constants.GC_PRIMITIVE_MAP_MAX_SIZE)
         self.declare_parameter("primitive_forgetting_factor", constants.GC_PRIMITIVE_FORGETTING_FACTOR)
         self.declare_parameter("k_insert_tile", constants.GC_K_INSERT_TILE)
+        # Phase 6 (Real tiling): deterministic MA-Hex 3D tiling + fixed active/stencil budgets.
+        # These are fixed-cost budgets; runtime YAML must match compiled constants (fail-fast).
+        self.declare_parameter("H_TILE", constants.GC_H_TILE)
+        self.declare_parameter("R_ACTIVE_TILES_XY", constants.GC_R_ACTIVE_TILES_XY)
+        self.declare_parameter("R_ACTIVE_TILES_Z", constants.GC_R_ACTIVE_TILES_Z)
+        self.declare_parameter("N_ACTIVE_TILES", constants.GC_N_ACTIVE_TILES)
+        self.declare_parameter("R_STENCIL_TILES_XY", constants.GC_R_STENCIL_TILES_XY)
+        self.declare_parameter("R_STENCIL_TILES_Z", constants.GC_R_STENCIL_TILES_Z)
+        self.declare_parameter("N_STENCIL_TILES", constants.GC_N_STENCIL_TILES)
+        self.declare_parameter("M_TILE_VIEW", constants.GC_M_TILE_VIEW)
         self.declare_parameter("primitive_merge_threshold", constants.GC_PRIMITIVE_MERGE_THRESHOLD)
         self.declare_parameter("primitive_cull_weight_threshold", constants.GC_PRIMITIVE_CULL_WEIGHT_THRESHOLD)
         # Surfel extraction config
@@ -435,12 +447,15 @@ class GeometricCompositionalBackend(Node):
         self.declare_parameter("odom_belief_diagnostic_max_scans", 0)  # 0 = all scans
         # Camera (required): single RGBD topic from camera_rgbd_node
         self.declare_parameter("camera_rgbd_topic", "/gc/sensors/camera_rgbd")
+        # Visual feature batch (from C++ visual_feature_node)
+        self.declare_parameter("visual_feature_topic", "/gc/sensors/visual_features")
         self.declare_parameter("camera_K", [500.0, 500.0, 320.0, 240.0])  # [fx, fy, cx, cy]
         self.declare_parameter("T_base_camera", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])  # 6D rotvec
         self.declare_parameter("ringbuf_len", constants.GC_RINGBUF_LEN)
         self.declare_parameter("use_rerun", True)
         self.declare_parameter("rerun_recording_path", "")
         self.declare_parameter("rerun_spawn", False)
+        self.declare_parameter("event_log_path", "")
         # Manifest-only flags (view layer)
         self.declare_parameter("bev_backend_enabled", False)
         self.declare_parameter("bev_views_n", 0)
@@ -463,6 +478,55 @@ class GeometricCompositionalBackend(Node):
         self.config.primitive_forgetting_factor = float(
             self.get_parameter("primitive_forgetting_factor").value
         )
+        # Phase 6 tiling budgets (fail-fast if YAML drifts from compiled constants).
+        self.config.H_TILE = float(self.get_parameter("H_TILE").value)
+        self.config.R_ACTIVE_TILES_XY = int(self.get_parameter("R_ACTIVE_TILES_XY").value)
+        self.config.R_ACTIVE_TILES_Z = int(self.get_parameter("R_ACTIVE_TILES_Z").value)
+        self.config.N_ACTIVE_TILES = int(self.get_parameter("N_ACTIVE_TILES").value)
+        self.config.R_STENCIL_TILES_XY = int(self.get_parameter("R_STENCIL_TILES_XY").value)
+        self.config.R_STENCIL_TILES_Z = int(self.get_parameter("R_STENCIL_TILES_Z").value)
+        self.config.N_STENCIL_TILES = int(self.get_parameter("N_STENCIL_TILES").value)
+        self.config.M_TILE_VIEW = int(self.get_parameter("M_TILE_VIEW").value)
+
+        if self.config.H_TILE != constants.GC_H_TILE:
+            raise ValueError(
+                f"H_TILE must equal compiled GC_H_TILE={constants.GC_H_TILE}; got {self.config.H_TILE}"
+            )
+        if self.config.R_ACTIVE_TILES_XY != constants.GC_R_ACTIVE_TILES_XY:
+            raise ValueError(
+                f"R_ACTIVE_TILES_XY must equal compiled GC_R_ACTIVE_TILES_XY={constants.GC_R_ACTIVE_TILES_XY}; "
+                f"got {self.config.R_ACTIVE_TILES_XY}"
+            )
+        if self.config.R_ACTIVE_TILES_Z != constants.GC_R_ACTIVE_TILES_Z:
+            raise ValueError(
+                f"R_ACTIVE_TILES_Z must equal compiled GC_R_ACTIVE_TILES_Z={constants.GC_R_ACTIVE_TILES_Z}; "
+                f"got {self.config.R_ACTIVE_TILES_Z}"
+            )
+        if self.config.R_STENCIL_TILES_XY != constants.GC_R_STENCIL_TILES_XY:
+            raise ValueError(
+                f"R_STENCIL_TILES_XY must equal compiled GC_R_STENCIL_TILES_XY={constants.GC_R_STENCIL_TILES_XY}; "
+                f"got {self.config.R_STENCIL_TILES_XY}"
+            )
+        if self.config.R_STENCIL_TILES_Z != constants.GC_R_STENCIL_TILES_Z:
+            raise ValueError(
+                f"R_STENCIL_TILES_Z must equal compiled GC_R_STENCIL_TILES_Z={constants.GC_R_STENCIL_TILES_Z}; "
+                f"got {self.config.R_STENCIL_TILES_Z}"
+            )
+        if self.config.N_ACTIVE_TILES != constants.GC_N_ACTIVE_TILES:
+            raise ValueError(
+                f"N_ACTIVE_TILES must equal compiled GC_N_ACTIVE_TILES={constants.GC_N_ACTIVE_TILES}; "
+                f"got {self.config.N_ACTIVE_TILES}"
+            )
+        if self.config.N_STENCIL_TILES != constants.GC_N_STENCIL_TILES:
+            raise ValueError(
+                f"N_STENCIL_TILES must equal compiled GC_N_STENCIL_TILES={constants.GC_N_STENCIL_TILES}; "
+                f"got {self.config.N_STENCIL_TILES}"
+            )
+        if self.config.M_TILE_VIEW != constants.GC_M_TILE_VIEW:
+            raise ValueError(
+                f"M_TILE_VIEW must equal compiled GC_M_TILE_VIEW={constants.GC_M_TILE_VIEW}; "
+                f"got {self.config.M_TILE_VIEW}"
+            )
         # Keep config budgets consistent for diagnostics/manifesting
         self.config.N_FEAT = int(self.config.n_feat)
         self.config.N_SURFEL = int(self.config.n_surfel)
@@ -513,6 +577,7 @@ class GeometricCompositionalBackend(Node):
         )
         # Diagnostics
         self.config.save_full_diagnostics = bool(self.get_parameter("save_full_diagnostics").value)
+        self.config.enable_parallel_stages = bool(self.get_parameter("enable_parallel_stages").value)
 
         # Explicit backend selection (single-path, fail-fast)
         self.map_backend = str(self.get_parameter("map_backend").value).strip()
@@ -605,17 +670,16 @@ class GeometricCompositionalBackend(Node):
         self.camera_ringbuf: List[Tuple[float, np.ndarray, np.ndarray]] = []  # (stamp_sec, rgb, depth)
         self.camera_ringbuf_max = ringbuf_len
         self.camera_drop_count = 0
+        self.visual_feature_ringbuf: List[Tuple[float, VisualFeatureBatch]] = []
+        self.visual_feature_ringbuf_max = ringbuf_len
+        self.visual_feature_drop_count = 0
         self.get_logger().info(
             "Camera: K=[fx=%s fy=%s cx=%s cy=%s], T_base_camera cached, ringbuf_len=%d"
             % (camera_K[0], camera_K[1], camera_K[2], camera_K[3], ringbuf_len)
         )
-        # VisualFeatureExtractor and splat_prep config (camera -> MeasurementBatch)
+        # Camera intrinsics and splat_prep config (camera -> MeasurementBatch)
         fx, fy, cx, cy = float(camera_K[0]), float(camera_K[1]), float(camera_K[2]), float(camera_K[3])
         self.camera_intrinsics = PinholeIntrinsics(fx=fx, fy=fy, cx=cx, cy=cy)
-        self.visual_extractor = VisualFeatureExtractor(
-            self.camera_intrinsics,
-            config=VisualFeatureExtractorConfig(max_features=self.config.n_feat),
-        )
         self.depth_fusion_config = LidarCameraDepthFusionConfig()
 
         # Wire LiDAR origin (in base frame) into the pipeline so direction features are computed
@@ -627,6 +691,9 @@ class GeometricCompositionalBackend(Node):
         _et = self.get_parameter("enable_timing").value
         self.config.enable_timing = _et if isinstance(_et, bool) else (str(_et).lower() == "true")
         self.get_logger().info(f"Timing diagnostics: {'enabled' if self.config.enable_timing else 'disabled'}")
+        self.get_logger().info(
+            f"Parallel stages: {'enabled' if self.config.enable_parallel_stages else 'disabled'}"
+        )
         self.get_logger().info(f"Deskew rotation-only: {self.config.deskew_rotation_only}")
         self.init_window_odom_count = int(self.get_parameter("init_window_odom_count").value)
         self.get_logger().info(f"Init window: first_odom_pose = aggregate of first {self.init_window_odom_count} odom")
@@ -669,6 +736,8 @@ class GeometricCompositionalBackend(Node):
         self.last_odom_pose = None
         self.last_odom_stamp = 0.0
         self.last_odom_cov_se3 = None  # (6,6) in [x,y,z,roll,pitch,yaw] ~ [trans, rotvec]
+        self.last_imu_cov_g = None  # (3,3) gyro covariance from IMU messages
+        self.last_imu_cov_a = None  # (3,3) accel covariance from IMU messages
 
     def _jit_warmup_primitives(self) -> None:
         """Warm up JAX compile for association + fuse without mutating state."""
@@ -709,16 +778,7 @@ class GeometricCompositionalBackend(Node):
         map_positions = jnp.zeros((1, 3), dtype=jnp.float64)
         map_directions = jnp.array([[1.0, 0.0, 0.0]], dtype=jnp.float64)
         map_kappas = jnp.array([1.0], dtype=jnp.float64)
-        map_covariances = jnp.eye(3, dtype=jnp.float64)[None, :, :]
-
-        candidate_indices = generate_candidates_ma_hex_web_jax(
-            meas_positions=meas_positions,
-            map_positions=map_positions,
-            map_covariances=map_covariances,
-            k_assoc=k_assoc,
-            config=MAHexWebConfig(),
-        )
-        candidate_indices = jnp.where(batch.valid_mask[:, None], candidate_indices, 0).astype(jnp.int32)
+        candidate_indices = jnp.zeros((batch.n_total, k_assoc), dtype=jnp.int32)
 
         cost_matrix = _compute_sparse_cost_matrix_jax(
             meas_positions=meas_positions,
@@ -879,6 +939,14 @@ class GeometricCompositionalBackend(Node):
                 window_end_sec=cam_end,
                 last_stamp_sec=cam_last,
             ),
+            "visual_features": self._stream_stats(
+                buffer_len=len(self.visual_feature_ringbuf),
+                buffer_max=self.visual_feature_ringbuf_max,
+                drops_total=self.visual_feature_drop_count,
+                window_start_sec=self._buffer_time_window(self.visual_feature_ringbuf)[0],
+                window_end_sec=self._buffer_time_window(self.visual_feature_ringbuf)[1],
+                last_stamp_sec=self._buffer_time_window(self.visual_feature_ringbuf)[2],
+            ),
             "odom": self._stream_stats(
                 buffer_len=odom_len,
                 buffer_max=1,
@@ -976,7 +1044,7 @@ class GeometricCompositionalBackend(Node):
         self.get_logger().info(f"Odom: {odom_topic}")
         self.get_logger().info(f"IMU: {imu_topic}")
 
-        # Camera (required): single RGBD subscription with ring buffer
+        # Camera (required): RGBD subscription for debug/visualization
         camera_rgbd_topic = str(self.get_parameter("camera_rgbd_topic").value).strip()
         if not camera_rgbd_topic:
             raise ValueError("camera_rgbd_topic is required but empty")
@@ -985,6 +1053,18 @@ class GeometricCompositionalBackend(Node):
             callback_group=self.cb_group_sensors,
         )
         self.get_logger().info(f"Camera RGBD: {camera_rgbd_topic} (ring buffer len={self.camera_ringbuf_max})")
+
+        # Visual feature batch (C++ preprocessing)
+        visual_feature_topic = str(self.get_parameter("visual_feature_topic").value).strip()
+        if not visual_feature_topic:
+            raise ValueError("visual_feature_topic is required but empty")
+        self.sub_visual_features = self.create_subscription(
+            VisualFeatureBatch, visual_feature_topic, self._on_visual_features, qos_sensor,
+            callback_group=self.cb_group_sensors,
+        )
+        self.get_logger().info(
+            f"Visual features: {visual_feature_topic} (ring buffer len={self.visual_feature_ringbuf_max})"
+        )
         
         # Publishers
         self.pub_state = self.create_publisher(Odometry, "/gc/state", 10)
@@ -999,6 +1079,11 @@ class GeometricCompositionalBackend(Node):
         rerun_recording_path = str(self.get_parameter("rerun_recording_path").value).strip()
         rerun_spawn = bool(self.get_parameter("rerun_spawn").value)
         if use_rerun:
+            if not rerun_spawn and not rerun_recording_path:
+                self.get_logger().warning(
+                    "use_rerun=true but rerun_spawn=false and rerun_recording_path empty; "
+                    "no viewer or recording will be created."
+                )
             self.rerun_visualizer = RerunVisualizer(
                 application_id="fl_slam_poc",
                 spawn=rerun_spawn,
@@ -1010,8 +1095,10 @@ class GeometricCompositionalBackend(Node):
                     % (rerun_spawn, rerun_recording_path or "none")
                 )
             else:
-                self.get_logger().warn("Rerun visualization: requested but rerun-sdk not available; install with: pip install rerun-sdk")
-                self.rerun_visualizer = None
+                raise RuntimeError(
+                    "Rerun visualization requested but initialization failed. "
+                    "Install rerun-sdk or disable use_rerun."
+                )
         else:
             self.rerun_visualizer = None
 
@@ -1029,6 +1116,14 @@ class GeometricCompositionalBackend(Node):
             self.get_logger().info("PrimitiveMap publisher: /gc/map/points (PointCloud2)")
         
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
+
+        # Event log (append-only JSONL for replay)
+        self.event_log_path = str(self.get_parameter("event_log_path").value).strip()
+        self._event_log_file = None
+        if self.event_log_path:
+            import os
+            os.makedirs(os.path.dirname(self.event_log_path) or ".", exist_ok=True)
+            self._event_log_file = open(self.event_log_path, "a", encoding="utf-8")
         
         # Trajectory export
         self.trajectory_export_path = str(self.get_parameter("trajectory_export_path").value)
@@ -1065,6 +1160,7 @@ class GeometricCompositionalBackend(Node):
             power_beta_min=float(self.config.power_beta_min),
             power_beta_exc_c=float(self.config.power_beta_exc_c),
             power_beta_z_c=float(self.config.power_beta_z_c),
+            enable_parallel_stages=bool(self.config.enable_parallel_stages),
             ot_epsilon=float(self.config.ot_epsilon),
             ot_tau_a=float(self.config.ot_tau_a),
             ot_tau_b=float(self.config.ot_tau_b),
@@ -1076,6 +1172,14 @@ class GeometricCompositionalBackend(Node):
             K_SINKHORN=int(self.config.k_sinkhorn),
             K_INSERT_TILE=int(self.config.k_insert_tile),
             M_TILE=int(self.config.primitive_map_max_size),
+            H_TILE=float(self.config.H_TILE),
+            N_ACTIVE_TILES=int(self.config.N_ACTIVE_TILES),
+            R_ACTIVE_TILES_XY=int(self.config.R_ACTIVE_TILES_XY),
+            R_ACTIVE_TILES_Z=int(self.config.R_ACTIVE_TILES_Z),
+            M_TILE_VIEW=int(self.config.M_TILE_VIEW),
+            N_STENCIL_TILES=int(self.config.N_STENCIL_TILES),
+            R_STENCIL_TILES_XY=int(self.config.R_STENCIL_TILES_XY),
+            R_STENCIL_TILES_Z=int(self.config.R_STENCIL_TILES_Z),
             bev_backend_enabled=bool(self.bev_backend_enabled),
             bev_views_n=int(self.bev_views_n),
             pose_evidence_backend=self.pose_evidence_backend,
@@ -1085,6 +1189,7 @@ class GeometricCompositionalBackend(Node):
                 "odom": str(self.get_parameter("odom_topic").value),
                 "imu": str(self.get_parameter("imu_topic").value),
                 "camera_rgbd": str(self.get_parameter("camera_rgbd_topic").value),
+                "visual_features": str(self.get_parameter("visual_feature_topic").value),
                 "runtime_manifest": "/gc/runtime_manifest",
                 "certificate": "/gc/certificate",
                 "status": "/gc/status",
@@ -1128,6 +1233,14 @@ class GeometricCompositionalBackend(Node):
         accel = self.R_base_imu @ accel
 
         self.imu_buffer.append((stamp_sec, gyro, accel))
+
+        if bool(self.get_parameter("use_imu_message_covariance").value):
+            cov_g = np.array(msg.angular_velocity_covariance, dtype=np.float64).reshape(3, 3)
+            cov_a = np.array(msg.linear_acceleration_covariance, dtype=np.float64).reshape(3, 3)
+            if np.all(np.isfinite(cov_g)) and np.all(np.isfinite(cov_a)):
+                if not np.allclose(cov_g, 0.0) and not np.allclose(cov_a, 0.0):
+                    self.last_imu_cov_g = cov_g
+                    self.last_imu_cov_a = cov_a
         
         # Keep buffer bounded
         if len(self.imu_buffer) > self.max_imu_buffer:
@@ -1268,6 +1381,74 @@ class GeometricCompositionalBackend(Node):
                 self.camera_drop_count += 1
         except Exception as e:
             self.get_logger().warn("Camera RGBD buffer failed: %s" % e)
+
+    def _on_visual_features(self, msg: VisualFeatureBatch) -> None:
+        """Store visual feature batch in ring buffer (C++ preprocessing output)."""
+        stamp_sec = float(msg.stamp_sec) if msg.stamp_sec > 0.0 else (
+            msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        )
+        self.visual_feature_ringbuf.append((stamp_sec, msg))
+        if len(self.visual_feature_ringbuf) > self.visual_feature_ringbuf_max:
+            self.visual_feature_ringbuf.pop(0)
+            self.visual_feature_drop_count += 1
+
+    def _feature_batch_to_list(self, batch: VisualFeatureBatch) -> List[Feature3D]:
+        """Convert VisualFeatureBatch to Feature3D list (camera frame)."""
+        features: List[Feature3D] = []
+        n = min(int(batch.count), len(batch.features))
+        log_2pi = np.log(2.0 * np.pi)
+        for i in range(n):
+            f = batch.features[i]
+            if not bool(f.valid):
+                continue
+            xyz = np.array(f.xyz, dtype=np.float64).reshape(3)
+            cov = np.array(f.cov_xyz, dtype=np.float64).reshape(3, 3)
+            if not np.all(np.isfinite(cov)):
+                cov = np.eye(3, dtype=np.float64) * 1e6
+            cov_reg = cov + float(self.config.eps_lift) * np.eye(3, dtype=np.float64)
+            try:
+                sign, logdet = np.linalg.slogdet(cov_reg)
+                if sign <= 0:
+                    cov_reg = cov + 1e-6 * np.eye(3, dtype=np.float64)
+                    sign, logdet = np.linalg.slogdet(cov_reg)
+                info = np.linalg.inv(cov_reg)
+            except np.linalg.LinAlgError:
+                info = np.linalg.inv(cov_reg + 1e-3 * np.eye(3, dtype=np.float64))
+                logdet = float(np.linalg.slogdet(cov_reg)[1])
+            canonical_theta = info @ xyz
+            canonical_log_partition = (
+                0.5 * float(xyz @ info @ xyz) + 0.5 * float(logdet) + 1.5 * float(log_2pi)
+            )
+            mu_app = np.array(f.mu_app, dtype=np.float64).reshape(3)
+            if not np.all(np.isfinite(mu_app)) or np.linalg.norm(mu_app) <= 0.0:
+                mu_app_out = None
+            else:
+                mu_app_out = mu_app / (np.linalg.norm(mu_app) + 1e-12)
+            meta = {
+                "depth_sigma_c_sq": float(f.depth_sigma_c_sq),
+                "depth_Lambda_c": float(f.depth_lambda_c),
+                "depth_theta_c": float(f.depth_theta_c),
+            }
+            color = np.array(f.color, dtype=np.float64).reshape(3) if len(f.color) >= 3 else None
+            features.append(
+                Feature3D(
+                    u=float(f.u),
+                    v=float(f.v),
+                    xyz=xyz,
+                    cov_xyz=cov,
+                    info_xyz=info,
+                    logdet_cov=float(logdet),
+                    canonical_theta=canonical_theta,
+                    canonical_log_partition=canonical_log_partition,
+                    desc=np.zeros((0,), dtype=np.uint8),
+                    weight=float(f.weight),
+                    meta=meta,
+                    mu_app=mu_app_out,
+                    kappa_app=float(f.kappa_app),
+                    color=color,
+                )
+            )
+        return features
 
     def on_lidar(self, msg: PointCloud2):
         """
@@ -1416,36 +1597,45 @@ class GeometricCompositionalBackend(Node):
             f"IMU_interval=({t_last_scan:.9f}, {t_scan:.9f})"
         )
 
-        # Camera is a first-class sensor, but the pipeline must remain total (no gating).
-        # If the ring buffer is empty, run with an empty camera batch and rely on LiDAR/IMU/odom.
-        if not self.camera_ringbuf:
-            self.get_logger().warn(
-                f"Scan {self.scan_count}: camera ring buffer empty; using empty camera MeasurementBatch (no gating)."
-            )
-            camera_batch = create_empty_measurement_batch(
-                n_feat=self.config.n_feat,
-                n_surfel=self.config.n_surfel,
+        # Visual features are required when the visual feature topic is configured.
+        if not self.visual_feature_ringbuf:
+            raise RuntimeError(
+                "Visual feature ring buffer is empty; visual features are required for GC v2. "
+                "Ensure the C++ visual_feature_node is running and publishing /gc/sensors/visual_features."
             )
         else:
-            # Select frame closest to scan time (argmin |t_frame - t_scan|)
             best_idx = 0
-            best_dt = abs(self.camera_ringbuf[0][0] - t_scan)
-            for i, (t_frame, _, _) in enumerate(self.camera_ringbuf):
+            best_dt = abs(self.visual_feature_ringbuf[0][0] - t_scan)
+            for i, (t_frame, _) in enumerate(self.visual_feature_ringbuf):
                 dt_frame = abs(t_frame - t_scan)
                 if dt_frame < best_dt:
                     best_dt = dt_frame
                     best_idx = i
-            stamp_rgb, rgb, depth = self.camera_ringbuf[best_idx]
+            stamp_feat, feat_batch = self.visual_feature_ringbuf[best_idx]
             if self.scan_count <= 5:
                 self.get_logger().info(
-                    f"Camera frame selected: idx={best_idx}/{len(self.camera_ringbuf)}, "
-                    f"t_frame={stamp_rgb:.6f}, t_scan={t_scan:.6f}, dt={best_dt:.6f}s"
+                    f"Visual feature batch selected: idx={best_idx}/{len(self.visual_feature_ringbuf)}, "
+                    f"t_frame={stamp_feat:.6f}, t_scan={t_scan:.6f}, dt={best_dt:.6f}s"
                 )
-            if self.rerun_visualizer is not None:
+            # Optional RGBD logging for Rerun (debug only)
+            if self.rerun_visualizer is not None and self.camera_ringbuf:
+                rb_idx = 0
+                rb_dt = abs(self.camera_ringbuf[0][0] - t_scan)
+                for i, (t_frame, _, _) in enumerate(self.camera_ringbuf):
+                    dt_frame = abs(t_frame - t_scan)
+                    if dt_frame < rb_dt:
+                        rb_dt = dt_frame
+                        rb_idx = i
+                stamp_rgb, rgb, depth = self.camera_ringbuf[rb_idx]
                 self.rerun_visualizer.log_rgbd(rgb, depth, stamp_rgb)
-            extraction_result = self.visual_extractor.extract(
-                rgb, depth, color_order="RGB", timestamp_ns=int(stamp_rgb * 1e9)
+
+            features = self._feature_batch_to_list(feat_batch)
+            extraction_result = ExtractionResult(
+                features=features,
+                op_report=[],
+                timestamp_ns=int(stamp_feat * 1e9),
             )
+
             # LiDAR points in base frame -> camera frame for lidar_depth_evidence
             record_device_to_host(points, syncs=1)
             points_base = np.array(points, dtype=np.float64)
@@ -1459,7 +1649,7 @@ class GeometricCompositionalBackend(Node):
                 self.camera_intrinsics,
                 self.depth_fusion_config,
             )
-            # Camera features are extracted in the camera frame; convert to base frame so all
+            # Camera features are in camera frame; convert to base frame so all
             # MeasurementBatch primitives share a common sensor frame (base) before world transform.
             if fused:
                 R = self.R_base_camera
@@ -1495,7 +1685,7 @@ class GeometricCompositionalBackend(Node):
                 fused = fused_base
             camera_batch = feature_list_to_camera_batch(
                 fused,
-                stamp_rgb,
+                stamp_feat,
                 n_feat=self.config.n_feat,
                 n_surfel=self.config.n_surfel,
                 eps_lift=self.config.eps_lift,
@@ -1598,6 +1788,11 @@ class GeometricCompositionalBackend(Node):
             self.config.Sigma_meas = measurement_noise_mean_jax(self.measurement_noise_state, idx=2)
             self.config.Sigma_g = measurement_noise_mean_jax(self.measurement_noise_state, idx=0)
             self.config.Sigma_a = measurement_noise_mean_jax(self.measurement_noise_state, idx=1)
+            if bool(self.get_parameter("use_imu_message_covariance").value):
+                if self.last_imu_cov_g is not None:
+                    self.config.Sigma_g = jnp.array(self.last_imu_cov_g, dtype=jnp.float64)
+                if self.last_imu_cov_a is not None:
+                    self.config.Sigma_a = jnp.array(self.last_imu_cov_a, dtype=jnp.float64)
 
             # Precompute Q once for this scan (shared across hypotheses)
             Q_scan = process_noise_state_to_Q_jax(self.process_noise_state)
@@ -1633,9 +1828,20 @@ class GeometricCompositionalBackend(Node):
                     odom_twist_cov=self.last_odom_twist_cov,
                     primitive_map=self.primitive_map,
                     camera_batch=camera_batch,
+                    scan_seq=int(self.scan_count),
                 )
                 results.append(result)
                 self.hypotheses[i] = result.belief_updated
+
+                if i == 0 and self._event_log_file and result.event_log_entries:
+                    import json
+                    for entry in result.event_log_entries:
+                        payload = {
+                            "scan_time": float(scan_end_time),
+                            "entry": entry,
+                        }
+                        self._event_log_file.write(json.dumps(payload) + "\n")
+                    self._event_log_file.flush()
 
                 # Stage 1: Update PrimitiveMap from first hypothesis
                 # (For multi-hypothesis, we use hypothesis 0's map update; proper multi-hyp requires merging)
@@ -1844,7 +2050,17 @@ class GeometricCompositionalBackend(Node):
 
         # PrimitiveMap as PointCloud2 (/gc/map/points)
         if self.map_publisher is not None and self.primitive_map is not None:
-            self.map_publisher.publish(self.primitive_map, stamp_sec)
+            tile_ids = None
+            if self.current_belief is not None:
+                pose = self.current_belief.mean_world_pose(eps_lift=self.config.eps_lift)
+                center_xyz = np.asarray(pose[:3], dtype=np.float64).reshape(3)
+                tile_ids = ma_hex_stencil_tile_ids(
+                    center_xyz=center_xyz,
+                    h_tile=float(self.config.H_TILE),
+                    radius_xy=int(self.config.R_ACTIVE_TILES_XY),
+                    radius_z=int(self.config.R_ACTIVE_TILES_Z),
+                )
+            self.map_publisher.publish(self.primitive_map, stamp_sec, tile_ids=tile_ids)
         
         # TUM export
         if self.trajectory_file:
@@ -1892,6 +2108,9 @@ class GeometricCompositionalBackend(Node):
             self.trajectory_file.flush()
             self.trajectory_file.close()
             self.get_logger().info(f"Trajectory saved: {self.trajectory_export_path}")
+        if self._event_log_file:
+            self._event_log_file.flush()
+            self._event_log_file.close()
 
         # Save diagnostics log for dashboard
         diagnostics_path = str(self.get_parameter("diagnostics_export_path").value)
@@ -1914,47 +2133,68 @@ class GeometricCompositionalBackend(Node):
         if splat_path and self.primitive_map is not None and self.primitive_map.total_count > 0:
             try:
                 import os
-                if self.primitive_map.n_tiles != 1:
-                    raise ValueError(
-                        f"splat export expects single-tile atlas, got {self.primitive_map.n_tiles}"
+                # Multi-tile export: concatenate all tiles deterministically (sorted by tile_id).
+                positions_list = []
+                cov_list = []
+                colors_list = []
+                weights_list = []
+                directions_list = []
+                kappas_list = []
+                timestamps_list = []
+                created_list = []
+                ids_list = []
+
+                for tile_id in sorted(self.primitive_map.tile_ids):
+                    tile = self.primitive_map.tiles.get(int(tile_id))
+                    if tile is None or int(tile.count) == 0:
+                        continue
+                    view = extract_primitive_map_view(tile=tile)
+                    if view.count == 0:
+                        continue
+                    positions_list.append(np.asarray(view.positions))
+                    cov_list.append(np.asarray(view.covariances))
+                    colors_list.append(np.asarray(view.colors) if view.colors is not None else np.zeros((view.count, 3), dtype=np.float64))
+                    weights_list.append(np.asarray(view.weights))
+                    directions_list.append(np.asarray(view.directions))
+                    kappas_list.append(np.asarray(view.kappas))
+                    ids_list.append(np.asarray(view.primitive_ids))
+                    # Slot-local timestamps are direct (avoid ID lookups).
+                    slot_idx = np.asarray(view.slot_indices, dtype=np.int64)
+                    timestamps_list.append(np.asarray(tile.timestamps[slot_idx], dtype=np.float64))
+                    created_list.append(np.asarray(tile.created_timestamps[slot_idx], dtype=np.float64))
+
+                if not positions_list:
+                    self.get_logger().info("Splat export skipped: no valid primitives in atlas tiles.")
+                    positions = covariances = colors = weights = directions = kappas = timestamps = created_timestamps = view_ids = None
+                    n = 0
+                else:
+                    positions = np.concatenate(positions_list, axis=0)
+                    covariances = np.concatenate(cov_list, axis=0)
+                    colors = np.concatenate(colors_list, axis=0)
+                    weights = np.concatenate(weights_list, axis=0)
+                    directions = np.concatenate(directions_list, axis=0)
+                    kappas = np.concatenate(kappas_list, axis=0)
+                    timestamps = np.concatenate(timestamps_list, axis=0)
+                    created_timestamps = np.concatenate(created_list, axis=0)
+                    view_ids = np.concatenate(ids_list, axis=0)
+                    n = int(positions.shape[0])
+
+                if n > 0:
+                    os.makedirs(os.path.dirname(splat_path) or ".", exist_ok=True)
+                    np.savez_compressed(
+                        splat_path,
+                        positions=positions,
+                        covariances=covariances,
+                        colors=colors,
+                        weights=weights,
+                        directions=directions,
+                        kappas=kappas,
+                        timestamps=timestamps,
+                        created_timestamps=created_timestamps,
+                        primitive_ids=view_ids,
+                        n=n,
                     )
-                tile_id = self.primitive_map.tile_ids[0]
-                tile = self.primitive_map.tiles[tile_id]
-                view = extract_primitive_map_view(tile=tile)
-                n = view.count
-                # Convert to numpy for NPZ (JAX arrays may be on device)
-                positions = np.asarray(view.positions)
-                covariances = np.asarray(view.covariances)
-                colors = np.asarray(view.colors) if view.colors is not None else np.zeros((n, 3), dtype=np.float64)
-                weights = np.asarray(view.weights)
-                directions = np.asarray(view.directions)
-                kappas = np.asarray(view.kappas)
-                view_ids = np.asarray(view.primitive_ids)
-                # Match view primitive IDs back to map timestamps
-                id_to_idx = {int(pid): i for i, pid in enumerate(np.asarray(tile.primitive_ids))}
-                timestamps = np.array(
-                    [float(tile.timestamps[id_to_idx[int(pid)]]) for pid in view_ids],
-                    dtype=np.float64,
-                )
-                created_timestamps = np.array(
-                    [float(tile.created_timestamps[id_to_idx[int(pid)]]) for pid in view_ids],
-                    dtype=np.float64,
-                )
-                os.makedirs(os.path.dirname(splat_path) or ".", exist_ok=True)
-                np.savez_compressed(
-                    splat_path,
-                    positions=positions,
-                    covariances=covariances,
-                    colors=colors,
-                    weights=weights,
-                    directions=directions,
-                    kappas=kappas,
-                    timestamps=timestamps,
-                    created_timestamps=created_timestamps,
-                    primitive_ids=view_ids,
-                    n=n,
-                )
-                self.get_logger().info(f"Splat export saved: {splat_path} ({n} primitives)")
+                    self.get_logger().info(f"Splat export saved: {splat_path} ({n} primitives)")
             except Exception as e:
                 self.get_logger().warn(f"Failed to save splat export: {e}")
 

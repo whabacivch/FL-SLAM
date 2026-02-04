@@ -15,7 +15,7 @@ IMU_GRAVITY_SCALE="${IMU_GRAVITY_SCALE:-1.0}"
 DESKEW_ROTATION_ONLY="${DESKEW_ROTATION_ONLY:-false}"
 # Rosbag playback: 1/4 speed gives 4x wall-clock time per scan.
 # Playback duration: only first N seconds of bag (for testing; set BAG_DURATION to play more).
-BAG_PLAY_RATE="${BAG_PLAY_RATE:-0.25}"
+BAG_PLAY_RATE="${BAG_PLAY_RATE:-0.5}"
 BAG_DURATION="${BAG_DURATION:-60}"
 
 # ============================================================================
@@ -100,6 +100,9 @@ print_warn() {
 # ============================================================================
 cleanup() {
     local exit_code=$?
+    if [ -n "${PERF_PID:-}" ] && kill -0 "$PERF_PID" 2>/dev/null; then
+        kill "$PERF_PID" 2>/dev/null || true
+    fi
     if [ $exit_code -ne 0 ]; then
         clear_status
         echo ""
@@ -238,7 +241,7 @@ mkdir -p "$ROS_HOME" "$ROS_LOG_DIR"
 # Playback: only first BAG_DURATION seconds (e.g. 60 for quick Kimera testing).
 # Timeout = playback duration + buffer for JIT and processing (do not use full bag length).
 PLAYBACK_DURATION="$BAG_DURATION"
-TIMEOUT_SEC=$((PLAYBACK_DURATION + 90))
+TIMEOUT_SEC=$((PLAYBACK_DURATION + 120))
 
 echo -e "  Playback: ${CYAN}first ${PLAYBACK_DURATION}s${NC} of bag (timeout: ${TIMEOUT_SEC}s)"
 echo -e "  Log: ${CYAN}$LOG_FILE${NC}"
@@ -282,6 +285,46 @@ LAUNCH_OPTS=(
 ros2 launch fl_slam_poc gc_rosbag.launch.py "${LAUNCH_OPTS[@]}" \
   > "$LOG_FILE" 2>&1 &
 LAUNCH_PID=$!
+
+# Live perf monitor (CPU + GPU) for quick visibility during run.
+start_perf_monitor() {
+    local gpu_ok=false
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        gpu_ok=true
+    fi
+    (
+        local prev_idle prev_total
+        read -r _ user nice system idle iowait irq softirq steal _ < /proc/stat
+        prev_idle=$((idle + iowait))
+        prev_total=$((user + nice + system + idle + iowait + irq + softirq + steal))
+        while kill -0 "$LAUNCH_PID" 2>/dev/null; do
+            sleep 2
+            read -r _ user nice system idle iowait irq softirq steal _ < /proc/stat
+            local idle_now=$((idle + iowait))
+            local total_now=$((user + nice + system + idle + iowait + irq + softirq + steal))
+            local diff_idle=$((idle_now - prev_idle))
+            local diff_total=$((total_now - prev_total))
+            local cpu_pct=0
+            if [ "$diff_total" -gt 0 ]; then
+                cpu_pct=$(( (100 * (diff_total - diff_idle)) / diff_total ))
+            fi
+            prev_idle=$idle_now
+            prev_total=$total_now
+
+            local gpu_line=""
+            if [ "$gpu_ok" = true ]; then
+                gpu_line=$(nvidia-smi --query-gpu=utilization.gpu,utilization.memory,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | head -n1 | awk -F',' '{printf(" GPU:%s%% MEM:%s%% VRAM:%s/%sMiB",$1,$2,$3,$4)}')
+            fi
+            local proc_cpu=""
+            if [ -n "$LAUNCH_PID" ] && kill -0 "$LAUNCH_PID" 2>/dev/null; then
+                proc_cpu=$(ps -p "$LAUNCH_PID" -o %cpu= 2>/dev/null | awk '{printf(" ROS%%:%s",$1)}')
+            fi
+            echo "[perf] CPU:${cpu_pct}%${proc_cpu}${gpu_line}"
+        done
+    ) &
+    PERF_PID=$!
+}
+start_perf_monitor
 
 # Monitor with status bar
 SLAM_START=$(date +%s)

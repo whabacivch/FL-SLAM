@@ -6,5 +6,5 @@ Launch loads `gc_backend.ros__parameters` from this file. No overrides in launch
 
 - **gc_unified.yaml** — Canonical config (hub + backend). Contains extrinsics from Kimera calibration.
 - **calibration/** — Reference extrinsics from Kimera_Data/calibration (6D format).
-- **gc_backend.yaml** — Deprecated. Prefer gc_unified.yaml.
 - **gc_dead_end_audit.yaml** — Audit node config.
+  - Backend also consumes `/gc/sensors/visual_features` from `visual_feature_node` (C++).

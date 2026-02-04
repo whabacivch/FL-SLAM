@@ -22,6 +22,7 @@
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/compressed_image.hpp"
 #include "sensor_msgs/msg/image.hpp"
+#include "std_msgs/msg/float64.hpp"
 #include "fl_slam_poc/msg/rgbd_image.hpp"
 #include "opencv2/imgcodecs.hpp"
 #include "opencv2/imgproc.hpp"
@@ -56,6 +57,9 @@ class CameraRgbdNode final : public rclcpp::Node
     declare_parameter<bool>("depth_scale_mm_to_m", true);
     declare_parameter<double>("pair_max_dt_sec", 0.05);
     declare_parameter<std::string>("qos_reliability", "best_effort");
+    declare_parameter<bool>("enable_time_alignment", false);
+    declare_parameter<std::string>("time_reference_topic", "/gc/sensors/time_reference");
+    declare_parameter<double>("max_drift_sec", 0.5);
 
     rgb_in_ = get_parameter("rgb_compressed_topic").as_string();
     depth_in_ = get_parameter("depth_raw_topic").as_string();
@@ -63,6 +67,9 @@ class CameraRgbdNode final : public rclcpp::Node
     depth_scale_mm_to_m_ = get_parameter("depth_scale_mm_to_m").as_bool();
     pair_max_dt_sec_ = get_parameter("pair_max_dt_sec").as_double();
     qos_reliability_ = to_lower(get_parameter("qos_reliability").as_string());
+    enable_time_alignment_ = get_parameter("enable_time_alignment").as_bool();
+    time_reference_topic_ = get_parameter("time_reference_topic").as_string();
+    max_drift_sec_ = get_parameter("max_drift_sec").as_double();
 
     if (rgb_in_.empty() || depth_in_.empty()) {
       RCLCPP_ERROR(get_logger(),
@@ -70,9 +77,25 @@ class CameraRgbdNode final : public rclcpp::Node
       throw std::runtime_error("Missing required topic parameters");
     }
 
-    pub_ = create_publisher<fl_slam_poc::msg::RGBDImage>(output_topic_, kQueueDepth);
-
     auto qos = build_qos(qos_reliability_);
+    pub_ = create_publisher<fl_slam_poc::msg::RGBDImage>(output_topic_, kQueueDepth);
+    if (enable_time_alignment_) {
+      if (time_reference_topic_.empty()) {
+        throw std::runtime_error("camera_rgbd_node: enable_time_alignment requires time_reference_topic");
+      }
+      time_sub_ = create_subscription<std_msgs::msg::Float64>(
+        time_reference_topic_, qos,
+        [this](const std_msgs::msg::Float64::SharedPtr msg) {
+          last_ref_stamp_ = msg->data;
+          if (offset_ready_ && last_local_stamp_.has_value()) {
+            const double aligned = last_local_stamp_.value() + offset_sec_;
+            const double drift = std::abs(aligned - last_ref_stamp_.value());
+            if (drift > max_drift_sec_) {
+              throw std::runtime_error("camera_rgbd_node: timestamp drift exceeds max_drift_sec");
+            }
+          }
+        });
+    }
 
     sub_rgb_ = create_subscription<sensor_msgs::msg::CompressedImage>(
       rgb_in_, qos,
@@ -91,6 +114,11 @@ class CameraRgbdNode final : public rclcpp::Node
                 "  depth_scale_mm_to_m: %s",
                 rgb_in_.c_str(), depth_in_.c_str(), output_topic_.c_str(),
                 pair_max_dt_sec_, depth_scale_mm_to_m_ ? "true" : "false");
+    if (enable_time_alignment_) {
+      RCLCPP_INFO(get_logger(),
+                  "  time alignment: enabled (ref=%s, max_drift_sec=%.3f)",
+                  time_reference_topic_.c_str(), max_drift_sec_);
+    }
   }
 
  private:
@@ -218,6 +246,25 @@ class CameraRgbdNode final : public rclcpp::Node
     out.header.frame_id = !current_rgb_.frame_id.empty() ? current_rgb_.frame_id
                         : (!current_depth_.frame_id.empty() ? current_depth_.frame_id : "camera");
 
+    // Optional time alignment: apply single offset from reference timeline.
+    if (enable_time_alignment_) {
+      const double stamp_sec = stamp_to_sec(out.header.stamp);
+      last_local_stamp_ = stamp_sec;
+      if (!offset_ready_ && last_ref_stamp_.has_value()) {
+        offset_sec_ = last_ref_stamp_.value() - stamp_sec;
+        offset_ready_ = true;
+      }
+      if (offset_ready_) {
+        const double aligned = stamp_sec + offset_sec_;
+        if (last_out_stamp_.has_value() && aligned < last_out_stamp_.value()) {
+          throw std::runtime_error("camera_rgbd_node: non-monotonic aligned timestamps");
+        }
+        last_out_stamp_ = aligned;
+        out.header.stamp.sec = static_cast<int32_t>(aligned);
+        out.header.stamp.nanosec = static_cast<uint32_t>((aligned - std::floor(aligned)) * 1e9);
+      }
+    }
+
     // RGB image
     cv_bridge::CvImage rgb_bridge;
     rgb_bridge.header.stamp = current_rgb_.stamp;
@@ -245,6 +292,21 @@ class CameraRgbdNode final : public rclcpp::Node
                   current_depth_.image.cols, current_depth_.image.rows);
     }
 
+    // Fail-fast: if time alignment enabled but offset never initialized, something is wrong
+    // (likely QoS mismatch preventing time_reference messages from being received)
+    if (enable_time_alignment_ && !offset_ready_) {
+      unaligned_publish_count_++;
+      if (unaligned_publish_count_ == 1) {
+        RCLCPP_WARN(get_logger(),
+          "Time alignment enabled but no time_reference received yet - publishing unaligned");
+      }
+      if (unaligned_publish_count_ > 10) {
+        throw std::runtime_error(
+          "camera_rgbd_node: enable_time_alignment=true but no time_reference received after 10 frames. "
+          "Check QoS compatibility (publisher uses BEST_EFFORT) or set enable_time_alignment=false.");
+      }
+    }
+
     // Clear current to require fresh data for next pair
     current_rgb_.valid = false;
     current_depth_.valid = false;
@@ -264,9 +326,18 @@ class CameraRgbdNode final : public rclcpp::Node
   bool depth_scale_mm_to_m_{true};
   double pair_max_dt_sec_{0.05};
   std::string qos_reliability_;
+  bool enable_time_alignment_{false};
+  std::string time_reference_topic_;
+  double max_drift_sec_{0.5};
+  std::optional<double> last_ref_stamp_{};
+  std::optional<double> last_out_stamp_{};
+  std::optional<double> last_local_stamp_{};
+  double offset_sec_{0.0};
+  bool offset_ready_{false};
 
   rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr sub_rgb_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_depth_;
+  rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr time_sub_;
   rclcpp::Publisher<fl_slam_poc::msg::RGBDImage>::SharedPtr pub_;
 
   TimestampedImage current_rgb_;
@@ -277,6 +348,7 @@ class CameraRgbdNode final : public rclcpp::Node
   int pair_count_{0};
   int rgb_errors_{0};
   int depth_errors_{0};
+  int unaligned_publish_count_{0};
 };
 
 int main(int argc, char ** argv)

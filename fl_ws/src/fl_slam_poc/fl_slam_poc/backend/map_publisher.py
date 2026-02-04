@@ -128,26 +128,41 @@ class PrimitiveMapPublisher:
                 10,
             )
 
-    def publish(self, primitive_map: AtlasMap, stamp_sec: float) -> RenderablePrimitiveBatch:
+    def publish(
+        self,
+        primitive_map: AtlasMap,
+        stamp_sec: float,
+        tile_ids: Optional[list[int]] = None,
+    ) -> RenderablePrimitiveBatch:
         """
         Publish primitive map as PointCloud2 (and optionally MarkerArray).
 
-        Extracts PrimitiveMapView from primitive_map; publishes positions and
-        weights. Returns RenderablePrimitiveBatch with full fields.
+        Extracts PrimitiveMapView from the selected tiles (default: all tiles),
+        publishes positions and weights. Returns RenderablePrimitiveBatch with full fields.
         """
-        if primitive_map.n_tiles != 1:
-            raise ValueError(
-                f"PrimitiveMapPublisher expects single-tile atlas, got {primitive_map.n_tiles}"
+        if tile_ids is None:
+            tile_ids = sorted(primitive_map.tile_ids)
+        # Render-only path: concatenate variable-length views from each tile.
+        views = []
+        last_supported = []
+        for tid in tile_ids:
+            tile = primitive_map.tiles.get(int(tid))
+            if tile is None:
+                continue
+            views.append(
+                extract_primitive_map_view(
+                    tile=tile,
+                    max_primitives=self._max_primitives,
+                    eps_lift=self._eps_lift,
+                    eps_mass=self._eps_mass,
+                )
             )
-        tile_id = primitive_map.tile_ids[0]
-        tile = primitive_map.tiles[tile_id]
-        view = extract_primitive_map_view(
-            tile=tile,
-            max_primitives=self._max_primitives,
-            eps_lift=self._eps_lift,
-            eps_mass=self._eps_mass,
-        )
-        n = view.count
+            # Recency for rendering only (matches inference recency signal).
+            last_supported.append(np.asarray(tile.last_supported_scan_seq[views[-1].slot_indices], dtype=np.int64))
+        if not views:
+            n = 0
+        else:
+            n = int(sum(v.count for v in views))
         if n == 0:
             cloud_msg = _build_pointcloud2_from_view(
                 np.zeros((0, 3), dtype=np.float64),
@@ -165,11 +180,29 @@ class PrimitiveMapPublisher:
                 from visualization_msgs.msg import MarkerArray as MarkerArrayMsg
 
                 self._pub_markers.publish(MarkerArrayMsg())
-            return renderable_batch_from_view(view, eps_lift=self._eps_lift)
+            # Return an empty batch (canonical fields).
+            return RenderablePrimitiveBatch(
+                mu_world=np.zeros((0, 3), dtype=np.float64),
+                Sigma_world=np.zeros((0, 3, 3), dtype=np.float64),
+                Lambda_world=None,
+                eta=np.zeros((0, constants.GC_VMF_N_LOBES, 3), dtype=np.float64),
+                mass=np.zeros((0,), dtype=np.float64),
+                color=np.zeros((0, 3), dtype=np.float64),
+                primitive_ids=np.zeros((0,), dtype=np.int64),
+            )
 
-        positions = np.array(view.positions)
-        weights = np.array(view.weights)
-        colors = np.array(view.colors) if view.colors is not None else None
+        positions = np.concatenate([np.array(v.positions) for v in views], axis=0)
+        weights = np.concatenate([np.array(v.weights) for v in views], axis=0)
+        colors = np.concatenate([np.array(v.colors) for v in views], axis=0) if views[0].colors is not None else None
+        recency_seq = np.concatenate(last_supported, axis=0)
+        # Recency bias for rendering (newest first). Deterministic tie-break by primitive_id.
+        prim_ids_all = np.concatenate([np.array(v.primitive_ids) for v in views], axis=0)
+        order = np.lexsort((prim_ids_all, -recency_seq))
+        positions = positions[order]
+        weights = weights[order]
+        recency_seq = recency_seq[order]
+        if colors is not None:
+            colors = colors[order]
 
         cloud_msg = _build_pointcloud2_from_view(
             positions,
@@ -188,4 +221,22 @@ class PrimitiveMapPublisher:
             # Deferred: full MarkerArray from covariances can be added later
             pass
 
-        return renderable_batch_from_view(view, eps_lift=self._eps_lift)
+        # Build renderable batch from concatenated fields (covariance/eta preserved).
+        Sigma_world = np.concatenate([np.array(v.covariances) for v in views], axis=0)[order]
+        eta = (
+            np.concatenate([np.array(v.etas) for v in views], axis=0)[order]
+            if views[0].etas is not None
+            else np.zeros((positions.shape[0], constants.GC_VMF_N_LOBES, 3), dtype=np.float64)
+        )
+        prim_ids = prim_ids_all[order]
+        reg = self._eps_lift * np.eye(3, dtype=np.float64)[None, :, :]
+        Lambda_world = np.linalg.inv(Sigma_world + reg) if Sigma_world.size else None
+        return RenderablePrimitiveBatch(
+            mu_world=positions.astype(np.float64),
+            Sigma_world=Sigma_world.astype(np.float64),
+            Lambda_world=Lambda_world,
+            eta=eta.astype(np.float64),
+            mass=weights.astype(np.float64),
+            color=(colors.astype(np.float64) if colors is not None else np.zeros((positions.shape[0], 3), dtype=np.float64)),
+            primitive_ids=prim_ids.astype(np.int64),
+        )

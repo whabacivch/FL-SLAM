@@ -255,6 +255,12 @@ class PoseTwistConsistencyResult:
     r_rot: jnp.ndarray  # (3,) rotation residual
 
 
+@dataclass
+class OdomDependenceInflationResult:
+    """Conservative dependence inflation between odom pose and twist evidence."""
+    scale: float  # Multiplicative scale applied to L/h (0 < scale <= 1)
+
+
 def pose_twist_kinematic_consistency(
     pose_prev: jnp.ndarray,  # (6,) previous pose [trans, rotvec] in world frame
     pose_curr: jnp.ndarray,  # (6,) current pose [trans, rotvec] in world frame
@@ -408,3 +414,42 @@ def pose_twist_kinematic_consistency(
         r_trans=r_trans,
         r_rot=r_rot,
     ), cert, effect
+
+
+def odom_dependence_inflation(
+    r_trans: jnp.ndarray,
+    r_rot: jnp.ndarray,
+    eps_mass: float,
+    chart_id: str,
+    anchor_id: str,
+) -> Tuple[OdomDependenceInflationResult, CertBundle, ExpectedEffect]:
+    """
+    Conservative inflation for odom pose↔twist dependence.
+
+    Uses kinematic consistency residuals to downscale pose/twist evidence
+    continuously when dependence is strong. No gating, fixed-cost.
+    """
+    r_trans = jnp.asarray(r_trans, dtype=jnp.float64).reshape(-1)
+    r_rot = jnp.asarray(r_rot, dtype=jnp.float64).reshape(-1)
+    mag = float(jnp.linalg.norm(r_trans) + jnp.linalg.norm(r_rot))
+    scale = 1.0 / (1.0 + mag * mag + float(eps_mass))
+    cert = CertBundle.create_approx(
+        chart_id=chart_id,
+        anchor_id=anchor_id,
+        triggers=["OdomDependenceInflation"],
+        influence=InfluenceCert(
+            lift_strength=0.0,
+            psd_projection_delta=0.0,
+            mass_epsilon_ratio=0.0,
+            anchor_drift_rho=0.0,
+            dt_scale=1.0,
+            extrinsic_scale=1.0,
+            trust_alpha=float(scale),
+        ),
+    )
+    effect = ExpectedEffect(
+        objective_name="odom_dependence_inflation",
+        predicted=float(scale),
+        realized=float(scale),
+    )
+    return OdomDependenceInflationResult(scale=float(scale)), cert, effect

@@ -20,7 +20,7 @@ def _ensure_rerun():
         import rerun as rr
         return rr
     except ImportError:
-        return None
+        raise RuntimeError("rerun-sdk is required when use_rerun=True. Install with: pip install rerun-sdk")
 
 
 def _set_rerun_time(rr, time_sec: float) -> None:
@@ -56,14 +56,18 @@ class RerunVisualizer:
         if self._initialized:
             return self._rr is not None
         rr = _ensure_rerun()
-        if rr is None:
-            return False
         self._rr = rr
+        # Use explicit spawn call so we can hide the welcome screen and ensure connection.
         rr.init(
             application_id=self._application_id,
             default_enabled=True,
-            spawn=self._spawn,
+            spawn=False,
         )
+        if self._spawn:
+            rr.spawn(
+                hide_welcome_screen=True,
+                connect=True,
+            )
         # If recording to file: must call save() before any log (Rerun API).
         if self._recording_path and not self._spawn:
             rr.save(self._recording_path)

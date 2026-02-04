@@ -38,7 +38,7 @@ from fl_slam_poc.backend.structures.measurement_batch import (
     measurement_batch_mean_directions,
     measurement_batch_kappas,
 )
-from fl_slam_poc.backend.structures.primitive_map import PrimitiveMapView
+from fl_slam_poc.backend.structures.primitive_map import AtlasMapView
 from fl_slam_poc.backend.operators.primitive_association import PrimitiveAssociationResult
 
 
@@ -261,7 +261,7 @@ def _compute_rotation_evidence_vmf(
 def visual_pose_evidence(
     association_result: PrimitiveAssociationResult,
     measurement_batch: MeasurementBatch,
-    map_view: PrimitiveMapView,
+    map_view: AtlasMapView,
     belief_pred: BeliefGaussianInfo,
     eps_lift: float = constants.GC_EPS_LIFT,
     eps_mass: float = constants.GC_EPS_MASS,
@@ -294,7 +294,7 @@ def visual_pose_evidence(
     N_assoc, K_assoc = association_result.responsibilities.shape
 
     # Handle empty case
-    if N_meas == 0 or N_assoc == 0 or map_view.count == 0:
+    if N_meas == 0 or N_assoc == 0 or int(jnp.sum(map_view.valid_mask.astype(jnp.int32))) == 0:
         L_pose = eps_lift * jnp.eye(22, dtype=jnp.float64)
         h_pose = jnp.zeros((22,), dtype=jnp.float64)
 
@@ -347,22 +347,12 @@ def visual_pose_evidence(
 
     # Filter associations to valid measurement rows
     responsibilities = association_result.responsibilities[valid_indices]
-    candidate_tile_ids = association_result.candidate_tile_ids[valid_indices]
-    candidate_slots = association_result.candidate_slots[valid_indices]
-    if int(jnp.max(jnp.abs(candidate_tile_ids - int(map_view.tile_id)))) != 0:
-        raise ValueError(
-            f"visual_pose_evidence: candidate_tile_ids contain tiles != {map_view.tile_id}"
-        )
-    slot_to_view = -jnp.ones((map_view.m_tile,), dtype=jnp.int32)
-    slot_to_view = slot_to_view.at[map_view.slot_indices].set(
-        jnp.arange(map_view.count, dtype=jnp.int32)
-    )
-    candidate_view_indices = slot_to_view[candidate_slots]
+    candidate_view_indices = association_result.candidate_pool_indices[valid_indices].astype(jnp.int32)
     row_masses = association_result.row_masses[valid_indices]
     N_assoc, K_assoc = responsibilities.shape
 
     # Get map arrays
-    map_positions = map_view.positions  # Already in world frame
+    map_positions = map_view.positions  # Already in world frame (stitched pool)
     map_directions = map_view.directions
     map_kappas = map_view.kappas
 

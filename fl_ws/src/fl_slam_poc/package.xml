@@ -17,6 +17,7 @@
   <build_depend>rclcpp</build_depend>
   <build_depend>cv_bridge</build_depend>
   <build_depend>opencv4</build_depend>
+  <depend>libeigen3-dev</depend>
 
   <exec_depend>rclpy</exec_depend>
   <exec_depend>rclcpp</exec_depend>

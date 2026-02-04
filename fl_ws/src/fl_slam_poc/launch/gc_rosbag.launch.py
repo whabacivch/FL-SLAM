@@ -186,6 +186,11 @@ def generate_launch_description():
         default_value="/gc/sensors/camera_rgbd",
         description="Canonical RGBD output (fl_slam_poc/RGBDImage).",
     )
+    visual_feature_output_arg = DeclareLaunchArgument(
+        "visual_feature_output_topic",
+        default_value="/gc/sensors/visual_features",
+        description="Canonical visual feature batch output (fl_slam_poc/VisualFeatureBatch).",
+    )
     camera_pair_max_dt_arg = DeclareLaunchArgument(
         "camera_pair_max_dt_sec",
         default_value="0.05",
@@ -208,9 +213,74 @@ def generate_launch_description():
                 "depth_scale_mm_to_m": True,
                 "pair_max_dt_sec": LaunchConfiguration("camera_pair_max_dt_sec"),
                 "qos_reliability": "best_effort",
+                "enable_time_alignment": True,
+                "time_reference_topic": "/gc/sensors/time_reference",
+                "max_drift_sec": 0.5,
             }
         ],
     )
+
+    # =========================================================================
+    # Visual feature extraction (C++): RGBDImage -> VisualFeatureBatch
+    # =========================================================================
+    def visual_feature_node_with_config(context):
+        config_path = LaunchConfiguration("config_path").perform(context)
+        backend_params = {}
+        if config_path and os.path.isfile(config_path):
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            backend_params = dict(data.get("gc_backend", {}).get("ros__parameters", {}))
+        max_features = int(backend_params.get("n_feat", 512))
+        camera_K = backend_params.get("camera_K", [500.0, 500.0, 320.0, 240.0])
+        # Visual feature params are stored in gc_backend.ros__parameters with visual_feature_* prefix.
+        vf_map = {
+            "depth_sample_mode": "visual_feature_depth_sample_mode",
+            "pixel_sigma": "visual_feature_pixel_sigma",
+            "orb_nlevels": "visual_feature_orb_nlevels",
+            "orb_scale_factor": "visual_feature_orb_scale_factor",
+            "depth_model": "visual_feature_depth_model",
+            "depth_sigma0": "visual_feature_depth_sigma0",
+            "depth_sigma_slope": "visual_feature_depth_sigma_slope",
+            "min_depth_m": "visual_feature_min_depth_m",
+            "max_depth_m": "visual_feature_max_depth_m",
+            "depth_validity_slope": "visual_feature_depth_validity_slope",
+            "response_soft_scale": "visual_feature_response_soft_scale",
+            "depth_scale": "visual_feature_depth_scale",
+            "cov_reg_eps": "visual_feature_cov_reg_eps",
+            "invalid_cov_inflate": "visual_feature_invalid_cov_inflate",
+            "hex_radius": "visual_feature_hex_radius",
+            "quad_fit_radius": "visual_feature_quad_fit_radius",
+            "quad_fit_min_points": "visual_feature_quad_fit_min_points",
+            "quad_fit_lstsq_eps": "visual_feature_quad_fit_lstsq_eps",
+            "student_t_nu": "visual_feature_student_t_nu",
+            "student_t_w_min": "visual_feature_student_t_w_min",
+            "ma_tau": "visual_feature_ma_tau",
+            "ma_delta_inflate": "visual_feature_ma_delta_inflate",
+            "kappa0": "visual_feature_kappa0",
+            "kappa_alpha": "visual_feature_kappa_alpha",
+            "kappa_max": "visual_feature_kappa_max",
+            "kappa_min": "visual_feature_kappa_min",
+        }
+        params = {
+            "input_topic": LaunchConfiguration("camera_rgbd_output_topic").perform(context),
+            "output_topic": LaunchConfiguration("visual_feature_output_topic").perform(context),
+            "max_features": max_features,
+            "camera_K": camera_K,
+        }
+        for out_key, in_key in vf_map.items():
+            if in_key in backend_params:
+                params[out_key] = backend_params[in_key]
+        return [
+            Node(
+                package="fl_slam_poc",
+                executable="visual_feature_node",
+                name="visual_feature_node",
+                output="screen",
+                parameters=[params],
+            )
+        ]
+
+    visual_feature_with_config = OpaqueFunction(function=visual_feature_node_with_config)
 
     # =========================================================================
     # Sensor Hub (single process)
@@ -351,9 +421,11 @@ def generate_launch_description():
         camera_rgb_compressed_arg,
         camera_depth_raw_arg,
         camera_rgbd_output_arg,
+        visual_feature_output_arg,
         camera_pair_max_dt_arg,
         # Camera: single-path RGBD (C++)
         camera_rgbd_node,
+        visual_feature_with_config,
         # Sensor Hub (single process)
         gc_sensor_hub,
         # Audit / observability

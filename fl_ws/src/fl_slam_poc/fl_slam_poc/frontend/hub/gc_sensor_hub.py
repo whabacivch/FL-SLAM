@@ -80,20 +80,16 @@ def _load_hub_config(path: str) -> SensorHubConfig:
 
 
 def _resolve_default_config_path() -> str:
-    # Prefer installed share dir when available, else fall back to workspace-relative.
+    # Prefer installed share dir when available; fail-fast if unavailable.
     try:
         from ament_index_python.packages import get_package_share_directory
 
         share = get_package_share_directory("fl_slam_poc")
         return os.path.join(share, "config", "gc_unified.yaml")
     except Exception:
-        # Workspace-relative fallback for dev.
-        return os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            "..",
-            "..",
-            "config",
-            "gc_unified.yaml",
+        raise RuntimeError(
+            "gc_sensor_hub: unable to resolve installed config path. "
+            "Set gc_sensor_hub.config_path explicitly (no fallback paths)."
         )
 
 

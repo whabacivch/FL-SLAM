@@ -254,6 +254,7 @@ def generate_candidates_ma_hex_web_jax(
     meas_positions: jnp.ndarray,
     map_positions: jnp.ndarray,
     map_covariances: jnp.ndarray,
+    map_valid_mask: jnp.ndarray,
     k_assoc: int,
     config: MAHexWebConfig,
 ) -> jnp.ndarray:
@@ -266,6 +267,7 @@ def generate_candidates_ma_hex_web_jax(
     meas_positions = jnp.asarray(meas_positions, dtype=jnp.float64).reshape(-1, 3)
     map_positions = jnp.asarray(map_positions, dtype=jnp.float64).reshape(-1, 3)
     map_covariances = jnp.asarray(map_covariances, dtype=jnp.float64).reshape(-1, 3, 3)
+    map_valid_mask = jnp.asarray(map_valid_mask).reshape(-1).astype(bool)
     N_meas = meas_positions.shape[0]
     M_map = map_positions.shape[0]
 
@@ -291,16 +293,18 @@ def generate_candidates_ma_hex_web_jax(
 
     def add_one(j, state):
         bucket_i, count_i = state
+        is_valid = map_valid_mask[j]
         cell = map_linear[j]
         c = count_i[cell]
-        can_add = c < max_occ
+        can_add = is_valid & (c < max_occ)
         pos = jnp.minimum(c, max_occ - 1)
         cell_bucket = bucket_i[cell]
         added = cell_bucket.at[pos].set(j)
         shifted = jnp.concatenate([cell_bucket[1:], jnp.array([j], dtype=jnp.int32)], axis=0)
-        new_cell = jnp.where(can_add, added, shifted)
+        # Only shift/append when the entry is valid. For invalid entries, leave bucket unchanged.
+        new_cell = jnp.where(can_add, added, jnp.where(is_valid, shifted, cell_bucket))
         bucket_i = bucket_i.at[cell].set(new_cell)
-        count_i = count_i.at[cell].set(jnp.minimum(c + 1, max_occ))
+        count_i = count_i.at[cell].set(jnp.where(is_valid, jnp.minimum(c + 1, max_occ), c))
         return bucket_i, count_i
 
     bucket, count = jax.lax.fori_loop(0, M_map, add_one, (bucket, count))

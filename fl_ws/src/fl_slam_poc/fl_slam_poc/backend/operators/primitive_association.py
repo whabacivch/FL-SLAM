@@ -28,6 +28,7 @@ from fl_slam_poc.common.certificates import (
     InfluenceCert,
     SupportCert,
     ComputeCert,
+    OTCert,
 )
 
 
@@ -56,12 +57,9 @@ class MapMassPolicy(Enum):
     UNIFORM = "uniform"  # b[k] = 1/K_assoc (uniform over candidates)
     PRIMITIVE_MASS = "primitive_mass"  # b[k] ∝ map primitive weight (accumulated ESS)
     MASS_TEMPERED = "mass_tempered"  # b[k] ∝ primitive_weight^beta (future)
-from fl_slam_poc.common.ma_hex_web import (
-    MAHexWebConfig,
-    generate_candidates_ma_hex_web_jax,
-)
+from fl_slam_poc.common.tiling import hex_disk_axial, tile_ids_from_cells_jax
 from fl_slam_poc.backend.structures.measurement_batch import MeasurementBatch
-from fl_slam_poc.backend.structures.primitive_map import PrimitiveMapView
+from fl_slam_poc.backend.structures.primitive_map import AtlasMapView
 
 
 
@@ -76,6 +74,10 @@ class PrimitiveAssociationResult:
     # Sparse responsibilities: (N_total, K_ASSOC)
     # pi[i, k] = responsibility of measurement i to candidate k
     responsibilities: jnp.ndarray  # (N_total, K_ASSOC)
+
+    # Candidate pool indices: indices into the AtlasMapView pool for each (meas, k).
+    # This keeps downstream evidence extraction (pose evidence) fixed-cost and JAX-friendly.
+    candidate_pool_indices: jnp.ndarray  # (N_total, K_ASSOC) int32
 
     # Candidate addressing: (N_total, K_ASSOC)
     # candidate_tile_ids[i, k] = tile ID for measurement i, candidate k
@@ -225,11 +227,18 @@ class AssociationConfig:
     b_policy: MapMassPolicy = MapMassPolicy.UNIFORM
     # Mass regularization (replaces magic 1e-12 constants)
     eps_mass: float = constants.GC_EPS_MASS
+    # Tiling (per-measurement stencil)
+    h_tile: float = constants.GC_H_TILE
+    r_stencil_tiles_xy: int = constants.GC_R_STENCIL_TILES_XY
+    r_stencil_tiles_z: int = constants.GC_R_STENCIL_TILES_Z
+    # Recency bias (scan_seq is integer scan counter)
+    scan_seq: int = 0
+    recency_decay_lambda: float = constants.GC_RECENCY_DECAY_LAMBDA
 
 
 def associate_primitives_ot(
     measurement_batch: MeasurementBatch,
-    map_view: PrimitiveMapView,
+    map_view: AtlasMapView,
     config: AssociationConfig = None,
     eps_lift: float = constants.GC_EPS_LIFT,
     eps_mass: float = constants.GC_EPS_MASS,
@@ -257,11 +266,13 @@ def associate_primitives_ot(
 
     N_total = measurement_batch.n_total
     M_map = map_view.count
+    M_map_valid = int(jnp.sum(map_view.valid_mask.astype(jnp.int32)))
 
     # Handle empty cases (return fixed shape N_total x K_assoc for JAX-only flatten)
-    if measurement_batch.n_valid == 0 or M_map == 0:
+    if measurement_batch.n_valid == 0 or M_map_valid == 0:
         result = PrimitiveAssociationResult(
             responsibilities=jnp.zeros((N_total, config.k_assoc), dtype=jnp.float64),
+            candidate_pool_indices=jnp.zeros((N_total, config.k_assoc), dtype=jnp.int32),
             candidate_tile_ids=jnp.zeros((N_total, config.k_assoc), dtype=jnp.int64),
             candidate_slots=jnp.zeros((N_total, config.k_assoc), dtype=jnp.int64),
             row_masses=jnp.zeros((N_total,), dtype=jnp.float64),
@@ -290,26 +301,86 @@ def associate_primitives_ot(
     map_positions = map_view.positions
     map_directions = map_view.directions
     map_kappas = map_view.kappas
-    map_covariances = map_view.covariances
+    map_valid = map_view.valid_mask
+    map_last_supported = map_view.last_supported_scan_seq
 
-    # Generate candidates (MA hex web: hex cells + stencil, nearest k_assoc per measurement)
-    hex_config = MAHexWebConfig()
-    candidate_view_indices = generate_candidates_ma_hex_web_jax(
+    # Per-measurement stencil (MA-Hex tile neighborhood around measurement tile).
+    # Build fixed stencil offsets once (deterministic).
+    disk = hex_disk_axial(int(config.r_stencil_tiles_xy))
+    dq = jnp.asarray([d[0] for d in disk], dtype=jnp.int64)
+    dr = jnp.asarray([d[1] for d in disk], dtype=jnp.int64)
+    dz = jnp.asarray(
+        [z for z in range(-int(config.r_stencil_tiles_z), int(config.r_stencil_tiles_z) + 1)],
+        dtype=jnp.int64,
+    )
+    # Compute measurement tile coords in JAX (same basis as tiling.py).
+    h = jnp.maximum(jnp.asarray(config.h_tile, dtype=jnp.float64), 1e-12)
+    s1 = meas_positions[:, 0]
+    s2 = meas_positions[:, 0] * 0.5 + meas_positions[:, 1] * (jnp.sqrt(jnp.asarray(3.0, dtype=jnp.float64)) * 0.5)
+    sz = meas_positions[:, 2]
+    c1 = jnp.floor(s1 / h).astype(jnp.int64)
+    c2 = jnp.floor(s2 / h).astype(jnp.int64)
+    cz = jnp.floor(sz / h).astype(jnp.int64)
+
+    # Build stencil tile ids per measurement: (N_total, N_STENCIL_TILES)
+    # Order: z slab outer, axial disk inner (deterministic).
+    N = int(meas_positions.shape[0])
+    n_xy = dq.shape[0]
+    n_z = dz.shape[0]
+    c1_grid = c1[:, None, None] + dq[None, None, :]
+    c2_grid = c2[:, None, None] + dr[None, None, :]
+    cz_grid = cz[:, None, None] + dz[None, :, None]
+    c1_grid = jnp.repeat(c1_grid, n_z, axis=1)
+    c2_grid = jnp.repeat(c2_grid, n_z, axis=1)
+    cz_grid = jnp.repeat(cz_grid, n_xy, axis=2)
+    stencil_tile_ids = tile_ids_from_cells_jax(c1_grid, c2_grid, cz_grid).reshape(N, -1)
+
+    # Map stencil tile ids to pool tile indices (fixed budget).
+    tile_ids_pool = map_view.tile_ids  # (N_tiles,)
+    m_tile_view = int(map_view.m_tile_view)
+    eq = stencil_tile_ids[:, :, None] == tile_ids_pool[None, None, :]
+    has_match = jnp.any(eq, axis=2)
+    tile_index = jnp.argmax(eq, axis=2)
+    tile_index = jnp.where(has_match, tile_index, 0)
+
+    offsets = jnp.arange(m_tile_view, dtype=jnp.int32)[None, None, :]
+    base = (tile_index.astype(jnp.int32) * int(m_tile_view))[:, :, None]
+    pool_idx = (base + offsets).reshape(N, -1)  # (N, N_STENCIL_TILES * M_TILE_VIEW)
+
+    # Compute sparse cost matrix on the candidate pool for each measurement.
+    cost_pool = _compute_sparse_cost_matrix_jax(
         meas_positions=meas_positions,
+        meas_directions=meas_directions,
+        meas_kappas=meas_kappas,
         map_positions=map_positions,
-        map_covariances=map_covariances,
-        k_assoc=config.k_assoc,
-        config=hex_config,
+        map_directions=map_directions,
+        map_kappas=map_kappas,
+        candidate_indices=pool_idx,
+        beta=config.beta,
     )
-    candidate_view_indices = jnp.where(
-        valid_mask[:, None] > 0.0, candidate_view_indices, 0
-    ).astype(jnp.int32)
-    candidate_slots = map_view.slot_indices[candidate_view_indices]
-    candidate_tile_ids = jnp.full(
-        candidate_slots.shape, int(map_view.tile_id), dtype=jnp.int32
-    )
+    # Mask invalid pool entries and missing tiles.
+    pool_valid = map_valid[pool_idx]
+    has_match_rep = jnp.repeat(has_match[:, :, None], int(m_tile_view), axis=2).reshape(N, -1)
+    pool_valid = pool_valid & has_match_rep
+    cost_pool = jnp.where(pool_valid, cost_pool, jnp.asarray(1e12, dtype=jnp.float64))
 
-    # Compute sparse cost matrix (device-side)
+    # Deterministic ordering: cost asc, recency (newer first), primitive_id asc.
+    pool_last = map_last_supported[pool_idx]
+    scan_seq = jnp.asarray(int(config.scan_seq), dtype=jnp.int64)
+    pool_dt = jnp.maximum(jnp.asarray(0, dtype=jnp.int64), scan_seq - pool_last)
+    pool_prim_id = map_view.primitive_ids[pool_idx]
+    idx_pool = jnp.broadcast_to(
+        jnp.arange(pool_idx.shape[1], dtype=jnp.int32)[None, :],
+        pool_idx.shape,
+    )
+    _, _, _, idx_sorted = jax.lax.sort((cost_pool, pool_dt, pool_prim_id, idx_pool), dimension=1)
+    pool_idx_sorted = jnp.take_along_axis(pool_idx, idx_sorted, axis=1)
+    candidate_view_indices = pool_idx_sorted[:, : int(config.k_assoc)].astype(jnp.int32)
+    candidate_view_indices = jnp.where(valid_mask[:, None] > 0.0, candidate_view_indices, 0).astype(jnp.int32)
+    candidate_slots = map_view.candidate_slots[candidate_view_indices].astype(jnp.int64)
+    candidate_tile_ids = map_view.candidate_tile_ids[candidate_view_indices].astype(jnp.int64)
+
+    # Compute sparse cost matrix (device-side) for selected candidates
     cost_matrix = _compute_sparse_cost_matrix_jax(
         meas_positions=meas_positions,
         meas_directions=meas_directions,
@@ -320,6 +391,11 @@ def associate_primitives_ot(
         candidate_indices=candidate_view_indices,
         beta=config.beta,
     )
+    # Recency bias in association (continuous, no gates).
+    cand_last = map_last_supported[candidate_view_indices]
+    cand_dt = jnp.maximum(jnp.asarray(0, dtype=jnp.int64), scan_seq - cand_last).astype(jnp.float64)
+    recency_cost = float(config.epsilon) * float(config.recency_decay_lambda) * cand_dt
+    cost_matrix = cost_matrix + recency_cost
 
     # Cost normalization
     if config.cost_subtract_row_min:
@@ -341,21 +417,33 @@ def associate_primitives_ot(
         weighted = valid_mask * measurement_batch.weights.astype(jnp.float64)
         sum_a = jnp.maximum(jnp.sum(weighted), eps_m)
         a = weighted / sum_a
-    else:  # FEATURE_CONFIDENCE - fallback to uniform for now
-        sum_a = jnp.maximum(jnp.sum(valid_mask), eps_m)
-        a = valid_mask / sum_a
+    else:
+        raise ValueError(
+            f"Unsupported measurement mass policy: {config.a_policy}. "
+            "Only UNIFORM and WEIGHT_PROPORTIONAL are implemented."
+        )
 
     # Map marginal 'b' based on policy
     if config.b_policy == MapMassPolicy.UNIFORM:
         b = jnp.ones((config.k_assoc,), dtype=jnp.float64) / float(config.k_assoc)
     elif config.b_policy == MapMassPolicy.PRIMITIVE_MASS:
-        # Note: candidate_indices selects per-measurement candidates; b applies globally
-        # For now, use uniform; full implementation requires per-measurement b
-        b = jnp.ones((config.k_assoc,), dtype=jnp.float64) / float(config.k_assoc)
-    else:  # MASS_TEMPERED - fallback to uniform for now
-        b = jnp.ones((config.k_assoc,), dtype=jnp.float64) / float(config.k_assoc)
+        raise ValueError(
+            "MapMassPolicy.PRIMITIVE_MASS requires per-measurement candidate mass; "
+            "not implemented."
+        )
+    else:
+        raise ValueError(
+            f"Unsupported map mass policy: {config.b_policy}. Only UNIFORM is implemented."
+        )
 
     sum_b = float(jnp.sum(b))
+    # Recency-weighted per-row b (diagnostics only; sinkhorn uses fixed b for fixed-cost).
+    recency_decay = jnp.exp(-jnp.asarray(config.recency_decay_lambda, dtype=jnp.float64) * cand_dt)
+    recency_decay = jnp.where(recency_decay > 0.0, recency_decay, 0.0)
+    b_row = recency_decay / jnp.maximum(jnp.sum(recency_decay, axis=1, keepdims=True), eps_m)
+    b_row_flat = b_row.reshape(-1)
+    b_row_sorted = jnp.sort(b_row_flat)
+    b_row_p95 = float(b_row_sorted[min(int(0.95 * b_row_sorted.shape[0]), b_row_sorted.shape[0] - 1)])
 
     # Run Sinkhorn (unbalanced only; fixed iter; device-side)
     pi = _sinkhorn_unbalanced_fixed_k_jax(
@@ -379,6 +467,7 @@ def associate_primitives_ot(
 
     result = PrimitiveAssociationResult(
         responsibilities=responsibilities.astype(jnp.float64),
+        candidate_pool_indices=candidate_view_indices.astype(jnp.int32),
         candidate_tile_ids=candidate_tile_ids.astype(jnp.int64),
         candidate_slots=candidate_slots.astype(jnp.int64),
         row_masses=row_masses.astype(jnp.float64),
@@ -436,17 +525,29 @@ def associate_primitives_ot(
         ),
         compute=compute,
     )
-    # Store OT-specific diagnostics in cert metadata (custom fields via approximation_triggers for now)
-    # TODO: Add dedicated OTCert dataclass in future refactor
-    cert.approximation_triggers.append(f"ot_defect_a={marginal_defect_a:.6f}")
-    cert.approximation_triggers.append(f"ot_defect_b={marginal_defect_b:.6f}")
-    cert.approximation_triggers.append(f"ot_transport_mass={transport_mass_total:.6f}")
-    cert.approximation_triggers.append(f"ot_sum_a={float(sum_a):.6f}")
-    cert.approximation_triggers.append(f"ot_sum_b={sum_b:.6f}")
-    cert.approximation_triggers.append(f"ot_p95_a={p95_a:.6f}")
-    cert.approximation_triggers.append(f"ot_p95_b={p95_b:.6f}")
-    cert.approximation_triggers.append(f"ot_nonzero_a={n_nonzero_a}")
-    cert.approximation_triggers.append(f"ot_nonzero_b={n_nonzero_b}")
+    sum_m = float(jnp.sum(row_masses))
+    sum_novel = float(jnp.sum(jnp.maximum(a - row_masses, 0.0)))
+    cert.ot = OTCert(
+        marginal_defect_a=float(marginal_defect_a),
+        marginal_defect_b=float(marginal_defect_b),
+        transport_mass_total=float(transport_mass_total),
+        dual_gap_proxy=0.0,
+        sum_a=float(sum_a),
+        sum_b=float(sum_b),
+        sum_m=float(sum_m),
+        sum_novel=float(sum_novel),
+        p95_a=float(p95_a),
+        p95_b=float(p95_b),
+        nonzero_a=int(n_nonzero_a),
+        nonzero_b=int(n_nonzero_b),
+        epsilon=float(config.epsilon),
+        tau_a=float(config.tau_a),
+        tau_b=float(config.tau_b),
+        n_iters=int(config.k_sinkhorn),
+        b_policy=str(config.b_policy.value),
+        b_recency_decay_lambda=float(config.recency_decay_lambda),
+        b_recency_p95=float(b_row_p95),
+    )
 
     total_cost = float(jnp.sum(pi * cost_matrix))
     effect = ExpectedEffect(

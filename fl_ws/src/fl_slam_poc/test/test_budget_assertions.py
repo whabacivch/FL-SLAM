@@ -9,7 +9,8 @@ import numpy as np
 from fl_slam_poc.common import constants
 from fl_slam_poc.backend.structures import (
     create_empty_tile,
-    extract_primitive_map_view,
+    extract_atlas_map_view,
+    AtlasMap,
 )
 from fl_slam_poc.backend.structures.measurement_batch import create_empty_measurement_batch, MeasurementBatch
 from fl_slam_poc.backend.operators.primitive_association import (
@@ -48,7 +49,7 @@ def _build_measurement_batch(n_feat: int, n_surfel: int, n_valid: int) -> Measur
     )
 
 
-def _build_tile_view(m_tile: int, n_valid: int):
+def _build_atlas_view_one_tile(m_tile: int, n_valid: int, m_tile_view: int):
     tile = create_empty_tile(tile_id=0, m_tile=m_tile)
     n_valid = min(n_valid, m_tile)
     idx = np.arange(n_valid, dtype=np.int32)
@@ -77,7 +78,14 @@ def _build_tile_view(m_tile: int, n_valid: int):
         next_local_id=tile.next_local_id,
         count=n_valid,
     )
-    return extract_primitive_map_view(tile=tile)
+    atlas = AtlasMap(tiles={0: tile}, next_global_id=n_valid, total_count=n_valid, m_tile=m_tile)
+    return extract_atlas_map_view(
+        atlas_map=atlas,
+        tile_ids=[0],
+        m_tile_view=int(m_tile_view),
+        eps_lift=constants.GC_EPS_LIFT,
+        eps_mass=constants.GC_EPS_MASS,
+    )
 
 
 def test_budget_assertions_association():
@@ -88,7 +96,7 @@ def test_budget_assertions_association():
     m_tile = max(k_assoc, 1)
 
     batch = _build_measurement_batch(n_feat=n_feat, n_surfel=n_surfel, n_valid=n_valid)
-    map_view = _build_tile_view(m_tile=m_tile, n_valid=k_assoc)
+    map_view = _build_atlas_view_one_tile(m_tile=m_tile, n_valid=k_assoc, m_tile_view=k_assoc)
 
     config = AssociationConfig(k_assoc=k_assoc, k_sinkhorn=constants.GC_K_SINKHORN)
     _, cert, _ = associate_primitives_ot(
@@ -107,4 +115,4 @@ def test_budget_assertions_association():
     assert cert.compute.alloc_bytes_est <= alloc_budget
 
     # PSD projection count: at most one per primitive per scan
-    assert cert.compute.psd_projection_count <= map_view.m_tile
+    assert cert.compute.psd_projection_count <= map_view.count

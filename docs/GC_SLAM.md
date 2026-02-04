@@ -565,6 +565,16 @@ To make OT/association implementable and auditable, the following must be declar
 - **Cost** `C[i,k]`: Must be decomposed into named terms with units (e.g. point-to-plane, normal mismatch, color residual). Each term’s scale must be a surfaced prior/budget (no hidden constants); matches the “constants must be surfaced” discipline.
 - **Unbalanced OT parameters** (ε, τ_a, τ_b or equivalent): Must be compile-time constants (fixed-cost), reported in the manifest, with a certificate field for **marginal defect / dual gap proxy** (already referenced in §5.7.7).
 
+#### 5.7.3.2 Recency bias (continuous; no gates)
+
+Recency bias is allowed **only** as a continuous, fixed-cost influence. It must not change which operators run, and must never exclude candidates. Use an integer scan counter `scan_seq`.
+
+- **Deterministic tie-break**: For equal-cost candidates, order by `recency` (most recent `last_supported_scan_seq` first), then `primitive_id` ascending. This enforces deterministic replay without semantic gating.
+- **Association prior (b)**: Recency may modulate the map-side prior using a bounded decay `g(Δt)` with `Δt = scan_seq - last_supported_scan_seq`, e.g. `g(Δt) = exp(-λΔt)` or `1/(1+λΔt)`. This is continuous and fixed-cost.
+- **Uncertainty inflation**: For stale primitives, downscale precision (or IW strength) by `g(Δt)` so their covariance inflates continuously. This is applied regardless of “match quality”; no branching.
+
+All recency parameters (λ) must be logged per scan, and any recency-derived stats must be surfaced in certificates.
+
 #### 5.7.4 Candidate pool (bounded)
 
 - **Per-tile view**: Each tile exposes a **view** of size at most `M_TILE_VIEW` (e.g. top by mass, tie-break by primitive_id) for association. This caps the candidate pool per tile.
@@ -575,7 +585,7 @@ To make OT/association implementable and auditable, the following must be declar
 
 - **Novelty mass**: For each measurement i, transported mass into the map is `m_i = sum_k π[i,k]`. Measurement mass budget is `a[i]` (from fixed rule, e.g. valid weight). **Novelty** `n_i = clamp(a[i] - m_i, 0, a[i])`. Continuous; no gate.
 - **Insertion tile**: Each measurement is assigned to an insertion tile deterministically (e.g. `tile_id` of measurement position). No “if empty then insert”; insertion runs every scan for the active set.
-- **Per-tile insert**: For each active tile, select a fixed number `K_INSERT_TILE` of measurements with highest `s_i = n_i * w_i` (tie-break deterministic). Evict `K_INSERT_TILE` lowest-mass slots in that tile (tie-break by `primitive_id`). Insert new primitives into those slots (world-frame Λ, θ, η, color; initial mass = novelty or n_i*w_i; timestamp = scan time). **Insert count per scan is fixed**: `N_ACTIVE_TILES * K_INSERT_TILE` (constant). No “insert only when map empty”; that condition is forbidden.
+- **Per-tile insert**: For each active tile, select a fixed number `K_INSERT_TILE` of measurements with highest `s_i = n_i * w_i` (tie-break deterministic). Evict `K_INSERT_TILE` lowest-retention slots in that tile (retention = mass × recency decay; tie-break by `primitive_id`). Insert new primitives into those slots (world-frame Λ, θ, η, color; initial mass = novelty or n_i*w_i; timestamp = scan time). **Insert count per scan is fixed**: `N_ACTIVE_TILES * K_INSERT_TILE` (constant). No “insert only when map empty”; that condition is forbidden.
 
 #### 5.7.6 Fusion: tile-local streaming reduce-by-key (engineering contract)
 

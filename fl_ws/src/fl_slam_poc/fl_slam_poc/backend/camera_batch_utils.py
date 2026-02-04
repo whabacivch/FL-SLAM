@@ -17,7 +17,7 @@ from fl_slam_poc.common.runtime_counters import record_host_to_device
 from fl_slam_poc.backend.structures.measurement_batch import (
     measurement_batch_from_camera_splats,
 )
-from fl_slam_poc.frontend.sensors.visual_feature_extractor import Feature3D
+from fl_slam_poc.frontend.sensors.visual_types import Feature3D
 
 
 def feature_list_to_camera_batch(

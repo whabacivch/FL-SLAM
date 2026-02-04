@@ -140,6 +140,12 @@ class TimeResolvedImuResult:
     transport_sigma: float  # Self-adaptive transport consistency scale
 
 
+@dataclass
+class ImuDependenceInflationResult:
+    """Conservative dependence inflation between gyro and accel evidence."""
+    scale: float  # Multiplicative scale applied to L/h (0 < scale <= 1)
+
+
 @jax.jit
 def _accel_resultant_direction_jax(
     imu_accel: jnp.ndarray,   # (M,3)
@@ -561,3 +567,39 @@ def imu_vmf_gravity_evidence_time_resolved(
     )
 
     return result, cert, effect
+
+
+def imu_dependence_inflation(
+    transport_sigma: float,
+    eps_mass: float,
+    chart_id: str,
+    anchor_id: str,
+) -> Tuple[ImuDependenceInflationResult, CertBundle, ExpectedEffect]:
+    """
+    Conservative inflation for IMU gyro↔accel dependence.
+
+    Uses transport_sigma (from transport consistency) to downscale evidence
+    continuously when dependence is strong. No gating, fixed-cost.
+    """
+    sigma = float(max(transport_sigma, 0.0))
+    scale = 1.0 / (1.0 + sigma * sigma + float(eps_mass))
+    cert = CertBundle.create_approx(
+        chart_id=chart_id,
+        anchor_id=anchor_id,
+        triggers=["ImuDependenceInflation"],
+        influence=InfluenceCert(
+            lift_strength=0.0,
+            psd_projection_delta=0.0,
+            mass_epsilon_ratio=0.0,
+            anchor_drift_rho=0.0,
+            dt_scale=1.0,
+            extrinsic_scale=1.0,
+            trust_alpha=float(scale),
+        ),
+    )
+    effect = ExpectedEffect(
+        objective_name="imu_dependence_inflation",
+        predicted=float(scale),
+        realized=float(scale),
+    )
+    return ImuDependenceInflationResult(scale=float(scale)), cert, effect

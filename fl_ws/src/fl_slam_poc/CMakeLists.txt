@@ -13,12 +13,15 @@ find_package(OpenCV REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(Eigen3 REQUIRED NO_MODULE)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/AnchorCreate.msg"
   "msg/IMUSegment.msg"
   "msg/LoopFactor.msg"
   "msg/RGBDImage.msg"
+  "msg/VisualFeature.msg"
+  "msg/VisualFeatureBatch.msg"
   DEPENDENCIES std_msgs geometry_msgs sensor_msgs
 )
 
@@ -36,6 +39,15 @@ rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} rosidl_type
 target_link_libraries(camera_rgbd_node "${cpp_typesupport_target}")
 
 install(TARGETS camera_rgbd_node
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+add_executable(visual_feature_node src/visual_feature_node.cpp)
+ament_target_dependencies(visual_feature_node rclcpp sensor_msgs cv_bridge)
+target_link_libraries(visual_feature_node Eigen3::Eigen cv_bridge::cv_bridge ${OpenCV_LIBRARIES})
+target_link_libraries(visual_feature_node "${cpp_typesupport_target}")
+
+install(TARGETS visual_feature_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

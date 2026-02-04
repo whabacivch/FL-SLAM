@@ -372,8 +372,11 @@ class DiagnosticsLog:
         n_full = len(self.scans)
         n_tape = len(self.tape)
         if n_full > 0:
-            self._save_npz_full(path, n_full)
-        elif n_tape > 0:
+            raise ValueError(
+                "Full ScanDiagnostics NPZ export has been removed; "
+                "use minimal tape diagnostics only."
+            )
+        if n_tape > 0:
             self._save_npz_tape(path, n_tape)
         else:
             np.savez_compressed(path, n_scans=0)
@@ -400,88 +403,6 @@ class DiagnosticsLog:
             "t_point_budget_ms": np.array([t.t_point_budget_ms for t in self.tape]),
             "t_deskew_ms": np.array([t.t_deskew_ms for t in self.tape]),
         }
-        np.savez_compressed(path, **data)
-
-    def _save_npz_full(self, path: str, n: int):
-        """Save full ScanDiagnostics format (legacy)."""
-        data = {
-            "n_scans": n,
-            "run_id": self.run_id,
-            "start_time": self.start_time,
-            "scan_numbers": np.array([s.scan_number for s in self.scans]),
-            "timestamps": np.array([s.timestamp for s in self.scans]),
-            "dt_secs": np.array([s.dt_sec for s in self.scans]),
-            "dt_scan": np.array([s.dt_scan for s in self.scans]),
-            "dt_int": np.array([s.dt_int for s in self.scans]),
-            "num_imu_samples": np.array([s.num_imu_samples for s in self.scans]),
-            "n_points_raw": np.array([s.n_points_raw for s in self.scans]),
-            "n_points_budget": np.array([s.n_points_budget for s in self.scans]),
-            "p_W": np.stack([s.p_W for s in self.scans]),  # (n, 3)
-            "R_WL": np.stack([s.R_WL for s in self.scans]),  # (n, 3, 3)
-            "L_total": np.stack([s.L_total for s in self.scans]),  # (n, 22, 22)
-            "h_total": np.stack([s.h_total for s in self.scans]),  # (n, 22)
-            # Scalar diagnostics
-            "logdet_L_total": np.array([s.logdet_L_total for s in self.scans]),
-            "trace_L_total": np.array([s.trace_L_total for s in self.scans]),
-            "L_dt": np.array([s.L_dt for s in self.scans]),
-            "trace_L_ex": np.array([s.trace_L_ex for s in self.scans]),
-            "s_dt": np.array([s.s_dt for s in self.scans]),
-            "s_ex": np.array([s.s_ex for s in self.scans]),
-            "psd_delta_fro": np.array([s.psd_delta_fro for s in self.scans]),
-            "psd_min_eig_before": np.array([s.psd_min_eig_before for s in self.scans]),
-            "psd_min_eig_after": np.array([s.psd_min_eig_after for s in self.scans]),
-            "trace_Q_mode": np.array([s.trace_Q_mode for s in self.scans]),
-            "trace_Sigma_lidar_mode": np.array([s.trace_Sigma_lidar_mode for s in self.scans]),
-            "trace_Sigma_g_mode": np.array([s.trace_Sigma_g_mode for s in self.scans]),
-            "trace_Sigma_a_mode": np.array([s.trace_Sigma_a_mode for s in self.scans]),
-            "rot_err_lidar_deg_pred": np.array([s.rot_err_lidar_deg_pred for s in self.scans]),
-            "rot_err_lidar_deg_post": np.array([s.rot_err_lidar_deg_post for s in self.scans]),
-            "rot_err_odom_deg_pred": np.array([s.rot_err_odom_deg_pred for s in self.scans]),
-            "rot_err_odom_deg_post": np.array([s.rot_err_odom_deg_post for s in self.scans]),
-            "fusion_alpha": np.array([s.fusion_alpha for s in self.scans]),
-            "total_trigger_magnitude": np.array([s.total_trigger_magnitude for s in self.scans]),
-            "conditioning_number": np.array([s.conditioning_number for s in self.scans]),
-            "conditioning_pose6": np.array([s.conditioning_pose6 for s in self.scans]),
-            "accel_dir_dot_mu0": np.array([s.accel_dir_dot_mu0 for s in self.scans]),
-            "accel_mag_mean": np.array([s.accel_mag_mean for s in self.scans]),
-            "imu_a_body_mean": np.stack([s.imu_a_body_mean for s in self.scans]),
-            "imu_a_world_nog_mean": np.stack([s.imu_a_world_nog_mean for s in self.scans]),
-            "imu_a_world_mean": np.stack([s.imu_a_world_mean for s in self.scans]),
-            "imu_dt_eff_sum": np.array([s.imu_dt_eff_sum for s in self.scans]),
-            "imu_dt_valid_min": np.array([s.imu_dt_valid_min for s in self.scans]),
-            "imu_dt_valid_max": np.array([s.imu_dt_valid_max for s in self.scans]),
-            "imu_dt_valid_mean": np.array([s.imu_dt_valid_mean for s in self.scans]),
-            "imu_dt_valid_median": np.array([s.imu_dt_valid_median for s in self.scans]),
-            "imu_dt_valid_std": np.array([s.imu_dt_valid_std for s in self.scans]),
-            "imu_dt_valid_nonpos": np.array([s.imu_dt_valid_nonpos for s in self.scans]),
-            "imu_dt_weighted_mean": np.array([s.imu_dt_weighted_mean for s in self.scans]),
-            "imu_dt_weighted_std": np.array([s.imu_dt_weighted_std for s in self.scans]),
-            "imu_dt_weighted_sum": np.array([s.imu_dt_weighted_sum for s in self.scans]),
-            "dyaw_gyro": np.array([s.dyaw_gyro for s in self.scans]),
-            "dyaw_odom": np.array([s.dyaw_odom for s in self.scans]),
-            "distance_pose": np.array([s.distance_pose for s in self.scans]),
-            "distance_twist": np.array([s.distance_twist for s in self.scans]),
-            "speed_odom": np.array([s.speed_odom for s in self.scans]),
-            "speed_pose": np.array([s.speed_pose for s in self.scans]),
-            "imu_jerk_norm_mean": np.array([s.imu_jerk_norm_mean for s in self.scans]),
-            "imu_jerk_norm_max": np.array([s.imu_jerk_norm_max for s in self.scans]),
-            "t_total_ms": np.array([s.t_total_ms for s in self.scans]),
-            "t_point_budget_ms": np.array([s.t_point_budget_ms for s in self.scans]),
-            "t_imu_preint_scan_ms": np.array([s.t_imu_preint_scan_ms for s in self.scans]),
-            "t_imu_preint_int_ms": np.array([s.t_imu_preint_int_ms for s in self.scans]),
-            "t_deskew_ms": np.array([s.t_deskew_ms for s in self.scans]),
-        }
-
-        # Optional individual evidence components
-        if self.scans[0].L_lidar is not None:
-            data["L_lidar"] = np.stack([s.L_lidar for s in self.scans])
-        if self.scans[0].L_odom is not None:
-            data["L_odom"] = np.stack([s.L_odom for s in self.scans])
-        if self.scans[0].L_imu is not None:
-            data["L_imu"] = np.stack([s.L_imu for s in self.scans])
-        if self.scans[0].L_gyro is not None:
-            data["L_gyro"] = np.stack([s.L_gyro for s in self.scans])
-
         np.savez_compressed(path, **data)
 
     @classmethod

@@ -157,6 +157,8 @@ class OTCert:
     # Mass budget statistics
     sum_a: float = 0.0  # Total declared measurement mass
     sum_b: float = 0.0  # Total declared map mass
+    sum_m: float = 0.0  # Total transported mass (sum_i m_i)
+    sum_novel: float = 0.0  # Total novelty mass (sum_i n_i)
     p95_a: float = 0.0  # 95th percentile of a distribution
     p95_b: float = 0.0  # 95th percentile of b distribution
     nonzero_a: int = 0  # Count of nonzero entries in a
@@ -166,6 +168,10 @@ class OTCert:
     tau_a: float = 0.0  # Unbalanced KL for a
     tau_b: float = 0.0  # Unbalanced KL for b
     n_iters: int = 0  # Sinkhorn iterations
+    # Recency diagnostics (association prior)
+    b_policy: str = ""
+    b_recency_decay_lambda: float = 0.0
+    b_recency_p95: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -175,6 +181,8 @@ class OTCert:
             "dual_gap_proxy": self.dual_gap_proxy,
             "sum_a": self.sum_a,
             "sum_b": self.sum_b,
+            "sum_m": self.sum_m,
+            "sum_novel": self.sum_novel,
             "p95_a": self.p95_a,
             "p95_b": self.p95_b,
             "nonzero_a": self.nonzero_a,
@@ -183,6 +191,9 @@ class OTCert:
             "tau_a": self.tau_a,
             "tau_b": self.tau_b,
             "n_iters": self.n_iters,
+            "b_policy": self.b_policy,
+            "b_recency_decay_lambda": self.b_recency_decay_lambda,
+            "b_recency_p95": self.b_recency_p95,
         }
 
 
@@ -197,6 +208,10 @@ class MapUpdateCert:
     # Tile activity
     n_active_tiles: int = 0  # Number of tiles touched this scan
     tile_ids_active: List[int] = field(default_factory=list)  # IDs of active tiles
+    n_inactive_tiles: int = 0  # Tiles outside active set (not updated)
+    tile_ids_inactive: List[int] = field(default_factory=list)  # Optional list/hash of inactive tiles
+    tile_cache_hits: int = 0  # Active tiles already present in atlas
+    tile_cache_misses: int = 0  # Active tiles created this scan
     # Candidate statistics
     candidate_tiles_per_meas_mean: float = 0.0  # Mean tiles per measurement
     candidate_primitives_per_meas_mean: float = 0.0  # Mean primitives per measurement
@@ -211,11 +226,19 @@ class MapUpdateCert:
     # Fusion statistics
     fused_count: int = 0  # Primitives fused this scan
     fused_mass_total: float = 0.0  # Total mass fused
+    # Recency inflation statistics
+    staleness_inflation_strength: float = 0.0
+    staleness_cov_inflation_trace: float = 0.0
+    stale_precision_downscale_total: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "n_active_tiles": self.n_active_tiles,
             "tile_ids_active": list(self.tile_ids_active),
+            "n_inactive_tiles": self.n_inactive_tiles,
+            "tile_ids_inactive": list(self.tile_ids_inactive),
+            "tile_cache_hits": self.tile_cache_hits,
+            "tile_cache_misses": self.tile_cache_misses,
             "candidate_tiles_per_meas_mean": self.candidate_tiles_per_meas_mean,
             "candidate_primitives_per_meas_mean": self.candidate_primitives_per_meas_mean,
             "candidate_primitives_per_meas_p95": self.candidate_primitives_per_meas_p95,
@@ -226,6 +249,9 @@ class MapUpdateCert:
             "evicted_mass_total": self.evicted_mass_total,
             "fused_count": self.fused_count,
             "fused_mass_total": self.fused_mass_total,
+            "staleness_inflation_strength": self.staleness_inflation_strength,
+            "staleness_cov_inflation_trace": self.staleness_cov_inflation_trace,
+            "stale_precision_downscale_total": self.stale_precision_downscale_total,
         }
 
 
@@ -577,8 +603,10 @@ def aggregate_certificates(certs: List[CertBundle]) -> CertBundle:
     max_h2d = max(c.compute.device_runtime.host_to_device_bytes_est for c in certs)
     max_recomp = max(c.compute.device_runtime.jit_recompile_count for c in certs)
 
-    # Pick scan_io from the highest scan_seq (deterministic); fallback to first.
-    scan_io_choice = max((c.compute.scan_io for c in certs), key=lambda s: s.scan_seq, default=certs[0].compute.scan_io)
+    # Pick scan_io from the highest scan_seq (deterministic); certs must be non-empty.
+    if not certs:
+        raise ValueError("aggregate_cert_bundles requires at least one certificate")
+    scan_io_choice = max((c.compute.scan_io for c in certs), key=lambda s: s.scan_seq)
     agg_compute = ComputeCert(
         alloc_bytes_est=max_alloc,
         largest_tensor_shape=largest_shape,
@@ -605,6 +633,8 @@ def aggregate_certificates(certs: List[CertBundle]) -> CertBundle:
             dual_gap_proxy=max(c.dual_gap_proxy for c in ot_certs),
             sum_a=sum(c.sum_a for c in ot_certs),
             sum_b=sum(c.sum_b for c in ot_certs),
+            sum_m=sum(c.sum_m for c in ot_certs),
+            sum_novel=sum(c.sum_novel for c in ot_certs),
             p95_a=max(c.p95_a for c in ot_certs),
             p95_b=max(c.p95_b for c in ot_certs),
             nonzero_a=sum(c.nonzero_a for c in ot_certs),
@@ -613,6 +643,9 @@ def aggregate_certificates(certs: List[CertBundle]) -> CertBundle:
             tau_a=ot_certs[0].tau_a,
             tau_b=ot_certs[0].tau_b,
             n_iters=ot_certs[0].n_iters,
+            b_policy=ot_certs[0].b_policy,
+            b_recency_decay_lambda=ot_certs[0].b_recency_decay_lambda,
+            b_recency_p95=max(c.b_recency_p95 for c in ot_certs),
         )
 
     # Aggregate MapUpdateCert (sum counts; union tile IDs)
@@ -620,11 +653,17 @@ def aggregate_certificates(certs: List[CertBundle]) -> CertBundle:
     agg_map = None
     if map_certs:
         all_tile_ids = []
+        all_inactive_ids = []
         for mc in map_certs:
             all_tile_ids.extend(mc.tile_ids_active)
+            all_inactive_ids.extend(mc.tile_ids_inactive)
         agg_map = MapUpdateCert(
             n_active_tiles=len(set(all_tile_ids)),
             tile_ids_active=list(set(all_tile_ids)),
+            n_inactive_tiles=len(set(all_inactive_ids)),
+            tile_ids_inactive=list(set(all_inactive_ids)),
+            tile_cache_hits=sum(c.tile_cache_hits for c in map_certs),
+            tile_cache_misses=sum(c.tile_cache_misses for c in map_certs),
             candidate_tiles_per_meas_mean=max(c.candidate_tiles_per_meas_mean for c in map_certs),
             candidate_primitives_per_meas_mean=max(c.candidate_primitives_per_meas_mean for c in map_certs),
             candidate_primitives_per_meas_p95=max(c.candidate_primitives_per_meas_p95 for c in map_certs),
@@ -635,6 +674,9 @@ def aggregate_certificates(certs: List[CertBundle]) -> CertBundle:
             evicted_mass_total=sum(c.evicted_mass_total for c in map_certs),
             fused_count=sum(c.fused_count for c in map_certs),
             fused_mass_total=sum(c.fused_mass_total for c in map_certs),
+            staleness_inflation_strength=max(c.staleness_inflation_strength for c in map_certs),
+            staleness_cov_inflation_trace=max(c.staleness_cov_inflation_trace for c in map_certs),
+            stale_precision_downscale_total=sum(c.stale_precision_downscale_total for c in map_certs),
         )
 
     return CertBundle(

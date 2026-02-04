@@ -258,6 +258,7 @@ class TestSensorHubWiring:
         assert 'executable="camera_rgbd_node"' in text
         assert 'executable="image_decompress_cpp"' not in text
         assert 'executable="depth_passthrough"' not in text
+        assert 'executable="visual_feature_node"' in text
 
     def test_unified_yaml_uses_camera_rgbd_topic(self):
         """Backend config must specify camera_rgbd_topic (legacy camera_image_topic/camera_depth_topic removed)."""
@@ -268,5 +269,6 @@ class TestSensorHubWiring:
         with open(path, "r", encoding="utf-8") as f:
             text = f.read()
         assert "camera_rgbd_topic:" in text
+        assert "visual_feature_topic:" in text
         assert "camera_image_topic:" not in text
         assert "camera_depth_topic:" not in text

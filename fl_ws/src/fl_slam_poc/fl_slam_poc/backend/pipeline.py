@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Tuple, List, Optional, Dict
+from concurrent.futures import ThreadPoolExecutor
 
 import time
 from fl_slam_poc.common.jax_init import jax, jnp
@@ -41,7 +42,9 @@ from fl_slam_poc.backend.operators import (
     odom_velocity_evidence,
     odom_yawrate_evidence,
     pose_twist_kinematic_consistency,
+    odom_dependence_inflation,
     imu_vmf_gravity_evidence_time_resolved,
+    imu_dependence_inflation,
     planar_z_prior,
     velocity_z_prior,
     imu_gyro_rotation_evidence,
@@ -67,17 +70,18 @@ from fl_slam_poc.backend.diagnostics import ScanDiagnostics, MinimalScanTape
 # Stage 1: PrimitiveMap + OT imports
 from fl_slam_poc.backend.structures import (
     AtlasMap,
-    PrimitiveMapView,
     create_empty_atlas_map,
-    extract_primitive_map_view,
+    extract_atlas_map_view,
     primitive_map_fuse,
-    primitive_map_insert,
+    primitive_map_insert_masked,
     primitive_map_cull,
     primitive_map_forget,
+    primitive_map_recency_inflate,
     primitive_map_merge_reduce,
     MeasurementBatch,
     create_empty_measurement_batch,
 )
+from fl_slam_poc.common.tiling import ma_hex_stencil_tile_ids, tile_ids_from_xyz_batch_jax
 from fl_slam_poc.common.primitives import (
     domain_projection_psd,
     spd_cholesky_solve_lifted,
@@ -164,6 +168,9 @@ class PipelineConfig:
     # Diagnostics: minimal tape (default) vs full ScanDiagnostics per scan
     save_full_diagnostics: bool = False  # If True, build full ScanDiagnostics; else minimal tape only
 
+    # Parallelize independent stages (IMU+odom evidence vs surfel/association prep)
+    enable_parallel_stages: bool = False
+
     # =========================================================================
     # Map + Pose Evidence (single-path, primitives only)
     # =========================================================================
@@ -183,6 +190,18 @@ class PipelineConfig:
     primitive_cull_weight_threshold: float = constants.GC_PRIMITIVE_CULL_WEIGHT_THRESHOLD
     # Fixed-budget insertion each scan (per-tile)
     k_insert_tile: int = constants.GC_K_INSERT_TILE
+
+    # Atlas tiling budgets (Phase 6 end state; spec §5.7)
+    H_TILE: float = constants.GC_H_TILE
+    N_ACTIVE_TILES: int = constants.GC_N_ACTIVE_TILES
+    R_ACTIVE_TILES_XY: int = constants.GC_R_ACTIVE_TILES_XY
+    R_ACTIVE_TILES_Z: int = constants.GC_R_ACTIVE_TILES_Z
+    M_TILE_VIEW: int = constants.GC_M_TILE_VIEW
+    N_STENCIL_TILES: int = constants.GC_N_STENCIL_TILES
+    R_STENCIL_TILES_XY: int = constants.GC_R_STENCIL_TILES_XY
+    R_STENCIL_TILES_Z: int = constants.GC_R_STENCIL_TILES_Z
+    RECENCY_DECAY_LAMBDA: float = constants.GC_RECENCY_DECAY_LAMBDA
+    RECENCY_MIN_SCALE: float = constants.GC_RECENCY_MIN_SCALE
 
     # Surfel extraction config
     surfel_voxel_size_m: float = 0.1
@@ -229,6 +248,7 @@ class ScanPipelineResult:
     n_primitives_inserted: int = 0
     n_primitives_fused: int = 0
     n_primitives_culled: int = 0
+    event_log_entries: Optional[list] = None
 
 
 # =============================================================================
@@ -312,6 +332,7 @@ def process_scan_single_hypothesis(
     odom_twist: jnp.ndarray,  # (6,) [vx,vy,vz,wx,wy,wz] in body frame (never None)
     odom_twist_cov: jnp.ndarray,  # (6,6) twist covariance (never None)
     camera_batch: MeasurementBatch,  # Camera splats from VisualFeatureExtractor + splat_prep (required)
+    scan_seq: int = 0,
     primitive_map: Optional[AtlasMap] = None,  # AtlasMap is the canonical map
 ) -> ScanPipelineResult:
     """
@@ -365,8 +386,8 @@ def process_scan_single_hypothesis(
                 out,
             )
             record_host_sync(syncs=1)
-        except Exception:
-            pass
+        except Exception as exc:
+            raise RuntimeError(f"Timing sync failed for {label}") from exc
         timing_ms[label] = (time.perf_counter() - start) * 1000.0
     
     # =========================================================================
@@ -604,149 +625,333 @@ def process_scan_single_hypothesis(
     norms = jnp.linalg.norm(rays, axis=1, keepdims=True)
     point_directions = rays / (norms + config.eps_mass)
 
-    # =========================================================================
-    # Build IMU+odom evidence and z_lin (linearization point for visual evidence)
-    # =========================================================================
-    # Evidence uses pre-update map; z_lin is IMU+odom-informed (not raw prediction).
-    pose_pred = belief_pred.mean_world_pose(eps_lift=config.eps_lift)
-    odom_pose = jnp.asarray(odom_pose, dtype=jnp.float64).reshape(-1)
-    odom_cov_se3 = jnp.asarray(odom_cov_se3, dtype=jnp.float64)
-    odom_result, odom_cert, odom_effect = odom_quadratic_evidence(
-        belief_pred_pose=pose_pred,
-        odom_pose=odom_pose,
-        odom_cov_se3=odom_cov_se3,
-        eps_psd=config.eps_psd,
-        eps_lift=config.eps_lift,
-        chart_id=belief_pred.chart_id,
-        anchor_id=belief_pred.anchor_id,
-    )
-    all_certs.append(odom_cert)
-    imu_result, imu_cert, imu_effect = imu_vmf_gravity_evidence_time_resolved(
-        rotvec_world_body=pose_pred[3:6],
-        imu_accel=imu_accel,
-        imu_gyro=imu_gyro,
-        weights=w_imu_int,
-        accel_bias=accel_bias,
-        gravity_W=gravity_W,
-        dt_imu=dt_imu,
-        eps_psd=config.eps_psd,
-        eps_mass=config.eps_mass,
-        chart_id=belief_pred.chart_id,
-        anchor_id=belief_pred.anchor_id,
-    )
-    all_certs.append(imu_cert)
-    Sigma_g = jnp.asarray(config.Sigma_g, dtype=jnp.float64)
-    _rotvec0_np = np.array(rotvec0)
-    _pose_pred_np = np.array(pose_pred)
-    _delta_pose_int_np = np.array(delta_pose_int)
-    if not np.all(np.isfinite(_rotvec0_np)):
-        raise ValueError(f"rotvec0 contains NaN: {_rotvec0_np}")
-    if not np.all(np.isfinite(_pose_pred_np)):
-        raise ValueError(f"pose_pred contains NaN: {_pose_pred_np}")
-    if not np.all(np.isfinite(_delta_pose_int_np)):
-        raise ValueError(f"delta_pose_int contains NaN: {_delta_pose_int_np}")
-    gyro_result, gyro_cert, gyro_effect = imu_gyro_rotation_evidence(
-        rotvec_start_WB=rotvec0,
-        rotvec_end_pred_WB=pose_pred[3:6],
-        delta_rotvec_meas=delta_pose_int[3:6],
-        Sigma_g=Sigma_g,
-        dt_int=dt_int,
-        eps_psd=config.eps_psd,
-        eps_lift=config.eps_lift,
-        chart_id=belief_pred.chart_id,
-        anchor_id=belief_pred.anchor_id,
-    )
-    all_certs.append(gyro_cert)
-    mu_prev = belief_prev.mean_increment(eps_lift=config.eps_lift)
-    v_start_world = mu_prev[6:9]
-    v_pred_world = mu_inc[6:9]
-    Sigma_a = jnp.asarray(config.Sigma_a, dtype=jnp.float64)
-    preint_result, preint_cert, preint_effect = imu_preintegration_factor(
-        p_start_world=pose0[0:3],
-        rotvec_start_WB=rotvec0,
-        v_start_world=v_start_world,
-        p_end_pred_world=pose_pred[0:3],
-        v_end_pred_world=v_pred_world,
-        delta_v_body=delta_v_int,
-        delta_p_body=delta_p_int,
-        Sigma_a=Sigma_a,
-        dt_int=dt_int,
-        eps_psd=config.eps_psd,
-        eps_lift=config.eps_lift,
-        chart_id=belief_pred.chart_id,
-        anchor_id=belief_pred.anchor_id,
-    )
-    all_certs.append(preint_cert)
-    planar_result, planar_cert, _ = planar_z_prior(
-        belief_pred_pose=pose_pred,
-        z_ref=config.planar_z_ref,
-        sigma_z=config.planar_z_sigma,
-        eps_psd=config.eps_psd,
-        chart_id=belief_pred.chart_id,
-        anchor_id=belief_pred.anchor_id,
-    )
-    all_certs.append(planar_cert)
-    vz_pred = float(mu_inc[8])
-    vz_result, vz_cert, _ = velocity_z_prior(
-        v_z_pred=vz_pred,
-        sigma_vz=config.planar_vz_sigma,
-        chart_id=belief_pred.chart_id,
-        anchor_id=belief_pred.anchor_id,
-    )
-    all_certs.append(vz_cert)
-    v_pred_world_early = mu_inc[6:9]
-    R_world_body_early = se3_jax.so3_exp(pose_pred[3:6])
-    odom_vel_result, odom_vel_cert, _ = odom_velocity_evidence(
-        v_pred_world=v_pred_world_early,
-        R_world_body=R_world_body_early,
-        v_odom_body=odom_twist[0:3],
-        Sigma_v=odom_twist_cov[0:3, 0:3],
-        eps_psd=config.eps_psd,
-        eps_lift=config.eps_lift,
-        chart_id=belief_pred.chart_id,
-        anchor_id=belief_pred.anchor_id,
-    )
-    all_certs.append(odom_vel_cert)
-    sigma_wz_from_cov = jnp.sqrt(jnp.maximum(odom_twist_cov[5, 5], 1e-12))
-    sigma_wz_effective = float(sigma_wz_from_cov)
-    odom_wz_result, odom_wz_cert, _ = odom_yawrate_evidence(
-        omega_z_pred=float(omega_avg[2]),
-        omega_z_odom=float(odom_twist[5]),
-        sigma_wz=sigma_wz_effective,
-        chart_id=belief_pred.chart_id,
-        anchor_id=belief_pred.anchor_id,
-    )
-    all_certs.append(odom_wz_cert)
-    kinematic_result, kinematic_cert, _ = pose_twist_kinematic_consistency(
-        pose_prev=pose0,
-        pose_curr=pose_pred,
-        v_body=odom_twist[0:3],
-        omega_body=odom_twist[3:6],
-        dt=dt_sec,
-        Sigma_v=odom_twist_cov[0:3, 0:3],
-        Sigma_omega=odom_twist_cov[3:6, 3:6],
-        eps_psd=config.eps_psd,
-        eps_lift=config.eps_lift,
-        chart_id=belief_pred.chart_id,
-        anchor_id=belief_pred.anchor_id,
-    )
-    all_certs.append(kinematic_cert)
-    L_imu_odom = (odom_result.L_odom + imu_result.L_imu + gyro_result.L_gyro + preint_result.L_imu_preint
-                  + planar_result.L_planar + vz_result.L_vz + odom_vel_result.L_vel + odom_wz_result.L_wz
-                  + kinematic_result.L_consistency)
-    h_imu_odom = (odom_result.h_odom + imu_result.h_imu + gyro_result.h_gyro + preint_result.h_imu_preint
-                  + planar_result.h_planar + vz_result.h_vz + odom_vel_result.h_vel + odom_wz_result.h_wz
-                  + kinematic_result.h_consistency)
-    L_fused = belief_pred.L + L_imu_odom
-    h_fused = belief_pred.h + h_imu_odom
-    L_fused_psd = domain_projection_psd(L_fused, config.eps_psd).M_psd
-    z_lin_22d = spd_cholesky_solve_lifted(L_fused_psd, h_fused, config.eps_lift).x
-    z_lin_pose = z_lin_22d[0:6]
+    def _compute_imu_odom_branch():
+        local_certs: List = []
+        pose_pred_local = belief_pred.mean_world_pose(eps_lift=config.eps_lift)
+        odom_pose_local = jnp.asarray(odom_pose, dtype=jnp.float64).reshape(-1)
+        odom_cov_se3_local = jnp.asarray(odom_cov_se3, dtype=jnp.float64)
+        odom_result_local, odom_cert_local, _ = odom_quadratic_evidence(
+            belief_pred_pose=pose_pred_local,
+            odom_pose=odom_pose_local,
+            odom_cov_se3=odom_cov_se3_local,
+            eps_psd=config.eps_psd,
+            eps_lift=config.eps_lift,
+            chart_id=belief_pred.chart_id,
+            anchor_id=belief_pred.anchor_id,
+        )
+        local_certs.append(odom_cert_local)
+        imu_result_local, imu_cert_local, _ = imu_vmf_gravity_evidence_time_resolved(
+            rotvec_world_body=pose_pred_local[3:6],
+            imu_accel=imu_accel,
+            imu_gyro=imu_gyro,
+            weights=w_imu_int,
+            accel_bias=accel_bias,
+            gravity_W=gravity_W,
+            dt_imu=dt_imu,
+            eps_psd=config.eps_psd,
+            eps_mass=config.eps_mass,
+            chart_id=belief_pred.chart_id,
+            anchor_id=belief_pred.anchor_id,
+        )
+        local_certs.append(imu_cert_local)
+        dep_result_local, dep_cert_local, _ = imu_dependence_inflation(
+            transport_sigma=float(imu_result_local.transport_sigma),
+            eps_mass=config.eps_mass,
+            chart_id=belief_pred.chart_id,
+            anchor_id="imu_dependence_inflation",
+        )
+        local_certs.append(dep_cert_local)
+        Sigma_g_local = jnp.asarray(config.Sigma_g, dtype=jnp.float64)
+        _rotvec0_np = np.array(rotvec0)
+        _pose_pred_np = np.array(pose_pred_local)
+        _delta_pose_int_np = np.array(delta_pose_int)
+        if not np.all(np.isfinite(_rotvec0_np)):
+            raise ValueError(f"rotvec0 contains NaN: {_rotvec0_np}")
+        if not np.all(np.isfinite(_pose_pred_np)):
+            raise ValueError(f"pose_pred contains NaN: {_pose_pred_np}")
+        if not np.all(np.isfinite(_delta_pose_int_np)):
+            raise ValueError(f"delta_pose_int contains NaN: {_delta_pose_int_np}")
+        gyro_result_local, gyro_cert_local, _ = imu_gyro_rotation_evidence(
+            rotvec_start_WB=rotvec0,
+            rotvec_end_pred_WB=pose_pred_local[3:6],
+            delta_rotvec_meas=delta_pose_int[3:6],
+            Sigma_g=Sigma_g_local,
+            dt_int=dt_int,
+            eps_psd=config.eps_psd,
+            eps_lift=config.eps_lift,
+            chart_id=belief_pred.chart_id,
+            anchor_id=belief_pred.anchor_id,
+        )
+        local_certs.append(gyro_cert_local)
+        mu_prev_local = belief_prev.mean_increment(eps_lift=config.eps_lift)
+        v_start_world_local = mu_prev_local[6:9]
+        v_pred_world_local = mu_inc[6:9]
+        Sigma_a_local = jnp.asarray(config.Sigma_a, dtype=jnp.float64)
+        preint_result_local, preint_cert_local, _ = imu_preintegration_factor(
+            p_start_world=pose0[0:3],
+            rotvec_start_WB=rotvec0,
+            v_start_world=v_start_world_local,
+            p_end_pred_world=pose_pred_local[0:3],
+            v_end_pred_world=v_pred_world_local,
+            delta_v_body=delta_v_int,
+            delta_p_body=delta_p_int,
+            Sigma_a=Sigma_a_local,
+            dt_int=dt_int,
+            eps_psd=config.eps_psd,
+            eps_lift=config.eps_lift,
+            chart_id=belief_pred.chart_id,
+            anchor_id=belief_pred.anchor_id,
+        )
+        local_certs.append(preint_cert_local)
+        planar_result_local, planar_cert_local, _ = planar_z_prior(
+            belief_pred_pose=pose_pred_local,
+            z_ref=config.planar_z_ref,
+            sigma_z=config.planar_z_sigma,
+            eps_psd=config.eps_psd,
+            chart_id=belief_pred.chart_id,
+            anchor_id=belief_pred.anchor_id,
+        )
+        local_certs.append(planar_cert_local)
+        vz_pred_local = float(mu_inc[8])
+        vz_result_local, vz_cert_local, _ = velocity_z_prior(
+            v_z_pred=vz_pred_local,
+            sigma_vz=config.planar_vz_sigma,
+            chart_id=belief_pred.chart_id,
+            anchor_id=belief_pred.anchor_id,
+        )
+        local_certs.append(vz_cert_local)
+        v_pred_world_early = mu_inc[6:9]
+        R_world_body_early = se3_jax.so3_exp(pose_pred_local[3:6])
+        odom_vel_result_local, odom_vel_cert_local, _ = odom_velocity_evidence(
+            v_pred_world=v_pred_world_early,
+            R_world_body=R_world_body_early,
+            v_odom_body=odom_twist[0:3],
+            Sigma_v=odom_twist_cov[0:3, 0:3],
+            eps_psd=config.eps_psd,
+            eps_lift=config.eps_lift,
+            chart_id=belief_pred.chart_id,
+            anchor_id=belief_pred.anchor_id,
+        )
+        local_certs.append(odom_vel_cert_local)
+        sigma_wz_from_cov_local = jnp.sqrt(jnp.maximum(odom_twist_cov[5, 5], 1e-12))
+        sigma_wz_effective_local = float(sigma_wz_from_cov_local)
+        odom_wz_result_local, odom_wz_cert_local, _ = odom_yawrate_evidence(
+            omega_z_pred=float(omega_avg[2]),
+            omega_z_odom=float(odom_twist[5]),
+            sigma_wz=sigma_wz_effective_local,
+            chart_id=belief_pred.chart_id,
+            anchor_id=belief_pred.anchor_id,
+        )
+        local_certs.append(odom_wz_cert_local)
+        kinematic_result_local, kinematic_cert_local, _ = pose_twist_kinematic_consistency(
+            pose_prev=pose0,
+            pose_curr=pose_pred_local,
+            v_body=odom_twist[0:3],
+            omega_body=odom_twist[3:6],
+            dt=dt_sec,
+            Sigma_v=odom_twist_cov[0:3, 0:3],
+            Sigma_omega=odom_twist_cov[3:6, 3:6],
+            eps_psd=config.eps_psd,
+            eps_lift=config.eps_lift,
+            chart_id=belief_pred.chart_id,
+            anchor_id=belief_pred.anchor_id,
+        )
+        local_certs.append(kinematic_cert_local)
+        odom_dep_result_local, odom_dep_cert_local, _ = odom_dependence_inflation(
+            r_trans=kinematic_result_local.r_trans,
+            r_rot=kinematic_result_local.r_rot,
+            eps_mass=config.eps_mass,
+            chart_id=belief_pred.chart_id,
+            anchor_id="odom_dependence_inflation",
+        )
+        local_certs.append(odom_dep_cert_local)
+        scale_dep_local = float(dep_result_local.scale)
+        L_imu_scaled = imu_result_local.L_imu * scale_dep_local
+        h_imu_scaled = imu_result_local.h_imu * scale_dep_local
+        L_gyro_scaled = gyro_result_local.L_gyro * scale_dep_local
+        h_gyro_scaled = gyro_result_local.h_gyro * scale_dep_local
+        odom_scale_local = float(odom_dep_result_local.scale)
+        L_odom_scaled = odom_result_local.L_odom * odom_scale_local
+        h_odom_scaled = odom_result_local.h_odom * odom_scale_local
+        L_vel_scaled = odom_vel_result_local.L_vel * odom_scale_local
+        h_vel_scaled = odom_vel_result_local.h_vel * odom_scale_local
+        L_wz_scaled = odom_wz_result_local.L_wz * odom_scale_local
+        h_wz_scaled = odom_wz_result_local.h_wz * odom_scale_local
+        L_imu_odom_local = (L_odom_scaled + L_imu_scaled + L_gyro_scaled + preint_result_local.L_imu_preint
+                            + planar_result_local.L_planar + vz_result_local.L_vz + L_vel_scaled + L_wz_scaled
+                            + kinematic_result_local.L_consistency)
+        h_imu_odom_local = (h_odom_scaled + h_imu_scaled + h_gyro_scaled + preint_result_local.h_imu_preint
+                            + planar_result_local.h_planar + vz_result_local.h_vz + h_vel_scaled + h_wz_scaled
+                            + kinematic_result_local.h_consistency)
+        L_fused_local = belief_pred.L + L_imu_odom_local
+        h_fused_local = belief_pred.h + h_imu_odom_local
+        L_fused_psd_local = domain_projection_psd(L_fused_local, config.eps_psd).M_psd
+        z_lin_22d_local = spd_cholesky_solve_lifted(L_fused_psd_local, h_fused_local, config.eps_lift).x
+        z_lin_pose_local = z_lin_22d_local[0:6]
+        return {
+            "certs": local_certs,
+            "odom_cert": odom_cert_local,
+            "imu_cert": imu_cert_local,
+            "gyro_cert": gyro_cert_local,
+            "pose_pred": pose_pred_local,
+            "odom_result": odom_result_local,
+            "imu_result": imu_result_local,
+            "gyro_result": gyro_result_local,
+            "preint_result": preint_result_local,
+            "planar_result": planar_result_local,
+            "vz_result": vz_result_local,
+            "odom_vel_result": odom_vel_result_local,
+            "odom_wz_result": odom_wz_result_local,
+            "kinematic_result": kinematic_result_local,
+            "dep_result": dep_result_local,
+            "odom_dep_result": odom_dep_result_local,
+            "L_imu_odom": L_imu_odom_local,
+            "h_imu_odom": h_imu_odom_local,
+            "z_lin_pose": z_lin_pose_local,
+        }
 
-    # =========================================================================
-    # Step 4: Surfel Extraction + OT Association (no map update yet)
-    # =========================================================================
-    # Always use PrimitiveMap path. No bins. No branching.
+    def _compute_map_branch():
+        local_certs: List = []
+        t0_prim_local = time.perf_counter() if config.enable_timing else None
+        surfel_config = SurfelExtractionConfig(
+            n_surfel=config.n_surfel,
+            n_feat=config.n_feat,
+            voxel_size_m=config.surfel_voxel_size_m,
+            min_points_per_voxel=config.surfel_min_points_per_voxel,
+            eps_lift=config.eps_lift,
+        )
+        measurement_batch_local, surfel_cert_local, _ = extract_lidar_surfels(
+            points=deskewed_points,
+            timestamps=timestamps,
+            weights=deskewed_weights,
+            config=surfel_config,
+            base_batch=camera_batch,
+            chart_id=belief_pred.chart_id,
+            anchor_id="surfel_extraction",
+        )
+        local_certs.append(surfel_cert_local)
+
+        pose_pred_for_map = belief_pred.mean_world_pose(eps_lift=config.eps_lift)
+        t_pred_for_map = pose_pred_for_map[:3]
+
+        map_local = primitive_map
+        if map_local is None:
+            map_local = create_empty_atlas_map(m_tile=config.primitive_map_max_size)
+
+        import numpy as np
+
+        center_xyz = np.asarray(t_pred_for_map, dtype=np.float64).reshape(3)
+        active_tile_ids_local = ma_hex_stencil_tile_ids(
+            center_xyz=center_xyz,
+            h_tile=float(config.H_TILE),
+            radius_xy=int(config.R_ACTIVE_TILES_XY),
+            radius_z=int(config.R_ACTIVE_TILES_Z),
+        )
+        stencil_tile_ids_local = ma_hex_stencil_tile_ids(
+            center_xyz=center_xyz,
+            h_tile=float(config.H_TILE),
+            radius_xy=int(config.R_STENCIL_TILES_XY),
+            radius_z=int(config.R_STENCIL_TILES_Z),
+        )
+        if len(active_tile_ids_local) != int(config.N_ACTIVE_TILES):
+            raise ValueError(
+                f"active tile stencil size mismatch: expected N_ACTIVE_TILES={config.N_ACTIVE_TILES}, "
+                f"got {len(active_tile_ids_local)}"
+            )
+        if len(stencil_tile_ids_local) != int(config.N_STENCIL_TILES):
+            raise ValueError(
+                f"stencil tile size mismatch: expected N_STENCIL_TILES={config.N_STENCIL_TILES}, "
+                f"got {len(stencil_tile_ids_local)}"
+            )
+
+        map_local, inflate_cert_local, _, inflate_stats_local = primitive_map_recency_inflate(
+            atlas_map=map_local,
+            tile_ids=active_tile_ids_local,
+            scan_seq=int(scan_seq),
+            recency_decay_lambda=float(config.RECENCY_DECAY_LAMBDA),
+            min_scale=float(config.RECENCY_MIN_SCALE),
+            chart_id=belief_pred.chart_id,
+            anchor_id="primitive_map_recency_inflate",
+        )
+        local_certs.append(inflate_cert_local)
+
+        map_view_local = extract_atlas_map_view(
+            atlas_map=map_local,
+            tile_ids=stencil_tile_ids_local,
+            m_tile_view=int(config.M_TILE_VIEW),
+            eps_lift=config.eps_lift,
+            eps_mass=config.eps_mass,
+        )
+
+        assoc_config = AssociationConfig(
+            k_assoc=config.k_assoc,
+            k_sinkhorn=config.k_sinkhorn,
+            epsilon=config.ot_epsilon,
+            tau_a=config.ot_tau_a,
+            tau_b=config.ot_tau_b,
+            eps_mass=config.eps_mass,
+            h_tile=float(config.H_TILE),
+            r_stencil_tiles_xy=int(config.R_STENCIL_TILES_XY),
+            r_stencil_tiles_z=int(config.R_STENCIL_TILES_Z),
+            scan_seq=int(scan_seq),
+            recency_decay_lambda=float(config.RECENCY_DECAY_LAMBDA),
+        )
+        assoc_result_local, assoc_cert_local, _ = associate_primitives_ot(
+            measurement_batch=measurement_batch_local,
+            map_view=map_view_local,
+            config=assoc_config,
+            chart_id=belief_pred.chart_id,
+            anchor_id="primitive_ot",
+        )
+        local_certs.append(assoc_cert_local)
+
+        candidate_tiles_per_meas_mean_local = 0.0
+        candidate_primitives_per_meas_mean_local = 0.0
+        candidate_primitives_per_meas_p95_local = 0.0
+        if measurement_batch_local is not None:
+            n_valid_meas = int(jnp.sum(measurement_batch_local.valid_mask))
+            if n_valid_meas > 0:
+                cand_valid = map_view_local.valid_mask[assoc_result_local.candidate_pool_indices]
+                cand_tiles = jnp.where(cand_valid, assoc_result_local.candidate_tile_ids, -1)
+                cand_counts = jnp.sum(cand_valid.astype(jnp.float64), axis=1)
+
+                cand_tiles_sorted = jnp.sort(cand_tiles, axis=1)
+                is_valid_tile = cand_tiles_sorted != -1
+                is_new = jnp.concatenate(
+                    [jnp.ones((cand_tiles_sorted.shape[0], 1), dtype=bool), cand_tiles_sorted[:, 1:] != cand_tiles_sorted[:, :-1]],
+                    axis=1,
+                )
+                distinct_tiles = jnp.sum((is_new & is_valid_tile).astype(jnp.float64), axis=1)
+
+                valid_rows_f = measurement_batch_local.valid_mask.astype(jnp.float64)
+                denom = jnp.maximum(jnp.sum(valid_rows_f), config.eps_mass)
+                candidate_tiles_per_meas_mean_local = float(jnp.sum(distinct_tiles * valid_rows_f) / denom)
+                candidate_primitives_per_meas_mean_local = float(jnp.sum(cand_counts * valid_rows_f) / denom)
+                cand_counts_valid = jnp.where(measurement_batch_local.valid_mask, cand_counts, -1.0)
+                cand_sorted = jnp.sort(cand_counts_valid)
+                idx_p95 = int(0.95 * float(cand_sorted.shape[0]))
+                idx_p95 = min(idx_p95, int(cand_sorted.shape[0]) - 1)
+                candidate_primitives_per_meas_p95_local = float(cand_sorted[idx_p95])
+
+        return {
+            "certs": local_certs,
+            "t0_prim": t0_prim_local,
+            "measurement_batch": measurement_batch_local,
+            "surfel_cert": surfel_cert_local,
+            "assoc_result": assoc_result_local,
+            "assoc_cert": assoc_cert_local,
+            "map_view": map_view_local,
+            "primitive_map": map_local,
+            "active_tile_ids": active_tile_ids_local,
+            "stencil_tile_ids": stencil_tile_ids_local,
+            "candidate_tiles_per_meas_mean": candidate_tiles_per_meas_mean_local,
+            "candidate_primitives_per_meas_mean": candidate_primitives_per_meas_mean_local,
+            "candidate_primitives_per_meas_p95": candidate_primitives_per_meas_p95_local,
+            "staleness_inflation_strength": float(inflate_stats_local.staleness_inflation_strength),
+            "staleness_cov_inflation_trace": float(inflate_stats_local.staleness_cov_inflation_trace),
+            "stale_precision_downscale_total": float(inflate_stats_local.stale_precision_downscale_total),
+        }
+
     primitive_map_updated = None
     measurement_batch = None
     n_primitives_inserted = 0
@@ -759,82 +964,64 @@ def process_scan_single_hypothesis(
     candidate_tiles_per_meas_mean = 0.0
     candidate_primitives_per_meas_mean = 0.0
     candidate_primitives_per_meas_p95 = 0.0
+    staleness_inflation_strength = 0.0
+    staleness_cov_inflation_trace = 0.0
+    stale_precision_downscale_total = 0.0
     assoc_result = None
     map_view = None
+    active_tile_ids: Optional[List[int]] = None
+    stencil_tile_ids: Optional[List[int]] = None
+    event_log_entries: List[dict] = []
 
-    # Optional certificates - defined when primitive path runs
     surfel_cert = None
     assoc_cert = None
     visual_cert = None
 
-    if primitive_map is not None:
-        t0_prim = time.perf_counter() if config.enable_timing else None
+    if config.enable_parallel_stages and primitive_map is not None:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            imu_future = executor.submit(_compute_imu_odom_branch)
+            map_future = executor.submit(_compute_map_branch)
+            imu_out = imu_future.result()
+            map_out = map_future.result()
+    else:
+        imu_out = _compute_imu_odom_branch()
+        map_out = _compute_map_branch() if primitive_map is not None else None
 
-        # Step 3.5a: Extract surfels from deskewed points
-        surfel_config = SurfelExtractionConfig(
-            n_surfel=config.n_surfel,
-            n_feat=config.n_feat,
-            voxel_size_m=config.surfel_voxel_size_m,
-            min_points_per_voxel=config.surfel_min_points_per_voxel,
-            eps_lift=config.eps_lift,
-        )
-        measurement_batch, surfel_cert, surfel_effect = extract_lidar_surfels(
-            points=deskewed_points,
-            timestamps=timestamps,
-            weights=deskewed_weights,
-            config=surfel_config,
-            base_batch=camera_batch,
-            chart_id=belief_pred.chart_id,
-            anchor_id="surfel_extraction",
-        )
-        all_certs.append(surfel_cert)
+    all_certs.extend(imu_out["certs"])
+    odom_result = imu_out["odom_result"]
+    imu_result = imu_out["imu_result"]
+    gyro_result = imu_out["gyro_result"]
+    preint_result = imu_out["preint_result"]
+    planar_result = imu_out["planar_result"]
+    vz_result = imu_out["vz_result"]
+    odom_vel_result = imu_out["odom_vel_result"]
+    odom_wz_result = imu_out["odom_wz_result"]
+    kinematic_result = imu_out["kinematic_result"]
+    dep_result = imu_out["dep_result"]
+    odom_dep_result = imu_out["odom_dep_result"]
+    L_imu_odom = imu_out["L_imu_odom"]
+    h_imu_odom = imu_out["h_imu_odom"]
+    z_lin_pose = imu_out["z_lin_pose"]
+    pose_pred = imu_out["pose_pred"]
 
-        # Step 3.5b: Get pose from predicted belief for world-frame transform
-        pose_pred_for_map = belief_pred.mean_world_pose(eps_lift=config.eps_lift)
-        R_pred_for_map = se3_jax.so3_exp(pose_pred_for_map[3:6])
-        t_pred_for_map = pose_pred_for_map[:3]
+    if map_out is not None:
+        all_certs.extend(map_out["certs"])
+        measurement_batch = map_out["measurement_batch"]
+        surfel_cert = map_out["surfel_cert"]
+        assoc_result = map_out["assoc_result"]
+        assoc_cert = map_out["assoc_cert"]
+        map_view = map_out["map_view"]
+        primitive_map = map_out["primitive_map"]
+        active_tile_ids = map_out["active_tile_ids"]
+        stencil_tile_ids = map_out["stencil_tile_ids"]
+        candidate_tiles_per_meas_mean = map_out["candidate_tiles_per_meas_mean"]
+        candidate_primitives_per_meas_mean = map_out["candidate_primitives_per_meas_mean"]
+        candidate_primitives_per_meas_p95 = map_out["candidate_primitives_per_meas_p95"]
+        staleness_inflation_strength = map_out["staleness_inflation_strength"]
+        staleness_cov_inflation_trace = map_out["staleness_cov_inflation_trace"]
+        stale_precision_downscale_total = map_out["stale_precision_downscale_total"]
 
-        # Step 3.5c: Extract map view for association (M_{t-1}; do not mutate map yet)
-        if primitive_map is None:
-            primitive_map = create_empty_atlas_map(m_tile=config.primitive_map_max_size)
-        if primitive_map.n_tiles != 1:
-            raise ValueError(
-                f"process_scan_single_hypothesis: expected single-tile atlas, got {primitive_map.n_tiles}"
-            )
-        tile_id = primitive_map.tile_ids[0]
-        tile = primitive_map.tiles[tile_id]
-        map_view = extract_primitive_map_view(
-            tile=tile,
-            eps_lift=config.eps_lift,
-            eps_mass=config.eps_mass,
-        )
-
-        # Step 3.5d: Run OT association
-        assoc_config = AssociationConfig(
-            k_assoc=config.k_assoc,
-            k_sinkhorn=config.k_sinkhorn,
-            epsilon=config.ot_epsilon,
-            tau_a=config.ot_tau_a,
-            tau_b=config.ot_tau_b,
-            eps_mass=config.eps_mass,
-        )
-        assoc_result, assoc_cert, assoc_effect = associate_primitives_ot(
-            measurement_batch=measurement_batch,
-            map_view=map_view,
-            config=assoc_config,
-            chart_id=belief_pred.chart_id,
-            anchor_id="primitive_ot",
-        )
-        all_certs.append(assoc_cert)
-        if measurement_batch is not None:
-            n_valid_meas = int(jnp.sum(measurement_batch.valid_mask))
-            if n_valid_meas > 0:
-                candidate_tiles_per_meas_mean = 1.0
-                candidate_primitives_per_meas_mean = float(config.k_assoc)
-                candidate_primitives_per_meas_p95 = float(config.k_assoc)
-
-        # Step 3.5e: Visual pose evidence at z_lin (IMU+odom-informed), before any map update
-        visual_result, visual_cert, visual_effect = visual_pose_evidence(
+        visual_result, visual_cert, _ = visual_pose_evidence(
             association_result=assoc_result,
             measurement_batch=measurement_batch,
             map_view=map_view,
@@ -848,8 +1035,7 @@ def process_scan_single_hypothesis(
         all_certs.append(visual_cert)
         L_lidar, h_lidar = build_visual_pose_evidence_22d(visual_result)
         if config.enable_timing:
-            _record_timing("visual_pose_evidence_ms", t0_prim, L_lidar)
-        # Map update (fuse/insert/cull/forget) deferred until after recompose; uses z_t below
+            _record_timing("visual_pose_evidence_ms", map_out["t0_prim"], L_lidar)
     else:
         L_lidar = config.eps_lift * jnp.eye(22, dtype=jnp.float64)
         h_lidar = jnp.zeros((22,), dtype=jnp.float64)
@@ -903,7 +1089,9 @@ def process_scan_single_hypothesis(
     if visual_cert is not None:
         lidar_certs.append(visual_cert)
     evidence_cert = aggregate_certificates(lidar_certs)
-    combined_evidence_cert = aggregate_certificates([evidence_cert, odom_cert, imu_cert, gyro_cert])
+    combined_evidence_cert = aggregate_certificates(
+        [evidence_cert, imu_out["odom_cert"], imu_out["imu_cert"], imu_out["gyro_cert"]]
+    )
 
     # Observability sentinels are computed from the *raw* evidence to avoid fixed-point iteration.
     eps = float(config.eps_mass)
@@ -1069,7 +1257,13 @@ def process_scan_single_hypothesis(
     # Step 12b: Primitive map update with z_t (post-recompose pose)
     # =========================================================================
     # Evidence used pre-update map; now update map using z_t (belief_recomposed).
-    if primitive_map is not None and assoc_result is not None and map_view is not None and measurement_batch is not None:
+    if (
+        primitive_map is not None
+        and assoc_result is not None
+        and map_view is not None
+        and measurement_batch is not None
+        and active_tile_ids is not None
+    ):
         z_t = belief_recomposed.mean_world_pose(eps_lift=config.eps_lift)
         R_t = se3_jax.so3_exp(z_t[3:6])
         t_t = z_t[:3]
@@ -1084,7 +1278,7 @@ def process_scan_single_hypothesis(
             eta_w = (R_t @ eta_b.T).T
             return Lambda_w, theta_w, eta_w
 
-        if measurement_batch.n_valid > 0:
+        if measurement_batch.n_valid > 0 and active_tile_ids is not None:
             (
                 meas_idx_blocks,
                 tile_blocks,
@@ -1111,11 +1305,8 @@ def process_scan_single_hypothesis(
                 weights_blk = measurement_batch.weights[meas_idx]
                 colors_blk = measurement_batch.colors[meas_idx]
 
-                if int(jnp.max(jnp.abs(tile_blk - int(tile_id)))) != 0:
-                    raise ValueError(
-                        f"process_scan_single_hypothesis: candidate tile_id mismatch (expected {tile_id})"
-                    )
-                target_flat = slot_blk.reshape(-1)
+                target_flat = slot_blk.reshape(-1).astype(jnp.int32)
+                tile_ids_flat = tile_blk.reshape(-1).astype(jnp.int64)
                 responsibilities_fuse = resp_blk.reshape(-1)
                 valid_flat = jnp.repeat(valid_rows_blk, k_assoc)
                 Lambdas_meas = jnp.repeat(Lambdas_blk, k_assoc, axis=0)
@@ -1123,34 +1314,41 @@ def process_scan_single_hypothesis(
                 etas_meas = jnp.repeat(etas_blk, k_assoc, axis=0)
                 weights_meas = jnp.repeat(weights_blk, k_assoc, axis=0)
                 colors_meas_flat = jnp.repeat(colors_blk, k_assoc, axis=0)
-                fused_mass_total += float(
-                    jnp.sum(weights_meas * responsibilities_fuse * valid_flat.astype(jnp.float64))
-                )
 
                 Lambdas_world, thetas_world, etas_world = jax.vmap(transform_gaussian_to_world)(
                     Lambdas_meas, thetas_meas, etas_meas
                 )
-                fuse_result, fuse_cert, fuse_effect = primitive_map_fuse(
-                    atlas_map=primitive_map,
-                    tile_id=int(tile_id),
-                    target_slots=target_flat,
-                    Lambdas_meas=Lambdas_world,
-                    thetas_meas=thetas_world,
-                    etas_meas=etas_world,
-                    weights_meas=weights_meas,
-                    responsibilities=responsibilities_fuse,
-                    timestamp=scan_end_time,
-                    valid_mask=valid_flat,
-                    colors_meas=colors_meas_flat,
-                    eps_mass=config.eps_mass,
-                )
-                primitive_map = fuse_result.atlas_map
-                all_certs.append(fuse_cert)
-                n_primitives_fused += fuse_result.n_fused
+
+                # Per-tile fuse: run fixed loop over active tiles; use masks (no gating).
+                for tid in active_tile_ids:
+                    tid_i = int(tid)
+                    tile_mask = (tile_ids_flat == tid_i)
+                    valid_t = valid_flat & tile_mask
+                    fused_mass_total += float(
+                        jnp.sum(weights_meas * responsibilities_fuse * valid_t.astype(jnp.float64))
+                    )
+                    fuse_result, fuse_cert, fuse_effect = primitive_map_fuse(
+                        atlas_map=primitive_map,
+                        tile_id=tid_i,
+                        target_slots=target_flat,
+                        Lambdas_meas=Lambdas_world,
+                        thetas_meas=thetas_world,
+                        etas_meas=etas_world,
+                        weights_meas=weights_meas,
+                        responsibilities=responsibilities_fuse,
+                        timestamp=scan_end_time,
+                        scan_seq=int(scan_seq),
+                        valid_mask=valid_t,
+                        colors_meas=colors_meas_flat,
+                        eps_mass=config.eps_mass,
+                    )
+                    primitive_map = fuse_result.atlas_map
+                    all_certs.append(fuse_cert)
+                    n_primitives_fused += fuse_result.n_fused
 
         # Fixed-budget insertion every scan: novelty mass from unbalanced OT coupling.
         # This replaces the legacy "insert only when map empty" behavior.
-        if measurement_batch.n_valid > 0 and assoc_result is not None:
+        if measurement_batch.n_valid > 0 and assoc_result is not None and active_tile_ids is not None:
             a = measurement_batch.valid_mask.astype(jnp.float64)
             a = a / jnp.maximum(jnp.sum(a), config.eps_mass)  # fixed total mass
             row_mass = assoc_result.row_masses.astype(jnp.float64)
@@ -1159,61 +1357,124 @@ def process_scan_single_hypothesis(
             score = novelty * measurement_batch.weights.astype(jnp.float64)
             score = score - (1.0 - measurement_batch.valid_mask.astype(jnp.float64)) * 1e6
             k_ins = int(config.k_insert_tile)
-            ins_idx = jnp.argsort(-score)[:k_ins]
 
-            Lambdas_ins = measurement_batch.Lambdas[ins_idx]
-            thetas_ins = measurement_batch.thetas[ins_idx]
-            etas_ins = measurement_batch.etas[ins_idx]
-            weights_ins = (novelty[ins_idx] * measurement_batch.weights[ins_idx]).astype(jnp.float64)
-            colors_ins = measurement_batch.colors[ins_idx]
-            insert_mass_total = float(jnp.sum(weights_ins))
-            weights_sorted = jnp.sort(weights_ins)
-            if int(weights_sorted.shape[0]) > 0:
-                idx_p95 = int(0.95 * float(weights_sorted.shape[0]))
-                idx_p95 = min(idx_p95, int(weights_sorted.shape[0]) - 1)
-                insert_mass_p95 = float(weights_sorted[idx_p95])
-            # Use scan end time as insertion time (matches evidence timebase).
-            Lambdas_world, thetas_world, etas_world = jax.vmap(transform_gaussian_to_world)(
-                Lambdas_ins, thetas_ins, etas_ins
-            )
-            result_insert, insert_cert, insert_effect = primitive_map_insert(
-                atlas_map=primitive_map,
-                tile_id=int(tile_id),
-                Lambdas_new=Lambdas_world,
-                thetas_new=thetas_world,
-                etas_new=etas_world,
-                weights_new=weights_ins,
-                timestamp=scan_end_time,
-                colors_new=colors_ins,
-            )
-            primitive_map = result_insert.atlas_map
-            all_certs.append(insert_cert)
-            n_primitives_inserted = result_insert.n_inserted
+            # Assign each measurement to a tile by its world-frame mean position at z_t.
+            Lambda_reg_all = measurement_batch.Lambdas + config.eps_lift * jnp.eye(3, dtype=jnp.float64)[None, :, :]
+            mu_body = jax.vmap(jnp.linalg.solve)(Lambda_reg_all, measurement_batch.thetas)
+            mu_world = (R_t @ mu_body.T).T + t_t[None, :]
+            meas_tile_ids = tile_ids_from_xyz_batch_jax(mu_world, h_tile=float(config.H_TILE))
 
-        cull_result, cull_cert, cull_effect = primitive_map_cull(
-            atlas_map=primitive_map,
-            tile_id=int(tile_id),
-            weight_threshold=config.primitive_cull_weight_threshold,
-        )
-        primitive_map = cull_result.atlas_map
-        all_certs.append(cull_cert)
-        n_primitives_culled = cull_result.n_culled
-        evicted_mass_total = float(cull_result.mass_dropped)
+            # Per-tile insertion with fixed budget K_INSERT_TILE, masked when no matching measurements exist.
+            for tid in active_tile_ids:
+                tid_i = int(tid)
+                in_tile = meas_tile_ids == jnp.asarray(tid_i, dtype=jnp.int64)
+                score_t = jnp.where(in_tile, score, jnp.asarray(-1e30, dtype=jnp.float64))
+                ins_idx_j = jnp.argsort(-score_t)[:k_ins].astype(jnp.int32)
+                valid_new_j = in_tile[ins_idx_j] & (score_t[ins_idx_j] > -1e20)
+                # Enforce fixed insert count: if no in-tile measurements, insert zero-mass placeholders.
+                valid_new_j = jnp.where(jnp.any(valid_new_j), valid_new_j, jnp.ones_like(valid_new_j, dtype=bool))
 
-        forget_result, forget_cert, forget_effect = primitive_map_forget(
-            atlas_map=primitive_map,
-            tile_id=int(tile_id),
-            forgetting_factor=config.primitive_forgetting_factor,
-        )
-        primitive_map = forget_result.atlas_map
-        all_certs.append(forget_cert)
+                Lambdas_ins = measurement_batch.Lambdas[ins_idx_j]
+                thetas_ins = measurement_batch.thetas[ins_idx_j]
+                etas_ins = measurement_batch.etas[ins_idx_j]
+                weights_ins = (novelty[ins_idx_j] * measurement_batch.weights[ins_idx_j]).astype(jnp.float64)
+                # If we had to fill budget, zero out those insert masses explicitly.
+                weights_ins = jnp.where(in_tile[ins_idx_j], weights_ins, 0.0)
+                colors_ins = measurement_batch.colors[ins_idx_j]
+
+                insert_mass_total += float(jnp.sum(weights_ins))
+                weights_sorted = jnp.sort(weights_ins)
+                if int(weights_sorted.shape[0]) > 0:
+                    idx_p95 = int(0.95 * float(weights_sorted.shape[0]))
+                    idx_p95 = min(idx_p95, int(weights_sorted.shape[0]) - 1)
+                    insert_mass_p95 = max(insert_mass_p95, float(weights_sorted[idx_p95]))
+
+                Lambdas_world_ins, thetas_world_ins, etas_world_ins = jax.vmap(transform_gaussian_to_world)(
+                    Lambdas_ins, thetas_ins, etas_ins
+                )
+                result_insert, insert_cert, insert_effect = primitive_map_insert_masked(
+                    atlas_map=primitive_map,
+                    tile_id=tid_i,
+                    Lambdas_new=Lambdas_world_ins,
+                    thetas_new=thetas_world_ins,
+                    etas_new=etas_world_ins,
+                    weights_new=weights_ins,
+                    timestamp=scan_end_time,
+                    scan_seq=int(scan_seq),
+                    valid_new_mask=valid_new_j,
+                    recency_decay_lambda=float(config.RECENCY_DECAY_LAMBDA),
+                    colors_new=colors_ins,
+                )
+                primitive_map = result_insert.atlas_map
+                all_certs.append(insert_cert)
+                n_primitives_inserted += int(result_insert.n_inserted)
+                # Event log payloads (for Rerun replay): record inserted primitives
+                if result_insert.n_inserted > 0:
+                    import numpy as np
+                    Lambda_reg = Lambdas_world_ins + config.eps_lift * jnp.eye(3, dtype=jnp.float64)[None, :, :]
+                    mu_world_ins = jax.vmap(jnp.linalg.solve)(Lambda_reg, thetas_world_ins)
+                    mu_np = np.array(mu_world_ins, dtype=np.float64)
+                    w_np = np.array(weights_ins, dtype=np.float64)
+                    c_np = np.array(colors_ins, dtype=np.float64)
+                    for i_ins in range(mu_np.shape[0]):
+                        event_log_entries.append(
+                            {
+                                "tile_id": tid_i,
+                                "mu_world": mu_np[i_ins].tolist(),
+                                "weight": float(w_np[i_ins]),
+                                "color": c_np[i_ins].tolist(),
+                                "timestamp": float(scan_end_time),
+                            }
+                        )
+
+        # Per-tile maintenance (local by construction): cull + forget for active tiles only.
+        if active_tile_ids is not None:
+            for tid in active_tile_ids:
+                tid_i = int(tid)
+                cull_result, cull_cert, cull_effect = primitive_map_cull(
+                    atlas_map=primitive_map,
+                    tile_id=tid_i,
+                    weight_threshold=config.primitive_cull_weight_threshold,
+                )
+                primitive_map = cull_result.atlas_map
+                all_certs.append(cull_cert)
+                n_primitives_culled += int(cull_result.n_culled)
+                evicted_mass_total += float(cull_result.mass_dropped)
+
+                forget_result, forget_cert, forget_effect = primitive_map_forget(
+                    atlas_map=primitive_map,
+                    tile_id=tid_i,
+                    forgetting_factor=config.primitive_forgetting_factor,
+                )
+                primitive_map = forget_result.atlas_map
+                all_certs.append(forget_cert)
+
+        # Cache hit/miss for active tiles.
+        active_set = set(active_tile_ids or [])
+        tile_cache_hits = len([t for t in (active_tile_ids or []) if t in primitive_map.tiles])
+        tile_cache_misses = len(active_set) - tile_cache_hits
 
         map_update_cert = CertBundle.create_exact(
             chart_id=belief_pred.chart_id,
             anchor_id="map_update",
             map_update=MapUpdateCert(
-                n_active_tiles=1,
-                tile_ids_active=[int(tile_id)],
+                n_active_tiles=int(len(active_tile_ids)) if active_tile_ids is not None else 0,
+                tile_ids_active=[int(t) for t in (active_tile_ids or [])],
+                n_inactive_tiles=int(
+                    len([t for t in primitive_map.tile_ids if t not in set(active_tile_ids or [])])
+                )
+                if primitive_map is not None
+                else 0,
+                staleness_inflation_strength=float(staleness_inflation_strength),
+                staleness_cov_inflation_trace=float(staleness_cov_inflation_trace),
+                stale_precision_downscale_total=float(stale_precision_downscale_total),
+                tile_ids_inactive=[
+                    int(t) for t in primitive_map.tile_ids if t not in set(active_tile_ids or [])
+                ]
+                if primitive_map is not None
+                else [],
+                tile_cache_hits=int(tile_cache_hits),
+                tile_cache_misses=int(tile_cache_misses),
                 candidate_tiles_per_meas_mean=float(candidate_tiles_per_meas_mean),
                 candidate_primitives_per_meas_mean=float(candidate_primitives_per_meas_mean),
                 candidate_primitives_per_meas_p95=float(candidate_primitives_per_meas_p95),
@@ -1488,6 +1749,7 @@ def process_scan_single_hypothesis(
         n_primitives_inserted=n_primitives_inserted,
         n_primitives_fused=n_primitives_fused,
         n_primitives_culled=n_primitives_culled,
+        event_log_entries=event_log_entries if event_log_entries else None,
     )
 
 
@@ -1563,6 +1825,7 @@ class RuntimeManifest:
     power_beta_min: float = 0.25
     power_beta_exc_c: float = 50.0
     power_beta_z_c: float = 1.0
+    enable_parallel_stages: bool = False
 
     # OT association parameters (spec §5.7)
     ot_epsilon: float = 0.1  # Entropic regularization
@@ -1574,6 +1837,15 @@ class RuntimeManifest:
     K_ASSOC: int = constants.GC_K_ASSOC  # Candidate neighborhood size
     K_INSERT_TILE: int = constants.GC_K_INSERT_TILE  # Insertion budget per tile
     M_TILE: int = constants.GC_PRIMITIVE_MAP_MAX_SIZE  # Max primitives per tile (single-tile for now)
+    # Atlas tiling budgets (spec §5.7)
+    H_TILE: float = constants.GC_H_TILE
+    N_ACTIVE_TILES: int = constants.GC_N_ACTIVE_TILES
+    R_ACTIVE_TILES_XY: int = constants.GC_R_ACTIVE_TILES_XY
+    R_ACTIVE_TILES_Z: int = constants.GC_R_ACTIVE_TILES_Z
+    M_TILE_VIEW: int = constants.GC_M_TILE_VIEW
+    N_STENCIL_TILES: int = constants.GC_N_STENCIL_TILES
+    R_STENCIL_TILES_XY: int = constants.GC_R_STENCIL_TILES_XY
+    R_STENCIL_TILES_Z: int = constants.GC_R_STENCIL_TILES_Z
     ASSOC_BLOCK_SIZE: int = constants.GC_ASSOC_BLOCK_SIZE
     FUSE_CHUNK_SIZE: int = constants.GC_FUSE_CHUNK_SIZE
     MAX_IMU_PREINT_LEN: int = constants.GC_MAX_IMU_PREINT_LEN
@@ -1651,6 +1923,7 @@ class RuntimeManifest:
             "power_beta_min": self.power_beta_min,
             "power_beta_exc_c": self.power_beta_exc_c,
             "power_beta_z_c": self.power_beta_z_c,
+            "enable_parallel_stages": self.enable_parallel_stages,
             # OT params (spec §5.7)
             "ot_epsilon": self.ot_epsilon,
             "ot_tau_a": self.ot_tau_a,
@@ -1660,6 +1933,15 @@ class RuntimeManifest:
             "K_ASSOC": self.K_ASSOC,
             "K_INSERT_TILE": self.K_INSERT_TILE,
             "M_TILE": self.M_TILE,
+            # Atlas tiling budgets (spec §5.7)
+            "H_TILE": self.H_TILE,
+            "N_ACTIVE_TILES": self.N_ACTIVE_TILES,
+            "R_ACTIVE_TILES_XY": self.R_ACTIVE_TILES_XY,
+            "R_ACTIVE_TILES_Z": self.R_ACTIVE_TILES_Z,
+            "M_TILE_VIEW": self.M_TILE_VIEW,
+            "N_STENCIL_TILES": self.N_STENCIL_TILES,
+            "R_STENCIL_TILES_XY": self.R_STENCIL_TILES_XY,
+            "R_STENCIL_TILES_Z": self.R_STENCIL_TILES_Z,
             "ASSOC_BLOCK_SIZE": self.ASSOC_BLOCK_SIZE,
             "FUSE_CHUNK_SIZE": self.FUSE_CHUNK_SIZE,
             "MAX_IMU_PREINT_LEN": self.MAX_IMU_PREINT_LEN,

@@ -41,6 +41,8 @@ from fl_slam_poc.backend.operators.odom_twist_evidence import (
     odom_velocity_evidence,
     odom_yawrate_evidence,
     pose_twist_kinematic_consistency,
+    odom_dependence_inflation,
+    OdomDependenceInflationResult,
 )
 
 from fl_slam_poc.backend.operators.imu_evidence import (
@@ -48,6 +50,8 @@ from fl_slam_poc.backend.operators.imu_evidence import (
     imu_vmf_gravity_evidence_time_resolved,
     ImuEvidenceResult,
     TimeResolvedImuResult,
+    imu_dependence_inflation,
+    ImuDependenceInflationResult,
 )
 
 from fl_slam_poc.backend.operators.fusion import (
@@ -141,11 +145,15 @@ __all__ = [
     "odom_velocity_evidence",
     "odom_yawrate_evidence",
     "pose_twist_kinematic_consistency",
+    "odom_dependence_inflation",
+    "OdomDependenceInflationResult",
     # IMU evidence
     "imu_vmf_gravity_evidence",
     "imu_vmf_gravity_evidence_time_resolved",
     "ImuEvidenceResult",
     "TimeResolvedImuResult",
+    "imu_dependence_inflation",
+    "ImuDependenceInflationResult",
     # Fusion
     "fusion_scale_from_certificates",
     "info_fusion_additive",

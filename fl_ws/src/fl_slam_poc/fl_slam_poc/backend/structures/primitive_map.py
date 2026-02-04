@@ -103,8 +103,7 @@ class PrimitiveMapTile:
     Phase 2 foundation: tiles enable spatial partitioning for scalability.
     Each tile has fixed capacity M_TILE; tile addressing is (tile_id, slot).
 
-    For Phase 2.1 (single-tile), tile_id=0 is the only active tile.
-    Multi-tile support (Phase 6) adds MA-Hex addressing.
+    Multi-tile support (Phase 6) uses deterministic MA-Hex tile_ids.
 
     Attributes:
         tile_id: Unique tile identifier (0 for single-tile mode)
@@ -127,6 +126,8 @@ class PrimitiveMapTile:
     weights: jnp.ndarray      # (M_TILE,)
     timestamps: jnp.ndarray   # (M_TILE,)
     created_timestamps: jnp.ndarray  # (M_TILE,)
+    last_supported_scan_seq: jnp.ndarray  # (M_TILE,) int64
+    last_update_scan_seq: jnp.ndarray  # (M_TILE,) int64
     primitive_ids: jnp.ndarray  # (M_TILE,) int64
     valid_mask: jnp.ndarray   # (M_TILE,) bool
     colors: jnp.ndarray       # (M_TILE, 3)
@@ -147,6 +148,8 @@ def create_empty_tile(
         weights=jnp.zeros((m_tile,), dtype=jnp.float64),
         timestamps=jnp.zeros((m_tile,), dtype=jnp.float64),
         created_timestamps=jnp.zeros((m_tile,), dtype=jnp.float64),
+        last_supported_scan_seq=jnp.zeros((m_tile,), dtype=jnp.int64),
+        last_update_scan_seq=jnp.zeros((m_tile,), dtype=jnp.int64),
         primitive_ids=jnp.zeros((m_tile,), dtype=jnp.int64),
         valid_mask=jnp.zeros((m_tile,), dtype=bool),
         colors=jnp.zeros((m_tile, 3), dtype=jnp.float64),
@@ -165,8 +168,7 @@ class AtlasMap:
     """
     Atlas of primitive map tiles.
 
-    Phase 2 foundation: AtlasMap wraps multiple PrimitiveMapTiles for
-    spatial scalability. For Phase 2.1, contains single tile (tile_id=0).
+    AtlasMap wraps multiple PrimitiveMapTiles for spatial scalability.
 
     Addressing: (tile_id, slot) tuples identify primitives globally.
     Multi-tile mode (Phase 6) uses MA-Hex for deterministic tile selection.
@@ -197,125 +199,15 @@ def create_empty_atlas_map(
     m_tile: int = constants.GC_PRIMITIVE_MAP_MAX_SIZE,
 ) -> AtlasMap:
     """
-    Create empty atlas with single tile (tile_id=0).
+    Create an empty atlas (no tiles yet).
 
-    Phase 2.1: Single-tile mode for backward compatibility.
+    Phase 6: Tiles are created on-demand by deterministic MA-Hex tile_id.
     """
-    tile0 = create_empty_tile(tile_id=0, m_tile=m_tile)
     return AtlasMap(
-        tiles={0: tile0},
+        tiles={},
         next_global_id=0,
         total_count=0,
         m_tile=m_tile,
-    )
-
-
-def atlas_to_primitive_map(atlas: AtlasMap) -> "PrimitiveMap":
-    """
-    Convert single-tile atlas to legacy PrimitiveMap.
-
-    Compatibility bridge for Phase 2.1. Raises if atlas has >1 tile.
-    """
-    if len(atlas.tiles) != 1 or 0 not in atlas.tiles:
-        raise ValueError("atlas_to_primitive_map only supports single-tile atlas (tile_id=0)")
-    tile = atlas.tiles[0]
-    return PrimitiveMap(
-        Lambdas=tile.Lambdas,
-        thetas=tile.thetas,
-        etas=tile.etas,
-        weights=tile.weights,
-        timestamps=tile.timestamps,
-        created_timestamps=tile.created_timestamps,
-        primitive_ids=tile.primitive_ids,
-        valid_mask=tile.valid_mask,
-        colors=tile.colors,
-        next_id=atlas.next_global_id,
-        count=atlas.total_count,
-    )
-
-
-def primitive_map_to_atlas(prim_map: "PrimitiveMap") -> AtlasMap:
-    """
-    Convert legacy PrimitiveMap to single-tile atlas.
-
-    Compatibility bridge for Phase 2.1.
-    """
-    tile = PrimitiveMapTile(
-        tile_id=0,
-        Lambdas=prim_map.Lambdas,
-        thetas=prim_map.thetas,
-        etas=prim_map.etas,
-        weights=prim_map.weights,
-        timestamps=prim_map.timestamps,
-        created_timestamps=prim_map.created_timestamps,
-        primitive_ids=prim_map.primitive_ids,
-        valid_mask=prim_map.valid_mask,
-        colors=prim_map.colors,
-        next_local_id=prim_map.next_id,
-        count=prim_map.count,
-    )
-    return AtlasMap(
-        tiles={0: tile},
-        next_global_id=prim_map.next_id,
-        total_count=prim_map.count,
-        m_tile=prim_map.Lambdas.shape[0],
-    )
-
-
-# =============================================================================
-# PrimitiveMap: Batched Atlas (Legacy interface; wraps single tile)
-# =============================================================================
-
-
-@dataclass
-class PrimitiveMap:
-    """
-    Batched primitive map for efficient GPU operations.
-
-    All arrays have fixed size MAX_SIZE; valid entries marked by mask.
-    This enables JIT compilation without dynamic shapes.
-
-    Attributes:
-        Lambdas: (MAX_SIZE, 3, 3) precision matrices
-        thetas: (MAX_SIZE, 3) information vectors
-        etas: (MAX_SIZE, 3) vMF natural parameters
-        weights: (MAX_SIZE,) accumulated mass/ESS
-        timestamps: (MAX_SIZE,) last update times
-        primitive_ids: (MAX_SIZE,) stable unique IDs
-        valid_mask: (MAX_SIZE,) bool mask for valid entries
-        colors: (MAX_SIZE, 3) optional RGB colors
-        next_id: Next available primitive ID
-        count: Number of valid primitives
-    """
-    Lambdas: jnp.ndarray      # (MAX_SIZE, 3, 3)
-    thetas: jnp.ndarray       # (MAX_SIZE, 3)
-    etas: jnp.ndarray         # (MAX_SIZE, B, 3)
-    weights: jnp.ndarray      # (MAX_SIZE,)
-    timestamps: jnp.ndarray   # (MAX_SIZE,)
-    created_timestamps: jnp.ndarray  # (MAX_SIZE,) creation time (seconds); never overwritten
-    primitive_ids: jnp.ndarray  # (MAX_SIZE,) int64
-    valid_mask: jnp.ndarray   # (MAX_SIZE,) bool
-    colors: jnp.ndarray       # (MAX_SIZE, 3)
-    next_id: int              # Next available ID
-    count: int                # Number of valid primitives
-
-
-def create_empty_primitive_map(
-    max_size: int = constants.GC_PRIMITIVE_MAP_MAX_SIZE,
-) -> PrimitiveMap:
-    """Create empty primitive map with fixed-size arrays."""
-    return PrimitiveMap(
-        Lambdas=jnp.zeros((max_size, 3, 3), dtype=jnp.float64),
-        thetas=jnp.zeros((max_size, 3), dtype=jnp.float64),
-        etas=jnp.zeros((max_size, constants.GC_VMF_N_LOBES, 3), dtype=jnp.float64),
-        weights=jnp.zeros((max_size,), dtype=jnp.float64),
-        timestamps=jnp.zeros((max_size,), dtype=jnp.float64),
-        created_timestamps=jnp.zeros((max_size,), dtype=jnp.float64),
-        primitive_ids=jnp.zeros((max_size,), dtype=jnp.int64),
-        valid_mask=jnp.zeros((max_size,), dtype=bool),
-        colors=jnp.zeros((max_size, 3), dtype=jnp.float64),
-        next_id=0,
-        count=0,
     )
 
 
@@ -356,6 +248,190 @@ class PrimitiveMapView:
     @property
     def count(self) -> int:
         return int(self.positions.shape[0])
+
+
+@dataclass
+class AtlasMapView:
+    """
+    Fixed-size stitched view over multiple tiles (for association).
+
+    This is the Phase 6 "candidate pool" surface:
+      - Provide a fixed-size pool of primitives from a fixed stencil of tiles.
+      - Preserve tile-local addressing via parallel arrays (tile_id, slot).
+      - Association uses valid_mask (no gating; continuous weights only).
+    """
+
+    # Candidate pool addressing
+    candidate_tile_ids: jnp.ndarray  # (M_pool,) int64 (packed tile_id)
+    candidate_slots: jnp.ndarray  # (M_pool,) int32 (tile-local slot index)
+    valid_mask: jnp.ndarray  # (M_pool,) bool
+    tile_ids: jnp.ndarray  # (N_tiles,) int64 in atlas view order
+    m_tile_view: int  # Fixed per-tile view size
+
+    # Geometry / appearance for OT cost
+    positions: jnp.ndarray  # (M_pool, 3)
+    covariances: jnp.ndarray  # (M_pool, 3, 3)
+    directions: jnp.ndarray  # (M_pool, 3)
+    kappas: jnp.ndarray  # (M_pool,)
+    weights: jnp.ndarray  # (M_pool,)
+    primitive_ids: jnp.ndarray  # (M_pool,) int64
+    last_supported_scan_seq: jnp.ndarray  # (M_pool,) int64
+    etas: jnp.ndarray  # (M_pool, B, 3)
+    colors: jnp.ndarray  # (M_pool, 3)
+
+    @property
+    def count(self) -> int:
+        return int(self.positions.shape[0])
+
+
+@jax.jit(static_argnames=("k",))
+def _select_topk_slots_fixed(
+    weights: jnp.ndarray, primitive_ids: jnp.ndarray, valid_mask: jnp.ndarray, k: int
+) -> jnp.ndarray:
+    """
+    Select top-k slots by weight from a fixed-size tile.
+
+    Fixed-cost: always sorts over full M_TILE, then slices k.
+    """
+    weights = jnp.asarray(weights, dtype=jnp.float64).reshape(-1)
+    primitive_ids = jnp.asarray(primitive_ids, dtype=jnp.int64).reshape(-1)
+    valid_mask = jnp.asarray(valid_mask, dtype=bool).reshape(-1)
+    # Use a large negative sentinel so invalid entries never win.
+    score = jnp.where(valid_mask, weights, jnp.asarray(-1e30, dtype=jnp.float64))
+    idx = jnp.arange(score.shape[0], dtype=jnp.int32)
+    # Deterministic tie-break by primitive_id (ascending).
+    score_sorted, id_sorted, idx_sorted = jax.lax.sort((-score, primitive_ids, idx), dimension=0)
+    _ = score_sorted, id_sorted
+    _ = score_sorted
+    return idx_sorted[: k].astype(jnp.int32)
+
+
+@jax.jit(static_argnames=("k",))
+def _select_lowest_mass_slots_fixed(
+    weights: jnp.ndarray,
+    primitive_ids: jnp.ndarray,
+    valid_mask: jnp.ndarray,
+    last_supported_scan_seq: jnp.ndarray,
+    scan_seq: int,
+    recency_decay_lambda: float,
+    k: int,
+) -> jnp.ndarray:
+    """
+    Select lowest-retention slots with deterministic tie-break by primitive_id.
+
+    Empty slots are treated as mass = -inf so they are selected first.
+    """
+    weights = jnp.asarray(weights, dtype=jnp.float64).reshape(-1)
+    primitive_ids = jnp.asarray(primitive_ids, dtype=jnp.int64).reshape(-1)
+    valid_mask = jnp.asarray(valid_mask, dtype=bool).reshape(-1)
+    last_supported_scan_seq = jnp.asarray(last_supported_scan_seq, dtype=jnp.int64).reshape(-1)
+    scan_seq = jnp.asarray(scan_seq, dtype=jnp.int64)
+    dt = jnp.maximum(jnp.asarray(0, dtype=jnp.int64), scan_seq - last_supported_scan_seq)
+    decay = jnp.exp(-jnp.asarray(recency_decay_lambda, dtype=jnp.float64) * dt.astype(jnp.float64))
+    retention = weights * decay
+    mass_key = jnp.where(valid_mask, retention, jnp.asarray(-jnp.inf, dtype=jnp.float64))
+    idx = jnp.arange(mass_key.shape[0], dtype=jnp.int32)
+    # Sort by (mass_key asc, primitive_id asc, idx asc) deterministically.
+    mass_sorted, id_sorted, idx_sorted = jax.lax.sort((mass_key, primitive_ids, idx), dimension=0)
+    _ = mass_sorted, id_sorted
+    return idx_sorted[: k].astype(jnp.int32)
+
+
+def extract_atlas_map_view(
+    atlas_map: AtlasMap,
+    tile_ids: List[int],
+    m_tile_view: int,
+    eps_lift: float = constants.GC_EPS_LIFT,
+    eps_mass: float = constants.GC_EPS_MASS,
+) -> AtlasMapView:
+    """
+    Extract a fixed-size candidate pool from a fixed list of tiles.
+
+    For each tile_id in tile_ids:
+      - If missing, treat it as an empty tile.
+      - Select top M_TILE_VIEW slots by weight (fixed-cost).
+      - Stitch into a single pool of size len(tile_ids) * M_TILE_VIEW.
+    """
+    if m_tile_view <= 0:
+        raise ValueError(f"extract_atlas_map_view: m_tile_view must be > 0, got {m_tile_view}")
+
+    tiles: List[PrimitiveMapTile] = []
+    for tid in tile_ids:
+        tile = atlas_map.tiles.get(int(tid))
+        if tile is None:
+            tile = create_empty_tile(tile_id=int(tid), m_tile=int(atlas_map.m_tile))
+        tiles.append(tile)
+
+    k = int(m_tile_view)
+    eps_lift_j = jnp.asarray(eps_lift, dtype=jnp.float64)
+    eps_mass_j = jnp.asarray(eps_mass, dtype=jnp.float64)
+
+    # Gather per-tile fixed views then stitch.
+    cand_tile_ids = []
+    cand_slots = []
+    valid_masks = []
+    Lambdas_list = []
+    thetas_list = []
+    etas_list = []
+    weights_list = []
+    prim_ids_list = []
+    last_supported_list = []
+    colors_list = []
+
+    for tile in tiles:
+        slots = _select_topk_slots_fixed(tile.weights, tile.primitive_ids, tile.valid_mask, k=k)
+        cand_slots.append(slots)
+        cand_tile_ids.append(jnp.full((k,), int(tile.tile_id), dtype=jnp.int64))
+        valid_masks.append(tile.valid_mask[slots])
+        Lambdas_list.append(tile.Lambdas[slots])
+        thetas_list.append(tile.thetas[slots])
+        etas_list.append(tile.etas[slots])
+        weights_list.append(tile.weights[slots])
+        prim_ids_list.append(tile.primitive_ids[slots])
+        last_supported_list.append(tile.last_supported_scan_seq[slots])
+        colors_list.append(tile.colors[slots])
+
+    Lambdas = jnp.concatenate(Lambdas_list, axis=0)
+    thetas = jnp.concatenate(thetas_list, axis=0)
+    etas = jnp.concatenate(etas_list, axis=0)
+    weights = jnp.concatenate(weights_list, axis=0)
+    primitive_ids = jnp.concatenate(prim_ids_list, axis=0)
+    last_supported_scan_seq = jnp.concatenate(last_supported_list, axis=0)
+    colors = jnp.concatenate(colors_list, axis=0)
+    valid_mask = jnp.concatenate(valid_masks, axis=0).astype(bool)
+    candidate_tile_ids = jnp.concatenate(cand_tile_ids, axis=0)
+    candidate_slots = jnp.concatenate(cand_slots, axis=0)
+
+    positions, covariances, directions, kappas, weights_out, prim_ids_out, colors_out, etas_out = (
+        _extract_primitive_map_view_core(
+            Lambdas,
+            thetas,
+            etas,
+            weights,
+            primitive_ids,
+            colors,
+            valid_mask,
+            eps_lift_j,
+            eps_mass_j,
+        )
+    )
+
+    return AtlasMapView(
+        candidate_tile_ids=candidate_tile_ids,
+        candidate_slots=candidate_slots,
+        valid_mask=valid_mask,
+        tile_ids=jnp.asarray(tile_ids, dtype=jnp.int64),
+        m_tile_view=int(m_tile_view),
+        positions=positions,
+        covariances=covariances,
+        directions=directions,
+        kappas=kappas,
+        weights=weights_out,
+        primitive_ids=prim_ids_out,
+        last_supported_scan_seq=last_supported_scan_seq,
+        etas=etas_out,
+        colors=colors_out,
+    )
 
 
 @dataclass
@@ -546,6 +622,7 @@ def primitive_map_insert(
     etas_new: jnp.ndarray,      # (M, B, 3)
     weights_new: jnp.ndarray,   # (M,)
     timestamp: float,
+    scan_seq: int = 0,
     colors_new: Optional[jnp.ndarray] = None,  # (M, 3)
     chart_id: str = constants.GC_CHART_ID,
     anchor_id: str = "primitive_map",
@@ -569,10 +646,10 @@ def primitive_map_insert(
     Returns:
         (result, CertBundle, ExpectedEffect)
     """
-    if tile_id not in atlas_map.tiles:
-        raise ValueError(f"primitive_map_insert: tile_id {tile_id} not in atlas")
-
-    tile = atlas_map.tiles[tile_id]
+    tile_id = int(tile_id)
+    tile = atlas_map.tiles.get(tile_id)
+    if tile is None:
+        tile = create_empty_tile(tile_id=tile_id, m_tile=int(atlas_map.m_tile))
     M = Lambdas_new.shape[0]
     max_size = tile.Lambdas.shape[0]
     available = max_size - tile.count
@@ -611,6 +688,12 @@ def primitive_map_insert(
     weights = tile.weights.at[empty_indices].set(weights_new[:n_to_insert])
     timestamps = tile.timestamps.at[empty_indices].set(timestamp)
     created_timestamps = tile.created_timestamps.at[empty_indices].set(timestamp)
+    last_supported_scan_seq = tile.last_supported_scan_seq.at[empty_indices].set(
+        jnp.asarray(scan_seq, dtype=jnp.int64)
+    )
+    last_update_scan_seq = tile.last_update_scan_seq.at[empty_indices].set(
+        jnp.asarray(scan_seq, dtype=jnp.int64)
+    )
     primitive_ids = tile.primitive_ids.at[empty_indices].set(new_ids)
     valid_mask = tile.valid_mask.at[empty_indices].set(True)
 
@@ -627,6 +710,8 @@ def primitive_map_insert(
         weights=weights,
         timestamps=timestamps,
         created_timestamps=created_timestamps,
+        last_supported_scan_seq=last_supported_scan_seq,
+        last_update_scan_seq=last_update_scan_seq,
         primitive_ids=primitive_ids,
         valid_mask=valid_mask,
         colors=colors,
@@ -657,6 +742,146 @@ def primitive_map_insert(
     return result, cert, effect
 
 
+def primitive_map_insert_masked(
+    atlas_map: AtlasMap,
+    tile_id: int,
+    Lambdas_new: jnp.ndarray,   # (K, 3, 3)
+    thetas_new: jnp.ndarray,    # (K, 3)
+    etas_new: jnp.ndarray,      # (K, B, 3)
+    weights_new: jnp.ndarray,   # (K,)
+    timestamp: float,
+    valid_new_mask: jnp.ndarray,  # (K,) bool; proposals with mask=0 are ignored (fixed-cost).
+    scan_seq: int = 0,
+    recency_decay_lambda: float = constants.GC_RECENCY_DECAY_LAMBDA,
+    colors_new: Optional[jnp.ndarray] = None,  # (K, 3)
+    chart_id: str = constants.GC_CHART_ID,
+    anchor_id: str = "primitive_map_insert_masked",
+) -> Tuple[PrimitiveMapInsertResult, CertBundle, ExpectedEffect]:
+    """
+    Fixed-cost insertion of up to K new primitives into a tile, using a boolean proposal mask.
+
+    This is the Phase 6 insertion surface: callers pass a fixed K=K_INSERT_TILE proposals
+    and a mask indicating which are real. The operator inserts only masked proposals, and
+    logs any truncation due to lack of free slots as an explicit budgeting approximation.
+    """
+    tile_id = int(tile_id)
+    tile = atlas_map.tiles.get(tile_id)
+    if tile is None:
+        tile = create_empty_tile(tile_id=tile_id, m_tile=int(atlas_map.m_tile))
+
+    Lambdas_new = jnp.asarray(Lambdas_new, dtype=jnp.float64)
+    thetas_new = jnp.asarray(thetas_new, dtype=jnp.float64)
+    etas_new = jnp.asarray(etas_new, dtype=jnp.float64)
+    weights_new = jnp.asarray(weights_new, dtype=jnp.float64).reshape(-1)
+    valid_new_mask = jnp.asarray(valid_new_mask).reshape(-1).astype(bool)
+    K = int(Lambdas_new.shape[0])
+
+    # Select K eviction targets (empty slots first, then lowest-mass with primitive_id tie-break).
+    target_slots = _select_lowest_mass_slots_fixed(
+        weights=tile.weights,
+        primitive_ids=tile.primitive_ids,
+        valid_mask=tile.valid_mask,
+        last_supported_scan_seq=tile.last_supported_scan_seq,
+        scan_seq=scan_seq,
+        recency_decay_lambda=recency_decay_lambda,
+        k=K,
+    )
+    do_insert = valid_new_mask
+
+    n_inserted = int(jnp.sum(do_insert.astype(jnp.int32)))
+    # Assign contiguous IDs for inserted proposals only (fixed-cost prefix-sum).
+    prefix = jnp.cumsum(do_insert.astype(jnp.int64)) - 1
+    new_ids_full = jnp.where(
+        do_insert,
+        jnp.asarray(atlas_map.next_global_id, dtype=jnp.int64) + prefix,
+        jnp.asarray(-1, dtype=jnp.int64),
+    )
+
+    # Masked updates into the selected empty slots.
+    Lambdas_prev = tile.Lambdas[target_slots]
+    thetas_prev = tile.thetas[target_slots]
+    etas_prev = tile.etas[target_slots]
+    weights_prev = tile.weights[target_slots]
+    prim_ids_prev = tile.primitive_ids[target_slots]
+    colors_prev = tile.colors[target_slots]
+    valid_prev = tile.valid_mask[target_slots]
+
+    Lambdas_set = jnp.where(do_insert[:, None, None], Lambdas_new, Lambdas_prev)
+    thetas_set = jnp.where(do_insert[:, None], thetas_new, thetas_prev)
+    etas_set = jnp.where(do_insert[:, None, None], etas_new, etas_prev)
+    weights_set = jnp.where(do_insert, weights_new, weights_prev)
+    prim_ids_set = jnp.where(do_insert, new_ids_full, prim_ids_prev)
+    valid_set = valid_prev | do_insert
+
+    if colors_new is not None:
+        colors_new = jnp.asarray(colors_new, dtype=jnp.float64)
+        colors_set = jnp.where(do_insert[:, None], colors_new, colors_prev)
+    else:
+        colors_set = colors_prev
+
+    Lambdas = tile.Lambdas.at[target_slots].set(Lambdas_set)
+    thetas = tile.thetas.at[target_slots].set(thetas_set)
+    etas = tile.etas.at[target_slots].set(etas_set)
+    weights = tile.weights.at[target_slots].set(weights_set)
+    timestamps = tile.timestamps.at[target_slots].set(
+        jnp.where(do_insert, float(timestamp), tile.timestamps[target_slots])
+    )
+    created_timestamps = tile.created_timestamps.at[target_slots].set(
+        jnp.where(do_insert, float(timestamp), tile.created_timestamps[target_slots])
+    )
+    last_supported_scan_seq = tile.last_supported_scan_seq.at[target_slots].set(
+        jnp.where(do_insert, jnp.asarray(scan_seq, dtype=jnp.int64), tile.last_supported_scan_seq[target_slots])
+    )
+    last_update_scan_seq = tile.last_update_scan_seq.at[target_slots].set(
+        jnp.where(do_insert, jnp.asarray(scan_seq, dtype=jnp.int64), tile.last_update_scan_seq[target_slots])
+    )
+    primitive_ids = tile.primitive_ids.at[target_slots].set(prim_ids_set)
+    valid_mask = tile.valid_mask.at[target_slots].set(valid_set)
+    colors = tile.colors.at[target_slots].set(colors_set)
+
+    new_tile = PrimitiveMapTile(
+        tile_id=tile.tile_id,
+        Lambdas=Lambdas,
+        thetas=thetas,
+        etas=etas,
+        weights=weights,
+        timestamps=timestamps,
+        created_timestamps=created_timestamps,
+        last_supported_scan_seq=last_supported_scan_seq,
+        last_update_scan_seq=last_update_scan_seq,
+        primitive_ids=primitive_ids,
+        valid_mask=valid_mask,
+        colors=colors,
+        next_local_id=int(tile.next_local_id),
+        count=int(jnp.sum(valid_mask.astype(jnp.int32))),
+    )
+    tiles = dict(atlas_map.tiles)
+    tiles[tile_id] = new_tile
+    new_atlas = AtlasMap(
+        tiles=tiles,
+        next_global_id=int(atlas_map.next_global_id + n_inserted),
+        total_count=int(atlas_map.total_count + n_inserted),
+        m_tile=atlas_map.m_tile,
+    )
+
+    triggers: List[str] = []
+    dropped = int(jnp.sum((~valid_new_mask).astype(jnp.int32)))
+    if dropped > 0:
+        triggers.append("insert_unfilled_budget")
+    cert = (
+        CertBundle.create_approx(chart_id=chart_id, anchor_id=anchor_id, triggers=triggers, frobenius_applied=False)
+        if triggers
+        else CertBundle.create_exact(chart_id=chart_id, anchor_id=anchor_id)
+    )
+    effect = ExpectedEffect(
+        objective_name="primitive_map_insert_masked",
+        predicted=float(int(jnp.sum(valid_new_mask.astype(jnp.int32)))),
+        realized=float(n_inserted),
+    )
+    result = PrimitiveMapInsertResult(atlas_map=new_atlas, tile_id=tile_id, n_inserted=n_inserted, new_ids=new_ids_full)
+    return result, cert, effect
+
+
 @dataclass
 class PrimitiveMapFuseResult:
     """Result of PrimitiveMapFuse operator."""
@@ -675,6 +900,7 @@ def primitive_map_fuse(
     weights_meas: jnp.ndarray,         # (K,) measurement weights
     responsibilities: jnp.ndarray,     # (K,) soft association weights
     timestamp: float,
+    scan_seq: int = 0,
     valid_mask: Optional[jnp.ndarray] = None,  # (K,) bool; when provided, zero out invalid before segment_sum
     colors_meas: Optional[jnp.ndarray] = None,  # (K, 3) measurement RGB; when provided, weighted blend per target
     eps_psd: float = constants.GC_EPS_PSD,
@@ -693,10 +919,10 @@ def primitive_map_fuse(
     Fixed-cost operator. Always applies (no gates).
     When valid_mask is provided (e.g. from JAX-only flatten), invalid entries contribute zero.
     """
-    if tile_id not in atlas_map.tiles:
-        raise ValueError(f"primitive_map_fuse: tile_id {tile_id} not in atlas")
-
-    tile = atlas_map.tiles[tile_id]
+    tile_id = int(tile_id)
+    tile = atlas_map.tiles.get(tile_id)
+    if tile is None:
+        tile = create_empty_tile(tile_id=tile_id, m_tile=int(atlas_map.m_tile))
     K = target_slots.shape[0]
     if K == 0:
         result = PrimitiveMapFuseResult(atlas_map=atlas_map, tile_id=tile_id, n_fused=0)
@@ -763,6 +989,17 @@ def primitive_map_fuse(
     etas = tile.etas + d_etas
     weights = tile.weights + d_weights
     timestamps = tile.timestamps.at[jnp.unique(target_slots)].set(timestamp)
+    updated = d_resp_sum > 0.0
+    last_supported_scan_seq = jnp.where(
+        updated,
+        jnp.asarray(scan_seq, dtype=jnp.int64),
+        tile.last_supported_scan_seq,
+    )
+    last_update_scan_seq = jnp.where(
+        updated,
+        jnp.asarray(scan_seq, dtype=jnp.int64),
+        tile.last_update_scan_seq,
+    )
 
     new_tile = PrimitiveMapTile(
         tile_id=tile.tile_id,
@@ -772,6 +1009,8 @@ def primitive_map_fuse(
         weights=weights,
         timestamps=timestamps,
         created_timestamps=tile.created_timestamps,
+        last_supported_scan_seq=last_supported_scan_seq,
+        last_update_scan_seq=last_update_scan_seq,
         primitive_ids=tile.primitive_ids,
         valid_mask=tile.valid_mask,
         colors=colors,
@@ -830,10 +1069,10 @@ def primitive_map_cull(
     Returns:
         (result, CertBundle, ExpectedEffect) with mass_dropped logged
     """
-    if tile_id not in atlas_map.tiles:
-        raise ValueError(f"primitive_map_cull: tile_id {tile_id} not in atlas")
-
-    tile = atlas_map.tiles[tile_id]
+    tile_id = int(tile_id)
+    tile = atlas_map.tiles.get(tile_id)
+    if tile is None:
+        tile = create_empty_tile(tile_id=tile_id, m_tile=int(atlas_map.m_tile))
     if tile.count == 0:
         result = PrimitiveMapCullResult(atlas_map=atlas_map, tile_id=tile_id, n_culled=0, mass_dropped=0.0)
         cert = CertBundle.create_exact(chart_id=chart_id, anchor_id=anchor_id)
@@ -875,6 +1114,8 @@ def primitive_map_cull(
         weights=tile.weights,
         timestamps=tile.timestamps,
         created_timestamps=tile.created_timestamps,
+        last_supported_scan_seq=tile.last_supported_scan_seq,
+        last_update_scan_seq=tile.last_update_scan_seq,
         primitive_ids=tile.primitive_ids,
         valid_mask=valid_mask,
         colors=tile.colors,
@@ -947,10 +1188,13 @@ def primitive_map_forget(
     Returns:
         (result, CertBundle, ExpectedEffect)
     """
-    if tile_id not in atlas_map.tiles:
-        raise ValueError(f"primitive_map_forget: tile_id {tile_id} not in atlas")
-
-    tile = atlas_map.tiles[tile_id]
+    tile_id = int(tile_id)
+    tile = atlas_map.tiles.get(tile_id)
+    if tile is None:
+        result = PrimitiveMapForgetResult(atlas_map=atlas_map, tile_id=tile_id)
+        cert = CertBundle.create_exact(chart_id=chart_id, anchor_id=anchor_id)
+        effect = ExpectedEffect(objective_name="primitive_map_forget", predicted=0.0, realized=0.0)
+        return result, cert, effect
     gamma = float(forgetting_factor)
 
     new_tile = PrimitiveMapTile(
@@ -961,6 +1205,8 @@ def primitive_map_forget(
         weights=gamma * tile.weights,
         timestamps=tile.timestamps,
         created_timestamps=tile.created_timestamps,
+        last_supported_scan_seq=tile.last_supported_scan_seq,
+        last_update_scan_seq=tile.last_update_scan_seq,
         primitive_ids=tile.primitive_ids,
         valid_mask=tile.valid_mask,
         colors=tile.colors,
@@ -984,6 +1230,101 @@ def primitive_map_forget(
         realized=1.0 - gamma,
     )
     return result, cert, effect
+
+
+# =============================================================================
+# Recency-based uncertainty inflation (continuous, fixed-cost)
+# =============================================================================
+
+
+@dataclass
+class PrimitiveMapRecencyInflateStats:
+    """Stats for recency-based inflation (for cert logging)."""
+    staleness_inflation_strength: float
+    staleness_cov_inflation_trace: float
+    stale_precision_downscale_total: float
+
+
+def primitive_map_recency_inflate(
+    atlas_map: AtlasMap,
+    tile_ids: List[int],
+    scan_seq: int,
+    recency_decay_lambda: float = constants.GC_RECENCY_DECAY_LAMBDA,
+    min_scale: float = constants.GC_RECENCY_MIN_SCALE,
+    chart_id: str = constants.GC_CHART_ID,
+    anchor_id: str = "primitive_map_recency_inflate",
+) -> Tuple[AtlasMap, CertBundle, ExpectedEffect, PrimitiveMapRecencyInflateStats]:
+    """
+    Inflate uncertainty for stale primitives by downscaling precision.
+
+    Continuous, fixed-cost: apply to all primitives in the specified tiles.
+    Scaling preserves mean (Lambda, theta scaled together).
+    """
+    tiles = dict(atlas_map.tiles)
+    total_downscale = 0.0
+    total_inflation_trace = 0.0
+    n_valid_total = 0.0
+
+    for tid in tile_ids:
+        tid_i = int(tid)
+        tile = tiles.get(tid_i)
+        if tile is None:
+            continue
+        valid = tile.valid_mask.astype(jnp.float64)
+        dt = jnp.maximum(
+            jnp.asarray(0, dtype=jnp.int64),
+            jnp.asarray(scan_seq, dtype=jnp.int64) - tile.last_supported_scan_seq,
+        )
+        decay = jnp.exp(-jnp.asarray(recency_decay_lambda, dtype=jnp.float64) * dt.astype(jnp.float64))
+        decay = jnp.clip(decay, float(min_scale), 1.0)
+        decay = jnp.where(tile.valid_mask, decay, 1.0)
+
+        Lambdas = tile.Lambdas * decay[:, None, None]
+        thetas = tile.thetas * decay[:, None]
+        # etas are vMF parameters; do not scale.
+        new_tile = PrimitiveMapTile(
+            tile_id=tile.tile_id,
+            Lambdas=Lambdas,
+            thetas=thetas,
+            etas=tile.etas,
+            weights=tile.weights,
+            timestamps=tile.timestamps,
+            created_timestamps=tile.created_timestamps,
+            last_supported_scan_seq=tile.last_supported_scan_seq,
+            last_update_scan_seq=tile.last_update_scan_seq,
+            primitive_ids=tile.primitive_ids,
+            valid_mask=tile.valid_mask,
+            colors=tile.colors,
+            next_local_id=tile.next_local_id,
+            count=tile.count,
+        )
+        tiles[tid_i] = new_tile
+
+        n_valid = float(jnp.sum(valid))
+        n_valid_total += n_valid
+        total_downscale += float(jnp.sum((1.0 - decay) * valid))
+        total_inflation_trace += float(jnp.sum(((1.0 / decay) - 1.0) * valid))
+
+    new_atlas = AtlasMap(
+        tiles=tiles,
+        next_global_id=atlas_map.next_global_id,
+        total_count=atlas_map.total_count,
+        m_tile=atlas_map.m_tile,
+    )
+
+    strength = total_downscale / max(n_valid_total, 1.0)
+    stats = PrimitiveMapRecencyInflateStats(
+        staleness_inflation_strength=float(strength),
+        staleness_cov_inflation_trace=float(total_inflation_trace),
+        stale_precision_downscale_total=float(total_downscale),
+    )
+    cert = CertBundle.create_exact(chart_id=chart_id, anchor_id=anchor_id)
+    effect = ExpectedEffect(
+        objective_name="primitive_map_recency_inflate",
+        predicted=float(n_valid_total),
+        realized=float(n_valid_total),
+    )
+    return new_atlas, cert, effect, stats
 
 
 # =============================================================================
@@ -1037,8 +1378,21 @@ def primitive_map_merge_reduce(
     # 3. Merge via moment matching (weight-preserving)
     # 4. Log Frobenius correction for out-of-family approximation
 
+    tile_id = int(tile_id)
     if tile_id not in atlas_map.tiles:
-        raise ValueError(f"primitive_map_merge_reduce: tile_id {tile_id} not in atlas")
+        result = PrimitiveMapMergeReduceResult(
+            atlas_map=atlas_map,
+            tile_id=tile_id,
+            n_merged=0,
+            frobenius_correction=0.0,
+        )
+        cert = CertBundle.create_exact(chart_id=chart_id, anchor_id=anchor_id)
+        effect = ExpectedEffect(
+            objective_name="primitive_map_merge_reduce",
+            predicted=0.0,
+            realized=0.0,
+        )
+        return result, cert, effect
 
     result = PrimitiveMapMergeReduceResult(
         atlas_map=atlas_map,

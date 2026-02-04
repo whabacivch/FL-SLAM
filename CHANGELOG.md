@@ -4,6 +4,11 @@ Project: Frobenius-Legendre SLAM POC (Impact Project_v1)
 
 This file tracks all significant changes, design decisions, and implementation milestones for the FL-SLAM project.
 
+## 2026-02-04: Jackal2 camera calibration + time reference QoS alignment
+
+- Updated `gc_unified.yaml` with acl_jackal2 camera intrinsics (from `/acl_jackal/forward/color/camera_info`) and `T_base_camera` extrinsics from Kimera calibration.
+- Aligned `/gc/sensors/time_reference` subscriptions to best-effort QoS (camera_rgbd_node + odom_normalizer) to match LiDAR passthrough and remove time alignment mismatch.
+
 ## 2026-02-02: Backend params applied for primitive budgets (config mismatch fix)
 
 - Wired GC backend parameters for `n_feat`, `n_surfel`, `k_assoc`, `k_sinkhorn`, `primitive_map_max_size`, and `primitive_forgetting_factor` into `PipelineConfig` so `gc_unified.yaml` is actually honored at runtime.
@@ -15,6 +20,43 @@ This file tracks all significant changes, design decisions, and implementation m
 - Backend now wires these parameters into `PipelineConfig` and publishes them in the runtime manifest; added explicit fail-fast for `map_backend` and `pose_evidence_backend`.
 - Renamed `k_insert` parameter to `k_insert_tile` for per-tile budget clarity; removed unused `forgetting_factor` parameter.
 - Runtime manifest schema now includes `N_FEAT`, `N_SURFEL`, and `K_SINKHORN` fields.
+
+## 2026-02-03: Legacy fallback cleanup (single-path enforcement)
+
+- Removed deprecated `gc_backend.yaml` and its mention in config docs.
+- Sensor hub now fails fast if `gc_unified.yaml` cannot be resolved (no workspace fallback).
+- Visual feature extraction now requires OpenCV ORB; removed deterministic grid fallback.
+- OT mass policies now fail fast when unsupported (no silent uniform fallback).
+- Removed legacy PrimitiveMap conversion helpers/exports; AtlasMap is the sole map interface.
+- Full ScanDiagnostics NPZ export removed; minimal tape is the only supported diagnostics output.
+- Certificate aggregation now fails fast on empty input (no scan_io fallback).
+
+## 2026-02-03: C++ visual preprocessing pipeline (Option 1)
+
+- Added `VisualFeature`/`VisualFeatureBatch` messages and `visual_feature_node` (C++ ORB + depth sampling + closed-form covariance).
+- Launch now wires `camera_rgbd_node` → `visual_feature_node` → `/gc/sensors/visual_features`.
+- Backend consumes VisualFeatureBatch (no Python OpenCV dependency) and runs LiDAR–camera depth fusion + map update unchanged.
+- Added `visual_feature_topic` to config/manifest and updated invariants test to assert new node/topic.
+
+## 2026-02-03: Visual Python extractor bloat removed
+
+- Removed `visual_feature_extractor.py` (Python ORB path) and moved shared data types to `visual_types.py`.
+- Updated splat prep and camera batch utilities to import from `visual_types.py`.
+- Visual feature parameters now live in `gc_unified.yaml` and are passed to `visual_feature_node` by launch.
+
+## 2026-02-03: Recency bias (association + map maintenance + rendering)
+
+- Added recency-aware deterministic candidate ordering for OT: cost → recency (`last_supported_scan_seq`) → primitive_id.
+- Introduced continuous recency bias in association cost and logged recency diagnostics in `OTCert`.
+- Added recency-based precision inflation (continuous, fixed-cost) for active tiles and logged staleness stats in `MapUpdateCert`.
+- Eviction now prefers lowest retention (mass × recency decay) with deterministic tie-break.
+- Rendering order now matches inference recency signal (last_supported_scan_seq).
+
+## 2026-02-03: Dependence coupling (IMU + odom)
+
+- Added conservative dependence inflation for IMU gyro↔accel (transport-consistency based) and odom pose↔twist (kinematic consistency based).
+- Scaled IMU/odom evidence contributions by dependence inflation factors, with certificate triggers.
+- Wired IMU message covariances (gyro/accel) into runtime noise when enabled.
 
 ## 2026-02-03: Spec doc renamed to GC_SLAM.md
 
@@ -3242,3 +3284,43 @@ Status monitoring: Will report DEAD_RECKONING if no loop factors
 - `pytest -q` under `fl_ws/src/fl_slam_poc` passes.
 - `colcon build --packages-select fl_slam_poc` succeeds.
 - `bash scripts/run_and_evaluate.sh` runs end-to-end on M3DGR (trajectory quality remains under investigation).
+
+## 2026-02-03
+### Phase 6 (Real Tiling)
+- Added deterministic MA-Hex 3D tile addressing utilities and wired tiling budgets into runtime config/manifest (fail-fast if YAML drifts).
+- Atlas now supports multi-tile operation (tiles created on-demand; fixed-size per-stencil candidate pool via `AtlasMapView`).
+- Updated OT association and visual pose evidence to operate on stitched candidate pools (includes candidate pool indices + tile-local addressing).
+- Updated per-scan map update to fuse/insert/cull/forget per active tile using masks (no hidden gating; fixed loop counts).
+- Updated map publisher and splat export to handle multi-tile atlases (publish/export selected tiles deterministically).
+
+### Tests
+- Updated budget assertion test to use `AtlasMapView`; `pytest -q` under `fl_ws/src/fl_slam_poc` passes.
+
+### Strictness / No-Fallbacks
+- Visual features are now required when configured; empty ring buffer is a hard error (no silent fallback).
+- Timing diagnostics now fail-fast on sync errors when enabled (no silent exceptions).
+- Rerun visualization now fails fast when `use_rerun=true` and `rerun-sdk` is missing.
+- Map publisher no longer suppresses `LinAlgError` when inverting covariances (no silent fallback).
+- Tile assignment for insertion moved to JAX (`tile_ids_from_xyz_batch_jax`), removing host-side numpy in the update path.
+
+### Phase 6 Fixes (GC_SLAM §5.7 alignment)
+- Per-measurement candidate pool stencil enforced in OT association (tile-local stencil mask).
+- Insertion now evicts lowest-mass slots per tile (deterministic tie-break by primitive_id).
+- MapUpdateCert now records inactive tiles; OTCert now records sum_m and sum_novel.
+- Rendering uses recency bias for visualization only (no effect on inference).
+ - Fixed insert count enforced by zero-mass placeholders when a tile has no in-tile measurements.
+ - Added event log JSONL output for replay (scan_time + inserted primitive payloads).
+ - Added tile cache hit/miss logging to MapUpdateCert.
+
+### Performance
+- Added optional parallel execution for independent stages (IMU/odom evidence vs surfel/association prep) behind `enable_parallel_stages`.
+- Fixed evidence certificate aggregation to use per-branch cert outputs after parallel refactor.
+- Defaulted `rerun_spawn=true` in unified config and added a warning when rerun is enabled but no viewer/recording target is configured.
+
+### Time Alignment
+- Added a shared time reference topic from LiDAR passthrough and offset-based timestamp alignment with drift/monotonicity checks in IMU/odom normalizers.
+- Added optional time alignment in `camera_rgbd_node` (RGBD header timestamps) and wired it in launch config.
+- Adjusted drift checking to occur on reference updates using the latest local stamp (avoids false positives between ref updates).
+
+### Visualization
+- Explicitly spawn Rerun viewer with welcome screen hidden and ensured connection to the current recording.

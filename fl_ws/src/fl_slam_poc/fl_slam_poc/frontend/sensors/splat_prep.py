@@ -17,7 +17,7 @@ from fl_slam_poc.frontend.sensors.lidar_camera_depth_fusion import (
     backprojection_cov_camera,
     lidar_depth_evidence,
 )
-from fl_slam_poc.frontend.sensors.visual_feature_extractor import (
+from fl_slam_poc.frontend.sensors.visual_types import (
     ExtractionResult,
     Feature3D,
     PinholeIntrinsics,
