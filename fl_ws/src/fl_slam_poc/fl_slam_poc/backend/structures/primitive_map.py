@@ -1379,6 +1379,249 @@ class PrimitiveMapMergeReduceResult:
     frobenius_correction: float  # Applied when out-of-family
 
 
+def _merge_reduce_jax(
+    dist: jnp.ndarray,
+    i_idx: jnp.ndarray,
+    j_idx: jnp.ndarray,
+    mu: jnp.ndarray,
+    Sigma: jnp.ndarray,
+    Lambdas: jnp.ndarray,
+    thetas: jnp.ndarray,
+    etas: jnp.ndarray,
+    weights: jnp.ndarray,
+    colors: jnp.ndarray,
+    valid: jnp.ndarray,
+    timestamps: jnp.ndarray,
+    created_timestamps: jnp.ndarray,
+    last_supported_scan_seq: jnp.ndarray,
+    last_update_scan_seq: jnp.ndarray,
+    merge_threshold: float,
+    max_pairs: int,
+    eps_psd: float,
+) -> Tuple[
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+]:
+    """
+    JAX-only merge-reduce: select disjoint pairs and apply merges without Python loops.
+
+    Returns updated arrays and n_merged.
+    """
+    M = weights.shape[0]
+    P = dist.shape[0]
+    max_pairs_i = int(max_pairs)
+    merge_threshold_f = float(merge_threshold)
+    eps_psd_f = float(eps_psd)
+
+    order = jnp.argsort(dist)
+    used = jnp.zeros((M,), dtype=bool)
+    sel_i = -jnp.ones((max_pairs_i,), dtype=jnp.int32)
+    sel_j = -jnp.ones((max_pairs_i,), dtype=jnp.int32)
+    n_sel = jnp.int32(0)
+
+    def select_body(k, state):
+        used_i, sel_i_i, sel_j_i, n_sel_i = state
+        idx = order[k]
+        i = i_idx[idx]
+        j = j_idx[idx]
+        d = dist[idx]
+        can_select = (
+            (n_sel_i < max_pairs_i)
+            & jnp.isfinite(d)
+            & (d < merge_threshold_f)
+            & (~used_i[i])
+            & (~used_i[j])
+        )
+
+        def do_select(s):
+            used_s, sel_i_s, sel_j_s, n_sel_s = s
+            used_s = used_s.at[i].set(True)
+            used_s = used_s.at[j].set(True)
+            sel_i_s = sel_i_s.at[n_sel_s].set(i)
+            sel_j_s = sel_j_s.at[n_sel_s].set(j)
+            n_sel_s = n_sel_s + 1
+            return used_s, sel_i_s, sel_j_s, n_sel_s
+
+        return jax.lax.cond(can_select, do_select, lambda s: s, (used_i, sel_i_i, sel_j_i, n_sel_i))
+
+    used, sel_i, sel_j, n_sel = jax.lax.fori_loop(0, P, select_body, (used, sel_i, sel_j, n_sel))
+
+    Lambdas_new = Lambdas
+    thetas_new = thetas
+    etas_new = etas
+    weights_new = weights
+    colors_new = colors
+    valid_new = valid
+    timestamps_new = timestamps
+    created_timestamps_new = created_timestamps
+    last_supported_new = last_supported_scan_seq
+    last_update_new = last_update_scan_seq
+
+    def merge_body(k, state):
+        (
+            Lambdas_s,
+            thetas_s,
+            etas_s,
+            weights_s,
+            colors_s,
+            valid_s,
+            timestamps_s,
+            created_timestamps_s,
+            last_supported_s,
+            last_update_s,
+        ) = state
+
+        def do_merge(s):
+            (
+                Lambdas_m,
+                thetas_m,
+                etas_m,
+                weights_m,
+                colors_m,
+                valid_m,
+                timestamps_m,
+                created_timestamps_m,
+                last_supported_m,
+                last_update_m,
+            ) = s
+            i = sel_i[k]
+            j = sel_j[k]
+            w1 = weights_m[i]
+            w2 = weights_m[j]
+            wsum = w1 + w2
+
+            def apply_merge(s2):
+                (
+                    Lambdas_a,
+                    thetas_a,
+                    etas_a,
+                    weights_a,
+                    colors_a,
+                    valid_a,
+                    timestamps_a,
+                    created_timestamps_a,
+                    last_supported_a,
+                    last_update_a,
+                ) = s2
+                mu1 = mu[i]
+                mu2 = mu[j]
+                Sigma1 = Sigma[i]
+                Sigma2 = Sigma[j]
+                mu_m = (w1 * mu1 + w2 * mu2) / wsum
+                d1 = (mu1 - mu_m).reshape(3, 1)
+                d2 = (mu2 - mu_m).reshape(3, 1)
+                Sigma_m = (w1 * (Sigma1 + d1 @ d1.T) + w2 * (Sigma2 + d2 @ d2.T)) / wsum
+                Sigma_m = Sigma_m + eps_psd_f * jnp.eye(3, dtype=jnp.float64)
+                Lambda_m = jnp.linalg.inv(Sigma_m)
+                theta_m = Lambda_m @ mu_m
+
+                eta_m = (w1 * etas_a[i] + w2 * etas_a[j]) / wsum
+                color_m = (w1 * colors_a[i] + w2 * colors_a[j]) / wsum
+
+                Lambdas_a = Lambdas_a.at[i].set(Lambda_m)
+                thetas_a = thetas_a.at[i].set(theta_m)
+                etas_a = etas_a.at[i].set(eta_m)
+                weights_a = weights_a.at[i].set(wsum)
+                colors_a = colors_a.at[i].set(color_m)
+                timestamps_a = timestamps_a.at[i].set(jnp.maximum(timestamps_a[i], timestamps_a[j]))
+                created_timestamps_a = created_timestamps_a.at[i].set(
+                    jnp.minimum(created_timestamps_a[i], created_timestamps_a[j])
+                )
+                last_supported_a = last_supported_a.at[i].set(
+                    jnp.maximum(last_supported_a[i], last_supported_a[j])
+                )
+                last_update_a = last_update_a.at[i].set(
+                    jnp.maximum(last_update_a[i], last_update_a[j])
+                )
+
+                weights_a = weights_a.at[j].set(0.0)
+                valid_a = valid_a.at[j].set(False)
+                return (
+                    Lambdas_a,
+                    thetas_a,
+                    etas_a,
+                    weights_a,
+                    colors_a,
+                    valid_a,
+                    timestamps_a,
+                    created_timestamps_a,
+                    last_supported_a,
+                    last_update_a,
+                )
+
+            return jax.lax.cond(wsum > 0.0, apply_merge, lambda s3: s3, s)
+
+        return jax.lax.cond(
+            k < n_sel,
+            do_merge,
+            lambda s: s,
+            (
+                Lambdas_s,
+                thetas_s,
+                etas_s,
+                weights_s,
+                colors_s,
+                valid_s,
+                timestamps_s,
+                created_timestamps_s,
+                last_supported_s,
+                last_update_s,
+            ),
+        )
+
+    (
+        Lambdas_new,
+        thetas_new,
+        etas_new,
+        weights_new,
+        colors_new,
+        valid_new,
+        timestamps_new,
+        created_timestamps_new,
+        last_supported_new,
+        last_update_new,
+    ) = jax.lax.fori_loop(
+        0,
+        max_pairs_i,
+        merge_body,
+        (
+            Lambdas_new,
+            thetas_new,
+            etas_new,
+            weights_new,
+            colors_new,
+            valid_new,
+            timestamps_new,
+            created_timestamps_new,
+            last_supported_new,
+            last_update_new,
+        ),
+    )
+
+    return (
+        Lambdas_new,
+        thetas_new,
+        etas_new,
+        weights_new,
+        colors_new,
+        valid_new,
+        timestamps_new,
+        created_timestamps_new,
+        last_supported_new,
+        last_update_new,
+        n_sel,
+    )
+
 def primitive_map_merge_reduce(
     atlas_map: AtlasMap,
     tile_id: int,
@@ -1497,85 +1740,44 @@ def primitive_map_merge_reduce(
     pair_valid = valid[i_idx] & valid[j_idx]
     dist = jnp.where(pair_valid, dist, jnp.asarray(jnp.inf, dtype=jnp.float64))
 
-    # Deterministic pair selection: sort by distance, then select disjoint pairs up to max_pairs.
-    order = jnp.argsort(dist)
-    used = np.zeros((M,), dtype=bool)
-    selected_pairs: List[Tuple[int, int]] = []
-    for idx in np.array(order):
-        if len(selected_pairs) >= int(max_pairs):
-            break
-        i = int(i_idx[idx])
-        j = int(j_idx[idx])
-        if not np.isfinite(float(dist[idx])):
-            break
-        if float(dist[idx]) >= float(merge_threshold):
-            break
-        if used[i] or used[j]:
-            continue
-        used[i] = True
-        used[j] = True
-        selected_pairs.append((i, j))
+    i_idx = i_idx.astype(jnp.int32)
+    j_idx = j_idx.astype(jnp.int32)
+    (
+        Lambdas_new,
+        thetas_new,
+        etas_new,
+        weights_new,
+        colors_new,
+        valid_new,
+        timestamps_new,
+        created_timestamps_new,
+        last_supported_new,
+        last_update_new,
+        n_merged,
+    ) = _merge_reduce_jax(
+        dist=dist,
+        i_idx=i_idx,
+        j_idx=j_idx,
+        mu=mu,
+        Sigma=Sigma,
+        Lambdas=Lambdas,
+        thetas=thetas,
+        etas=etas,
+        weights=weights,
+        colors=colors,
+        valid=valid,
+        timestamps=timestamps,
+        created_timestamps=created_timestamps,
+        last_supported_scan_seq=last_supported_scan_seq,
+        last_update_scan_seq=last_update_scan_seq,
+        merge_threshold=merge_threshold,
+        max_pairs=int(max_pairs),
+        eps_psd=eps_psd,
+    )
 
-    if not selected_pairs:
+    n_merged = int(n_merged)
+    if n_merged <= 0:
         return _no_op(predicted=float(max_pairs))
-
-    # Apply merges: keep lower index; invalidate higher index.
-    Lambdas_new = Lambdas
-    thetas_new = thetas
-    etas_new = etas
-    weights_new = weights
-    colors_new = colors
-    valid_new = valid
-    timestamps_new = timestamps
-    created_timestamps_new = created_timestamps
-    last_supported_new = last_supported_scan_seq
-    last_update_new = last_update_scan_seq
-
-    for i, j in selected_pairs:
-        w1 = float(weights_new[i])
-        w2 = float(weights_new[j])
-        wsum = w1 + w2
-        if wsum <= 0.0:
-            continue
-
-        mu1 = mu[i]
-        mu2 = mu[j]
-        Sigma1 = Sigma[i]
-        Sigma2 = Sigma[j]
-
-        mu_m = (w1 * mu1 + w2 * mu2) / wsum
-        d1 = (mu1 - mu_m).reshape(3, 1)
-        d2 = (mu2 - mu_m).reshape(3, 1)
-        Sigma_m = (w1 * (Sigma1 + d1 @ d1.T) + w2 * (Sigma2 + d2 @ d2.T)) / wsum
-        Sigma_m = Sigma_m + eps_psd * jnp.eye(3, dtype=jnp.float64)
-        Lambda_m = jnp.linalg.inv(Sigma_m)
-        theta_m = Lambda_m @ mu_m
-
-        # vMF payload: weight-weighted sum (user-selected default).
-        eta_m = (w1 * etas_new[i] + w2 * etas_new[j]) / wsum
-        color_m = (w1 * colors_new[i] + w2 * colors_new[j]) / wsum
-
-        Lambdas_new = Lambdas_new.at[i].set(Lambda_m)
-        thetas_new = thetas_new.at[i].set(theta_m)
-        etas_new = etas_new.at[i].set(eta_m)
-        weights_new = weights_new.at[i].set(wsum)
-        colors_new = colors_new.at[i].set(color_m)
-        timestamps_new = timestamps_new.at[i].set(jnp.maximum(timestamps_new[i], timestamps_new[j]))
-        created_timestamps_new = created_timestamps_new.at[i].set(
-            jnp.minimum(created_timestamps_new[i], created_timestamps_new[j])
-        )
-        last_supported_new = last_supported_new.at[i].set(
-            jnp.maximum(last_supported_new[i], last_supported_new[j])
-        )
-        last_update_new = last_update_new.at[i].set(
-            jnp.maximum(last_update_new[i], last_update_new[j])
-        )
-
-        # Invalidate j
-        weights_new = weights_new.at[j].set(0.0)
-        valid_new = valid_new.at[j].set(False)
-
-    n_merged = int(len(selected_pairs))
     new_tile = PrimitiveMapTile(
         tile_id=tile.tile_id,
         Lambdas=Lambdas_new,

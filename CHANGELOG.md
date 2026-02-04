@@ -3375,3 +3375,14 @@ Status monitoring: Will report DEAD_RECKONING if no loop factors
 
 ### Visualization
 - Explicitly spawn Rerun viewer with welcome screen hidden and ensured connection to the current recording.
+## 2026-02-04
+### Cleanup / Simplification (GC v2)
+- Removed legacy diagnostics paths; retained minimal tape only and tape-only NPZ/JSONL I/O.
+- Removed deprecated `save_full_diagnostics` config param and associated warning logic.
+- Dropped unused `sinkhorn_ot.py` module (not on runtime path).
+- Removed stale `map_bins_active` from wiring auditor output to match runtime status schema.
+- Vectorized per-point `time_offset` parsing in LiDAR processing.
+- Avoided JAX→host→JAX round-trip by keeping LiDAR base transform on host before a single device transfer.
+- Implemented JAX-only merge-reduce (pair selection + merge application) to eliminate Python loops in `primitive_map_merge_reduce`.
+- Removed unused NumPy helpers from `ma_hex_web`; JAX-only hot path remains.
+- Added merge-reduce unit test and refreshed simplification tracking doc.

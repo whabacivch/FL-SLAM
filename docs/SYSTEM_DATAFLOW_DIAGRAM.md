@@ -44,7 +44,7 @@ Topics present in the bag but **explicitly not consumed** by the GC v2 pipeline 
    - Trajectory path built from state estimates
 
 3. **`/gc/status`** - `std_msgs/String` (JSON)
-   - Runtime status: odom_count, scan_count, imu_count, pipeline_runs, map_bins_active
+   - Runtime status: odom_count, scan_count, imu_count, pipeline_runs
 
 4. **`/gc/runtime_manifest`** - `std_msgs/String` (JSON)
    - System configuration: enabled sensors, backends, operators, topic mappings

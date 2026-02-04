@@ -126,3 +126,40 @@ class TestCertBundleFrobeniusPolicy:
             frobenius_applied=False,
         )
         assert not cert_satisfies_frobenius_policy(cert)
+
+
+class TestLegacyDiagnosticsRemoval:
+    """Legacy diagnostics are removed; minimal tape only."""
+
+    def test_no_scan_diagnostics_symbol(self):
+        from fl_slam_poc.backend import diagnostics
+
+        assert not hasattr(diagnostics, "ScanDiagnostics")
+
+    def test_config_has_no_save_full_diagnostics(self):
+        config_path = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "config",
+            "gc_unified.yaml",
+        )
+        with open(config_path, "r") as f:
+            cfg = f.read()
+        assert "save_full_diagnostics" not in cfg
+
+
+class TestStatusSchemaNoLegacyFields:
+    """Status/auditor schemas do not reference legacy fields."""
+
+    def test_auditor_has_no_map_bins_active(self):
+        auditor_path = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "fl_slam_poc",
+            "frontend",
+            "audit",
+            "wiring_auditor.py",
+        )
+        with open(auditor_path, "r") as f:
+            contents = f.read()
+        assert "map_bins_active" not in contents

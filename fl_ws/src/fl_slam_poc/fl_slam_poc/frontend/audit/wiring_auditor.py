@@ -41,7 +41,6 @@ class AuditState:
     scan_count: int = 0
     imu_count: int = 0
     pipeline_runs: int = 0
-    map_bins_active: int = 0
     
     # From /gc/dead_end_status
     dead_end_counts: Dict[str, int] = field(default_factory=dict)
@@ -127,7 +126,6 @@ class WiringAuditorNode(Node):
             self._state.scan_count = int(data.get("scan_count", 0))
             self._state.imu_count = int(data.get("imu_count", 0))
             self._state.pipeline_runs = int(data.get("pipeline_runs", 0))
-            self._state.map_bins_active = int(data.get("map_bins_active", 0))
             self._state.last_status_time = time.time()
         except (json.JSONDecodeError, KeyError) as e:
             self.get_logger().warn(f"Failed to parse /gc/status: {e}")
@@ -227,7 +225,6 @@ class WiringAuditorNode(Node):
                 "imu_fused": True,    # Fused via imu_evidence + imu_gyro_evidence operators
             },
             "dead_ended": self._state.dead_end_counts,
-            "map_bins_active": self._state.map_bins_active,
             "manifest_received": self._state.manifest_received,
             "manifest": self._state.manifest,
         }

@@ -74,7 +74,6 @@ gc_backend:
     primitive_cull_weight_threshold: 1e-4
     surfel_voxel_size_m: 0.1
     surfel_min_points_per_voxel: 3
-    save_full_diagnostics: false
     # Phase 6 tiling budgets (spec §5.7) - wiring starts in Phase 6
     H_TILE: 2.0
     N_ACTIVE_TILES: 7

@@ -8,7 +8,6 @@ Reference: docs/GC_SLAM.md
 """
 
 import json
-import struct
 import time
 import threading
 from collections import deque
@@ -212,7 +211,6 @@ PARAM_SPECS: List[ParamSpec] = [
     ParamSpec("surfel_voxel_size_m", 0.1, float),
     ParamSpec("surfel_min_points_per_voxel", 3, int),
     # Diagnostics
-    ParamSpec("save_full_diagnostics", False, _cast_bool),
     # Smoothed initial reference: buffer first K odom, then set first_odom_pose = aggregate (PIPELINE_DESIGN_GAPS §5.4.1)
     ParamSpec("init_window_odom_count", 10, int),
     # PointCloud2 layout: vlp16 (Kimera/VLP-16). See docs/KIMERA_DATASET_AND_PIPELINE.md (§6 PointCloud2 layout).
@@ -378,7 +376,7 @@ def _pointfield_to_dtype(datatype: int) -> np.dtype:
 
 def parse_pointcloud2_vlp16(
     msg: PointCloud2,
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Parse VLP-16 (Velodyne Puck) PointCloud2: x, y, z, ring; optional t/time.
     Outputs (points, timestamps, weights, ring, tag) for pipeline.
@@ -388,11 +386,11 @@ def parse_pointcloud2_vlp16(
     n_points = msg.width * msg.height
     if n_points <= 0:
         return (
-            jnp.zeros((0, 3), dtype=jnp.float64),
-            jnp.zeros((0,), dtype=jnp.float64),
-            jnp.zeros((0,), dtype=jnp.float64),
-            jnp.zeros((0,), dtype=jnp.uint8),
-            jnp.zeros((0,), dtype=jnp.uint8),
+            np.zeros((0, 3), dtype=np.float64),
+            np.zeros((0,), dtype=np.float64),
+            np.zeros((0,), dtype=np.float64),
+            np.zeros((0,), dtype=np.uint8),
+            np.zeros((0,), dtype=np.uint8),
         )
 
     field_map = {f.name: (f.offset, f.datatype) for f in msg.fields}
@@ -461,17 +459,12 @@ def parse_pointcloud2_vlp16(
     w = w_raw * (1.0 - wf) + wf
 
     pts = np.stack([x, y, z], axis=1)
-    record_host_to_device(pts)
-    record_host_to_device(t)
-    record_host_to_device(w)
-    record_host_to_device(ring)
-    record_host_to_device(tag)
     return (
-        jnp.array(pts, dtype=jnp.float64),
-        jnp.array(t, dtype=jnp.float64),
-        jnp.array(w, dtype=jnp.float64),
-        jnp.array(ring),
-        jnp.array(tag),
+        pts.astype(np.float64, copy=False),
+        t.astype(np.float64, copy=False),
+        w.astype(np.float64, copy=False),
+        ring.astype(np.uint8, copy=False),
+        tag.astype(np.uint8, copy=False),
     )
 
 
@@ -634,12 +627,7 @@ class GeometricCompositionalBackend(Node):
         self.config.surfel_voxel_size_m = p["surfel_voxel_size_m"]
         self.config.surfel_min_points_per_voxel = p["surfel_min_points_per_voxel"]
         # Diagnostics
-        self.config.save_full_diagnostics = p["save_full_diagnostics"]
         self.config.enable_parallel_stages = p["enable_parallel_stages"]
-        if self.config.save_full_diagnostics:
-            self.get_logger().warn(
-                "save_full_diagnostics is deprecated; only minimal tape diagnostics are recorded."
-            )
 
         # Explicit backend selection (single-path, fail-fast)
         self.odom_topic = p["odom_topic"].strip()
@@ -1682,17 +1670,29 @@ class GeometricCompositionalBackend(Node):
         stamp_sec = header_stamp_sec + header_stamp_nsec * 1e-9
         
         # Parse point cloud (vlp16 layout; Kimera/VLP-16 PointCloud2).
-        points, timestamps, weights, ring, tag = parse_pointcloud2_vlp16(msg)
+        points_np, timestamps_np, weights_np, ring_np, tag_np = parse_pointcloud2_vlp16(msg)
 
         # No-TF mode: transform LiDAR points into the base/body frame before any inference.
         # p_base = R_base_lidar @ p_lidar + t_base_lidar
-        if points.shape[0] > 0:
-            record_device_to_host(points, syncs=1)
-            pts_np = np.array(points)
-            pts_base = (self.R_base_lidar @ pts_np.T).T + self.t_base_lidar[None, :]
+        if points_np.shape[0] > 0:
+            pts_base = (self.R_base_lidar @ points_np.T).T + self.t_base_lidar[None, :]
             record_host_to_device(pts_base)
             points = jnp.array(pts_base, dtype=jnp.float64)
-        n_points = points.shape[0]
+            record_host_to_device(timestamps_np)
+            record_host_to_device(weights_np)
+            record_host_to_device(ring_np)
+            record_host_to_device(tag_np)
+            timestamps = jnp.array(timestamps_np, dtype=jnp.float64)
+            weights = jnp.array(weights_np, dtype=jnp.float64)
+            ring = jnp.array(ring_np)
+            tag = jnp.array(tag_np)
+        else:
+            points = jnp.zeros((0, 3), dtype=jnp.float64)
+            timestamps = jnp.zeros((0,), dtype=jnp.float64)
+            weights = jnp.zeros((0,), dtype=jnp.float64)
+            ring = jnp.zeros((0,), dtype=jnp.uint8)
+            tag = jnp.zeros((0,), dtype=jnp.uint8)
+        n_points = points_np.shape[0]
         n_points_raw = int(n_points)
 
         if n_points == 0:
@@ -1700,6 +1700,8 @@ class GeometricCompositionalBackend(Node):
             points = jnp.zeros((1, 3), dtype=jnp.float64)
             timestamps = jnp.zeros(1, dtype=jnp.float64)
             weights = jnp.zeros(1, dtype=jnp.float64)
+            ring = jnp.zeros(1, dtype=jnp.uint8)
+            tag = jnp.zeros(1, dtype=jnp.uint8)
             n_points = 1
             per_point_offset_min = 0.0
             per_point_offset_max = 0.0
@@ -1710,17 +1712,23 @@ class GeometricCompositionalBackend(Node):
             # The parse function converts it to seconds, so we need to get raw offsets
             field_map = {f.name: (f.offset, f.datatype) for f in msg.fields}
             if "time_offset" in field_map:
-                off, dt = field_map["time_offset"]
-                # Read raw uint32 time_offset values (vectorized for efficiency)
-                # time_offset is at offset 'off' within each point, so we need to stride by point_step
-                # Create a view that reads uint32 from each point's time_offset field
-                offsets_raw = np.array([
-                    struct.unpack_from('<I', msg.data, i * msg.point_step + off)[0]
-                    for i in range(n_points)
-                ], dtype=np.uint32)
-                per_point_offset_min = float(np.min(offsets_raw)) if len(offsets_raw) > 0 else 0.0
-                per_point_offset_max = float(np.max(offsets_raw)) if len(offsets_raw) > 0 else 0.0
-                per_point_offset_units = "ns (uint32, relative to timebase)"
+                off, _dt = field_map["time_offset"]
+                bytes_needed = off + (n_points - 1) * msg.point_step + 4
+                if bytes_needed <= len(msg.data):
+                    offsets_raw = np.ndarray(
+                        shape=(n_points,),
+                        dtype=np.dtype("<u4"),
+                        buffer=msg.data,
+                        offset=off,
+                        strides=(msg.point_step,),
+                    )
+                    per_point_offset_min = float(np.min(offsets_raw)) if offsets_raw.size > 0 else 0.0
+                    per_point_offset_max = float(np.max(offsets_raw)) if offsets_raw.size > 0 else 0.0
+                    per_point_offset_units = "ns (uint32, relative to timebase)"
+                else:
+                    per_point_offset_min = 0.0
+                    per_point_offset_max = 0.0
+                    per_point_offset_units = "ns (time_offset out of bounds)"
             else:
                 per_point_offset_min = 0.0
                 per_point_offset_max = 0.0
