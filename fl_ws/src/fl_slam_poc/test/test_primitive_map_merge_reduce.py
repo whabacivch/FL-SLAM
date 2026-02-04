@@ -31,6 +31,25 @@ def _make_tile(tile_id: int = 0) -> PrimitiveMapTile:
     primitive_ids = jnp.array([0, 1, 2], dtype=jnp.int64)
     valid_mask = jnp.array([True, True, True], dtype=bool)
     colors = jnp.zeros((m_tile, 3), dtype=jnp.float64)
+    cam_mass = jnp.array([1.0, 0.0, 0.0], dtype=jnp.float64)
+    lidar_mass = jnp.array([0.0, 1.0, 1.0], dtype=jnp.float64)
+    rgb_cam_accum = jnp.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+        ],
+        dtype=jnp.float64,
+    )
+    rgb_cam_denom = jnp.array([1.0, 0.0, 0.0], dtype=jnp.float64)
+    rgb = jnp.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.5, 0.5, 0.5],
+            [0.5, 0.5, 0.5],
+        ],
+        dtype=jnp.float64,
+    )
     return PrimitiveMapTile(
         tile_id=tile_id,
         Lambdas=Lambdas,
@@ -44,6 +63,11 @@ def _make_tile(tile_id: int = 0) -> PrimitiveMapTile:
         primitive_ids=primitive_ids,
         valid_mask=valid_mask,
         colors=colors,
+        cam_mass=cam_mass,
+        lidar_mass=lidar_mass,
+        rgb_cam_accum=rgb_cam_accum,
+        rgb_cam_denom=rgb_cam_denom,
+        rgb=rgb,
         next_local_id=3,
         count=3,
     )

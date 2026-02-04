@@ -32,7 +32,7 @@ gc_backend:
     trajectory_export_path: /tmp/gc_slam_trajectory.tum
     status_check_period_sec: 5.0
     init_window_odom_count: 10
-    enable_timing: false
+    enable_timing: true
     enable_parallel_stages: true
     time_alignment_profile: /home/will/Documents/Coding/Phantom Fellowship MIT/Impact_Project_v1/config/time_alignment/kimera_10_14_acl_jackal_005.yaml
     time_alignment_reference_topic: /acl_jackal/lidar_points
@@ -130,3 +130,6 @@ gc_backend:
     visual_feature_kappa_alpha: 10.0
     visual_feature_kappa_max: 100.0
     visual_feature_kappa_min: 0.1
+eval:
+  bag_path: /home/will/Documents/Coding/Phantom Fellowship MIT/Impact_Project_v1/rosbags/Kimera_Data/ros2/10_14_acl_jackal-005
+  gt_file: /home/will/Documents/Coding/Phantom Fellowship MIT/Impact_Project_v1/rosbags/Kimera_Data/ground_truth/1014/acl_jackal_gt.tum

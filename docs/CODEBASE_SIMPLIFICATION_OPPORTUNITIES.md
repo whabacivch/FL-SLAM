@@ -167,3 +167,69 @@ Current codebase already uses `@jax.jit` in: predict, deskew, point_budget, odom
 ---
 
 *Doc generated from GC_SLAM.md-aligned codebase review. Update this file when simplification work is done or priorities change.*
+
+---
+
+## 8. Pipeline Restructure (Hard Cutover, GC_SLAM-aligned)
+
+**Purpose:** If backward compatibility is not required, do a hard cutover to a scan‑driven, single‑path pipeline that is auditable by construction and matches `docs/GC_SLAM.md` (§8 canonical order, §12.10–12.11 scan clock + buffering contract).
+
+**Targets (contract-driven):**
+- Preserve the canonical per‑scan operator order (see `docs/GC_SLAM.md` §8); simplify only orchestration and boundaries.
+- Scan‑clock semantics: one scan triggers exactly one per‑hypothesis pipeline run; faster streams contribute within the scan window but never trigger partial runs (`docs/GC_SLAM.md` §12.10).
+- Deterministic, bounded buffering per stream with fixed budgets, padding + masks (no “unused IMU/odom” aside from declared caps) (`docs/GC_SLAM.md` §12.11, §12.3).
+- JAX‑first numeric phases with explicit host↔device boundaries (one transfer per stream per scan; one diagnostics sync) (`docs/GC_SLAM.md` §12.5).
+- Certificates + ExpectedEffect are first‑class and include scan window bounds, valid counts, and saturation/truncation stats (`docs/GC_SLAM.md` CertBundle `compute.scan_io`).
+
+**Proposed phases (structural refactor; semantics unchanged):**
+1. **Scan snapshot + device batch:** deterministically window IMU/odom/camera buffers around the scan stamp, pad to budgets, build `DeviceBatch`.
+2. **Preprocess + evidence extraction:** point budgeting, predict/diffuse, IMU membership + preintegration, deskew, IMU+odom evidence and `z_lin`, pose evidence backend.
+3. **Fusion + recomposition:** excitation scaling, `FusionScaleFromCertificates`, `InfoFusionAdditive`, Frobenius recompose.
+4. **Uncertainty + map update:** IW sufficient‑stat updates, map update (association + fuse/insert/cull/forget/merge‑reduce), anchor drift.
+5. **Report:** minimal tape + cert aggregation + publish.
+
+**Structural changes:**
+- Introduce a `PipelineContext` holding persistent state (belief, atlas/map, IW states, manifest/config) plus a per‑scan `ScanSnapshot` (windowed stream batches + window stats).
+- Operators remain pure and single‑path: `Op(ctx) -> (ctx', cert, effect)`. Missing data is represented via masks (never “skip IMU factor” branches) (`docs/GC_SLAM.md` §12.11).
+- Any buffer saturation or scan‑window truncation is treated as an ApproxOp: it MUST be logged in certificates and MAY trigger continuous conservatism via IW inflation (never gating) (`docs/GC_SLAM.md` §1.6, §6.6.4–§6.6.5, §12.12).
+
+### 8.1 Scan clock + deterministic buffering (required; replaces shared-(L,h) writers)
+
+The hard‑cutover design should follow `docs/GC_SLAM.md` §12.10–§12.11:
+- **One subscription per stream** writing into a **bounded ring buffer**.
+- **Read buffers only at scan boundaries** (slow stream stamp defines scan clock).
+
+---
+
+## Timing Snapshot (2026-02-04, GPU, 20s bag @ 0.5x)
+
+**Purpose:** Identify dominant per‑scan costs to prioritize simplification/perf work.
+
+**Run notes:**
+- Timing enabled via `enable_timing: true` (minimal tape fields expanded).
+- Bag: `10_14_acl_jackal-005`, first 20s at 0.5x.
+- **Run processed 3 scans then crashed** due to NaN during publish (`ma_hex_cell_3d_from_xyz`); timings below are still useful for profiling.
+
+**Per‑scan timings (ms, n=3):**
+- `t_total_ms`: mean 8173 | p50 2017 | p90 17502 | max 21374
+- `t_map_update_ms`: mean 3379 | p50 1062 | p90 6937 | max 8405
+- `t_map_branch_ms`: mean 2460 | p50 409 | p90 5550 | max 6836
+- `t_visual_pose_ms`: mean 2482 | p50 427 | p90 5586 | max 6875
+- `t_surfel_extraction_ms`: mean 1160 | p50 27.6 | p90 2749 | max 3430
+- `t_association_ms`: mean 155 | p50 198 | p90 253 | max 266
+- `t_point_budget_ms`: mean 351 | p50 370 | p90 417 | max 429
+- `t_imu_preint_scan_ms`: mean 172 | p50 13.5 | p90 395 | max 490
+- `t_imu_preint_int_ms`: mean 12.9 | p50 12.9 | p90 13.3 | max 13.4
+- `t_deskew_ms`: mean 170 | p50 0.67 | p90 407 | max 509
+
+**Interpretation (initial):**
+- Dominant costs are **map update**, **map branch**, **visual pose**, and **surfel extraction**.
+- High p90/max values likely include first‑scan JAX compile overhead; add a warmup or ignore first scan when reporting steady‑state.
+
+**Actionable follow‑ups:**
+- Prioritize items **#3/#6/#7** (reduce host↔device syncs, consolidate kernels) inside the map/visual/surfel hot path.
+- Add a warmup pass and separate compile vs steady‑state timing in future runs.
+- **Deterministic selection** of windowed slices by timestamp (ties resolved deterministically; never by arrival order).
+- **Fixed budgets** via padding + `valid_mask` (e.g., IMU uses `MAX_IMU_PREINT_LEN`; odom has its own cap). The pipeline consumes *all* valid samples in the window in one per‑scan execution (vectorized / masked), so higher‑rate streams contribute proportionally more evidence without extra pipeline runs.
+
+This explicitly prevents the failure mode: “only one IMU/odom message was used.” The *snapshot* is a snapshot of the **windowed batch**, not of a single message.

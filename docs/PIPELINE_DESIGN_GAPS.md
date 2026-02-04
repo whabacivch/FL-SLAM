@@ -11,7 +11,7 @@ Key code anchors (actual behavior):
 - Per-scan evidence assembly: `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/pipeline.py` (time-resolved accel evidence at `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/pipeline.py:713`, planar translation at `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/pipeline.py:633`, planar priors at `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/pipeline.py:859`, odom twist evidence at `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/pipeline.py:884`).
 - Map update planar z fix: `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/operators/map_update.py` (sets `t_hat[2]=0` at `fl_ws/src/fl_slam_poc/fl_slam_poc/backend/operators/map_update.py:104`).
 
-**References (design context, may be stale vs code):** `docs/PIPELINE_TRACE_SINGLE_DOC.md`, `tools/inspect_odom_covariance.py`. Archived dataset audits are in `archive/docs/`.
+**References (design context, may be stale vs code):** `docs/PIPELINE_ORDER_AND_EVIDENCE.md`, `tools/inspect_odom_covariance.py`. Archived dataset audits are in `archive/docs/`.
 
 ---
 

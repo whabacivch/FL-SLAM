@@ -9,17 +9,16 @@ Compares estimated trajectory against ground truth using:
    - Distribution statistics (skewness, kurtosis, IQR, normality tests)
 2. RPE (Relative Pose Error) - Local drift at multiple scales (1m, 5m, 10m)
    - Enhanced with percentiles and distribution statistics
-3. Generates publication-quality plots:
+3. Optionally generates plots with --full-report:
    - Trajectory comparison (4-view)
    - Error heatmap
    - Error over time + histogram
    - Per-axis error breakdown (6 subplots)
    - Cumulative error analysis
    - Pose graph visualization
-4. Exports metrics in multiple formats:
-   - metrics.txt: Human-readable text format
-   - metrics.csv: Spreadsheet-ready with all statistics
-   - metrics.json: Structured JSON for automation/CI integration
+4. Exports metrics:
+   - metrics.json: Structured JSON for automation/CI integration (always)
+   - metrics.txt/csv + plots only when --full-report is set
 
 Uses evo library for standard SLAM metrics, enhanced with comprehensive statistics.
 
@@ -111,113 +110,34 @@ def swap_gt_yz(traj: trajectory.PoseTrajectory3D) -> trajectory.PoseTrajectory3D
     )
 
 
-def load_op_reports(file_path):
-    """Load OpReport JSON lines (strict)."""
-    reports = []
-    with open(file_path, "r", encoding="utf-8") as f:
-        for idx, line in enumerate(f, start=1):
-            line = line.strip()
-            if not line:
-                raise ValueError(f"Empty OpReport line at {idx} (expected JSON object).")
-            try:
-                reports.append(json.loads(line))
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"Invalid OpReport JSON at line {idx}: {exc}") from exc
-    if not reports:
-        raise ValueError(f"No OpReports found in {file_path}.")
-    return reports
+def _load_json_if_exists(path: str | None) -> dict | None:
+    if not path:
+        return None
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"File not found: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-def validate_op_reports(op_report_path, require_imu=True):
-    """Validate OpReports for runtime health and audit compliance."""
-    if not op_report_path or not os.path.exists(op_report_path):
-        raise FileNotFoundError(f"OpReport file not found: {op_report_path}")
-
-    reports = load_op_reports(op_report_path)
-
-    required_reports = [
-        "GaussianPredictSE3",
-        "AnchorCreate",
-        "LoopFactorPublished",
-        "LoopFactorRecomposition",
-    ]
-    if require_imu:
-        required_reports.append("IMUFactorUpdate")
-
-    forbidden_reports = [
-        "PointCloudTransformMissing",
-        "PointCloudExtrinsicInvalid",
-        "PointCloudConversionFailed",
-        "ScanPointsMissing",
-        "LoopFactorUnavailable",
-        "DenseModuleKeepFractionProjection",
-    ]
-
-    warning_reports = [
-        "ICPEvidenceUnavailable",
-        "LoopResponsibilityDomainProjection",
-        "DenseAssociationDomainProjection",
-        "LoopBudgetProjection",
-        "AnchorBudgetProjection",
-    ]
-
-    required_metrics = {
-        "GaussianPredictSE3": ["state_dim", "linearization_point", "process_noise_trace"],
-        "AnchorCreate": ["anchor_id", "dt_sec", "timestamp_weight"],
-        "LoopFactorPublished": ["anchor_id", "weight", "mse", "iterations", "converged", "point_source"],
-        "LoopFactorRecomposition": ["anchor_id", "weight", "innovation_norm"],
-        "IMUFactorUpdate": [
-            "dt_header",
-            "dt_stamps",
-            "dt_gap_start",
-            "dt_gap_end",
-            "bias_rw_cov_adaptive",
-            "bias_rw_cov_trace_gyro",
-            "bias_rw_cov_trace_accel",
-        ],
+def _audit_summary_from_log(path: str | None) -> dict | None:
+    if not path:
+        return None
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Audit log not found: {path}")
+    passed = 0
+    failed = 0
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if "PASSED" in line:
+                passed += 1
+            if "FAILED" in line:
+                failed += 1
+    return {
+        "log_path": path,
+        "passed": passed,
+        "failed": failed,
+        "status": "pass" if failed == 0 else "fail",
     }
-
-    def _require_keys(obj, keys, label):
-        missing = [k for k in keys if k not in obj or obj[k] is None]
-        if missing:
-            raise ValueError(f"Missing {label} keys: {missing}")
-
-    # Base schema validation
-    for report in reports:
-        _require_keys(
-            report,
-            ["name", "exact", "approximation_triggers", "family_in", "family_out",
-             "closed_form", "domain_projection", "metrics", "timestamp"],
-            "op_report",
-        )
-
-    # Required report presence
-    for name in required_reports:
-        if not any(r.get("name") == name for r in reports):
-            raise ValueError(f"Missing required OpReport: {name}")
-
-    # Required metric keys
-    for report in reports:
-        name = report.get("name")
-        if name in required_metrics:
-            metrics = report.get("metrics", {})
-            _require_keys(metrics, required_metrics[name], f"{name}.metrics")
-
-    # Forbidden report detection
-    forbidden_hits = [r for r in reports if r.get("name") in forbidden_reports]
-    if forbidden_hits:
-        names = sorted({r.get("name") for r in forbidden_hits})
-        raise ValueError(f"Forbidden OpReports present: {names}")
-
-    # Warning summary
-    warning_hits = [r for r in reports if r.get("name") in warning_reports]
-    if warning_hits:
-        counts = {}
-        for r in warning_hits:
-            counts[r.get("name")] = counts.get(r.get("name"), 0) + 1
-        print(f"  WARNING: Degraded OpReports detected: {counts}")
-
-    print(f"  OpReport checks passed: {len(reports)} total reports.")
 
 
 def validate_trajectory(traj: trajectory.PoseTrajectory3D, name: str, strict: bool = True):
@@ -1130,7 +1050,17 @@ def save_metrics_csv(ate_trans, ate_rot, rpe_results, per_axis_data, output_path
     print(f"  Metrics (csv) saved: {output_path}")
 
 
-def save_metrics_json(ate_trans, ate_rot, rpe_results, per_axis_data, output_path, eval_diagnostics: dict | None = None, align_mode: str = "initial"):
+def save_metrics_json(
+    ate_trans,
+    ate_rot,
+    rpe_results,
+    per_axis_data,
+    output_path,
+    eval_diagnostics: dict | None = None,
+    align_mode: str = "initial",
+    cert_summary: dict | None = None,
+    audit_summary: dict | None = None,
+):
     """Save all metrics to structured JSON format."""
     from datetime import datetime
 
@@ -1141,6 +1071,8 @@ def save_metrics_json(ate_trans, ate_rot, rpe_results, per_axis_data, output_pat
             'evaluation_tool': 'evaluate_slam.py',
             'align_mode': align_mode,
             'diagnostics': eval_diagnostics or None,
+            'cert_summary': cert_summary or None,
+            'audit_summary': audit_summary or None,
         },
         'ate': {
             'translation': {
@@ -1233,7 +1165,18 @@ def save_metrics_json(ate_trans, ate_rot, rpe_results, per_axis_data, output_pat
     print(f"  Metrics (json) saved: {output_path}")
 
 
-def main(gt_file, est_file, output_dir, op_report_path, require_imu=True, align_mode="initial", gt_swap_yz=False, apply_est_to_gt_axes=False, verbose=False):
+def main(
+    gt_file,
+    est_file,
+    output_dir,
+    cert_summary_path: str | None = None,
+    audit_log_path: str | None = None,
+    align_mode="initial",
+    gt_swap_yz=False,
+    apply_est_to_gt_axes=False,
+    verbose=False,
+    full_report=False,
+):
     """Run full evaluation pipeline.
 
     align_mode: "initial" = align first pose only (GT → estimate frame; valid for relative SLAM).
@@ -1241,6 +1184,7 @@ def main(gt_file, est_file, output_dir, op_report_path, require_imu=True, align_
     gt_swap_yz: if True, swap GT Y and Z axes before evaluation (diagnostic for axis-convention mismatch).
     apply_est_to_gt_axes: if True, transform EST by R_EST_TO_GT so EST is in GT axis convention (same-plane plots).
     verbose: if True, print first 5 rows of positions (TUM: t, x, y, z, qx, qy, qz, qw) to verify column order.
+    full_report: if True, write plots + txt/csv; otherwise write metrics.json only.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1282,12 +1226,11 @@ def main(gt_file, est_file, output_dir, op_report_path, require_imu=True, align_
     # Use non-strict validation for estimated trajectory to allow evaluation even with extreme values
     validate_trajectory(est_traj, "Estimated", strict=False)
 
-    # OpReport validation (IMU + Frobenius diagnostics)
-    print("\n3. Validating OpReports (runtime health + audit)...")
-    validate_op_reports(op_report_path, require_imu=require_imu)
+    cert_summary = _load_json_if_exists(cert_summary_path)
+    audit_summary = _audit_summary_from_log(audit_log_path)
 
     # Compute ATE (translation + rotation)
-    print("\n4. Computing Absolute Trajectory Error (ATE)...")
+    print("\n3. Computing Absolute Trajectory Error (ATE)...")
     print(f"   Alignment: {align_mode} (GT in estimate frame)")
     ate_trans, ate_rot, gt_aligned, est_aligned = compute_ate_full(gt_traj, est_traj, align_mode=align_mode)
     eval_diag = diagnose_constant_rotation_offset(gt_aligned, est_aligned)
@@ -1322,7 +1265,7 @@ def main(gt_file, est_file, output_dir, op_report_path, require_imu=True, align_
         print(f"     note: {eval_diag['note']}")
     
     # Compute per-axis errors
-    print("\n5. Computing per-axis errors...")
+    print("\n4. Computing per-axis errors...")
     per_axis_data = compute_per_axis_errors(gt_traj, est_traj, align_mode=align_mode)
     
     print("   Translation per axis:")
@@ -1336,7 +1279,7 @@ def main(gt_file, est_file, output_dir, op_report_path, require_imu=True, align_
         print(f"     {axis.capitalize()} RMSE: {np.sqrt(np.mean(errors**2)):.4f} deg")
     
     # Compute multi-scale RPE
-    print("\n6. Computing Relative Pose Error (RPE) at multiple scales...")
+    print("\n5. Computing Relative Pose Error (RPE) at multiple scales...")
     rpe_results = compute_rpe_multi_scale(gt_traj, est_traj, align_mode=align_mode)
     
     for scale, rpe_dict in rpe_results.items():
@@ -1346,20 +1289,40 @@ def main(gt_file, est_file, output_dir, op_report_path, require_imu=True, align_
         print(f"     Translation RMSE: {rpe_t_stats['rmse']:.4f} m/{scale}")
         print(f"     Rotation RMSE:    {rpe_r_stats['rmse']:.4f} deg/{scale}")
     
-    # Generate plots
-    print("\n7. Generating plots...")
-    plot_trajectories(gt_aligned, est_aligned, output_dir / "trajectory_comparison.png")
-    plot_trajectory_heatmap(gt_aligned, est_aligned, ate_trans, output_dir / "trajectory_heatmap.png")
-    plot_error_over_time(ate_trans, est_aligned.timestamps, output_dir / "error_analysis.png")
-    plot_per_axis_errors(per_axis_data, output_dir / "error_per_axis.png")
-    plot_cumulative_error(ate_trans, est_aligned.timestamps, output_dir / "cumulative_error.png")
-    plot_pose_graph(est_aligned, output_dir / "pose_graph.png")
+    # Generate plots (optional)
+    if full_report:
+        print("\n6. Generating plots...")
+        plot_trajectories(gt_aligned, est_aligned, output_dir / "trajectory_comparison.png")
+        plot_trajectory_heatmap(gt_aligned, est_aligned, ate_trans, output_dir / "trajectory_heatmap.png")
+        plot_error_over_time(ate_trans, est_aligned.timestamps, output_dir / "error_analysis.png")
+        plot_per_axis_errors(per_axis_data, output_dir / "error_per_axis.png")
+        plot_cumulative_error(ate_trans, est_aligned.timestamps, output_dir / "cumulative_error.png")
+        plot_pose_graph(est_aligned, output_dir / "pose_graph.png")
     
     # Save metrics
-    print("\n8. Saving metrics...")
-    save_metrics_txt(ate_trans, ate_rot, rpe_results, per_axis_data, output_dir / "metrics.txt", eval_diagnostics=eval_diag, align_mode=align_mode)
-    save_metrics_csv(ate_trans, ate_rot, rpe_results, per_axis_data, output_dir / "metrics.csv")
-    save_metrics_json(ate_trans, ate_rot, rpe_results, per_axis_data, output_dir / "metrics.json", eval_diagnostics=eval_diag, align_mode=align_mode)
+    print("\n7. Saving metrics...")
+    save_metrics_json(
+        ate_trans,
+        ate_rot,
+        rpe_results,
+        per_axis_data,
+        output_dir / "metrics.json",
+        eval_diagnostics=eval_diag,
+        align_mode=align_mode,
+        cert_summary=cert_summary,
+        audit_summary=audit_summary,
+    )
+    if full_report:
+        save_metrics_txt(
+            ate_trans,
+            ate_rot,
+            rpe_results,
+            per_axis_data,
+            output_dir / "metrics.txt",
+            eval_diagnostics=eval_diag,
+            align_mode=align_mode,
+        )
+        save_metrics_csv(ate_trans, ate_rot, rpe_results, per_axis_data, output_dir / "metrics.csv")
     
     print("\n" + "=" * 60)
     print("Evaluation complete!")
@@ -1384,10 +1347,13 @@ def main(gt_file, est_file, output_dir, op_report_path, require_imu=True, align_
         print(f"    {axis.capitalize()}: {np.sqrt(np.mean(errors**2)):.4f} deg")
     
     print(f"\nResults saved to: {output_dir}")
-    print(f"  - metrics.txt, metrics.csv, metrics.json (comprehensive statistics)")
-    print(f"  - trajectory_comparison.png, trajectory_heatmap.png")
-    print(f"  - error_analysis.png, error_per_axis.png, cumulative_error.png")
-    print(f"  - pose_graph.png")
+    if full_report:
+        print("  - metrics.txt, metrics.csv, metrics.json (comprehensive statistics)")
+        print("  - trajectory_comparison.png, trajectory_heatmap.png")
+        print("  - error_analysis.png, error_per_axis.png, cumulative_error.png")
+        print("  - pose_graph.png")
+    else:
+        print("  - metrics.json")
 
 
 if __name__ == "__main__":
@@ -1395,8 +1361,9 @@ if __name__ == "__main__":
     ap.add_argument("ground_truth", help="Aligned ground truth TUM file (time-aligned)")
     ap.add_argument("estimated", help="Estimated TUM file")
     ap.add_argument("output_dir", help="Output directory")
-    ap.add_argument("op_report", help="OpReport JSONL file")
-    ap.add_argument("--no-imu", action="store_true", help="Disable IMU OpReport requirements")
+    ap.add_argument("--cert-summary", default="", help="Cert summary JSON path (optional)")
+    ap.add_argument("--audit-log", default="", help="Audit invariants log path (optional)")
+    ap.add_argument("--full-report", action="store_true", help="Generate plots and txt/csv outputs")
     ap.add_argument(
         "--align",
         choices=("initial", "umeyama"),
@@ -1425,12 +1392,13 @@ if __name__ == "__main__":
             args.ground_truth,
             args.estimated,
             args.output_dir,
-            args.op_report,
-            require_imu=not args.no_imu,
+            args.cert_summary,
+            args.audit_log,
             align_mode=args.align,
             gt_swap_yz=args.gt_swap_yz,
             apply_est_to_gt_axes=args.apply_est_to_gt_convention,
             verbose=args.verbose,
+            full_report=args.full_report,
         )
     except KeyboardInterrupt:
         print("\n\nEvaluation interrupted by user.")

@@ -115,7 +115,12 @@ class PrimitiveMapTile:
         created_timestamps: (M_TILE,) creation times
         primitive_ids: (M_TILE,) stable unique IDs
         valid_mask: (M_TILE,) bool mask for valid entries
-        colors: (M_TILE, 3) RGB colors
+        colors: (M_TILE, 3) RGB colors (canonical; camera-dominant)
+        cam_mass: (M_TILE,) cumulative camera responsibility mass
+        lidar_mass: (M_TILE,) cumulative LiDAR responsibility mass
+        rgb_cam_accum: (M_TILE, 3) camera color numerator accumulator
+        rgb_cam_denom: (M_TILE,) camera color denominator accumulator
+        rgb: (M_TILE, 3) canonical per-primitive color (camera-dominant)
         next_local_id: Next available slot index (local to tile)
         count: Number of valid primitives in this tile
     """
@@ -131,6 +136,11 @@ class PrimitiveMapTile:
     primitive_ids: jnp.ndarray  # (M_TILE,) int64
     valid_mask: jnp.ndarray   # (M_TILE,) bool
     colors: jnp.ndarray       # (M_TILE, 3)
+    cam_mass: jnp.ndarray     # (M_TILE,)
+    lidar_mass: jnp.ndarray   # (M_TILE,)
+    rgb_cam_accum: jnp.ndarray  # (M_TILE, 3)
+    rgb_cam_denom: jnp.ndarray  # (M_TILE,)
+    rgb: jnp.ndarray          # (M_TILE, 3)
     next_local_id: int        # Next available slot in this tile
     count: int                # Number of valid primitives in this tile
 
@@ -140,6 +150,7 @@ def create_empty_tile(
     m_tile: int = constants.GC_PRIMITIVE_MAP_MAX_SIZE,
 ) -> PrimitiveMapTile:
     """Create empty tile with fixed-size arrays."""
+    gray = jnp.array([0.5, 0.5, 0.5], dtype=jnp.float64)
     return PrimitiveMapTile(
         tile_id=tile_id,
         Lambdas=jnp.zeros((m_tile, 3, 3), dtype=jnp.float64),
@@ -153,6 +164,11 @@ def create_empty_tile(
         primitive_ids=jnp.zeros((m_tile,), dtype=jnp.int64),
         valid_mask=jnp.zeros((m_tile,), dtype=bool),
         colors=jnp.zeros((m_tile, 3), dtype=jnp.float64),
+        cam_mass=jnp.zeros((m_tile,), dtype=jnp.float64),
+        lidar_mass=jnp.zeros((m_tile,), dtype=jnp.float64),
+        rgb_cam_accum=jnp.zeros((m_tile, 3), dtype=jnp.float64),
+        rgb_cam_denom=jnp.zeros((m_tile,), dtype=jnp.float64),
+        rgb=jnp.broadcast_to(gray, (m_tile, 3)).astype(jnp.float64),
         next_local_id=0,
         count=0,
     )
@@ -389,7 +405,7 @@ def extract_atlas_map_view(
         weights_list.append(tile.weights[slots])
         prim_ids_list.append(tile.primitive_ids[slots])
         last_supported_list.append(tile.last_supported_scan_seq[slots])
-        colors_list.append(tile.colors[slots])
+        colors_list.append(tile.rgb[slots])
 
     Lambdas = jnp.concatenate(Lambdas_list, axis=0)
     thetas = jnp.concatenate(thetas_list, axis=0)
@@ -534,7 +550,7 @@ def extract_primitive_map_view(
     etas = tile.etas[slot_indices]
     weights = tile.weights[slot_indices]
     primitive_ids = tile.primitive_ids[slot_indices]
-    colors = tile.colors[slot_indices]
+    colors = tile.rgb[slot_indices]
     valid_mask = jnp.ones(len(slot_indices), dtype=bool)
 
     eps_lift_j = jnp.asarray(eps_lift, dtype=jnp.float64)
@@ -642,6 +658,7 @@ def primitive_map_insert(
     timestamp: float,
     scan_seq: int = 0,
     colors_new: Optional[jnp.ndarray] = None,  # (M, 3)
+    sources_new: Optional[jnp.ndarray] = None,  # (M,) 0=camera, 1=lidar
     chart_id: str = constants.GC_CHART_ID,
     anchor_id: str = "primitive_map",
 ) -> Tuple[PrimitiveMapInsertResult, CertBundle, ExpectedEffect]:
@@ -715,10 +732,32 @@ def primitive_map_insert(
     primitive_ids = tile.primitive_ids.at[empty_indices].set(new_ids)
     valid_mask = tile.valid_mask.at[empty_indices].set(True)
 
+    gray = jnp.array([0.5, 0.5, 0.5], dtype=jnp.float64)
     if colors_new is not None:
-        colors = tile.colors.at[empty_indices].set(colors_new[:n_to_insert])
+        colors_new = jnp.asarray(colors_new, dtype=jnp.float64)
     else:
-        colors = tile.colors
+        colors_new = jnp.zeros((n_to_insert, 3), dtype=jnp.float64)
+    if sources_new is not None:
+        sources_new = jnp.asarray(sources_new, dtype=jnp.int32).reshape(-1)
+        is_cam = (sources_new[:n_to_insert] == 0).astype(jnp.float64)
+        is_lidar = (sources_new[:n_to_insert] == 1).astype(jnp.float64)
+    else:
+        is_cam = jnp.zeros((n_to_insert,), dtype=jnp.float64)
+        is_lidar = jnp.ones((n_to_insert,), dtype=jnp.float64)
+
+    cam_mass_new = weights_new[:n_to_insert] * is_cam
+    lidar_mass_new = weights_new[:n_to_insert] * is_lidar
+    rgb_cam_accum_new = colors_new[:n_to_insert] * cam_mass_new[:, None]
+    rgb_cam_denom_new = cam_mass_new
+    has_cam = cam_mass_new > 0.0
+    rgb_new = jnp.where(has_cam[:, None], jnp.clip(colors_new[:n_to_insert], 0.0, 1.0), gray)
+
+    colors = tile.colors.at[empty_indices].set(rgb_new)
+    cam_mass = tile.cam_mass.at[empty_indices].set(cam_mass_new)
+    lidar_mass = tile.lidar_mass.at[empty_indices].set(lidar_mass_new)
+    rgb_cam_accum = tile.rgb_cam_accum.at[empty_indices].set(rgb_cam_accum_new)
+    rgb_cam_denom = tile.rgb_cam_denom.at[empty_indices].set(rgb_cam_denom_new)
+    rgb = tile.rgb.at[empty_indices].set(rgb_new)
 
     new_tile = PrimitiveMapTile(
         tile_id=tile.tile_id,
@@ -733,6 +772,11 @@ def primitive_map_insert(
         primitive_ids=primitive_ids,
         valid_mask=valid_mask,
         colors=colors,
+        cam_mass=cam_mass,
+        lidar_mass=lidar_mass,
+        rgb_cam_accum=rgb_cam_accum,
+        rgb_cam_denom=rgb_cam_denom,
+        rgb=rgb,
         next_local_id=max(int(tile.next_local_id), int(jnp.max(empty_indices)) + 1),
         count=tile.count + n_to_insert,
     )
@@ -772,6 +816,7 @@ def primitive_map_insert_masked(
     scan_seq: int = 0,
     recency_decay_lambda: float = constants.GC_RECENCY_DECAY_LAMBDA,
     colors_new: Optional[jnp.ndarray] = None,  # (K, 3)
+    sources_new: Optional[jnp.ndarray] = None,  # (K,) 0=camera, 1=lidar
     chart_id: str = constants.GC_CHART_ID,
     anchor_id: str = "primitive_map_insert_masked",
 ) -> Tuple[PrimitiveMapInsertResult, CertBundle, ExpectedEffect]:
@@ -822,6 +867,11 @@ def primitive_map_insert_masked(
     weights_prev = tile.weights[target_slots]
     prim_ids_prev = tile.primitive_ids[target_slots]
     colors_prev = tile.colors[target_slots]
+    cam_mass_prev = tile.cam_mass[target_slots]
+    lidar_mass_prev = tile.lidar_mass[target_slots]
+    rgb_cam_accum_prev = tile.rgb_cam_accum[target_slots]
+    rgb_cam_denom_prev = tile.rgb_cam_denom[target_slots]
+    rgb_prev = tile.rgb[target_slots]
     valid_prev = tile.valid_mask[target_slots]
 
     Lambdas_set = jnp.where(do_insert[:, None, None], Lambdas_new, Lambdas_prev)
@@ -831,11 +881,32 @@ def primitive_map_insert_masked(
     prim_ids_set = jnp.where(do_insert, new_ids_full, prim_ids_prev)
     valid_set = valid_prev | do_insert
 
+    gray = jnp.array([0.5, 0.5, 0.5], dtype=jnp.float64)
     if colors_new is not None:
         colors_new = jnp.asarray(colors_new, dtype=jnp.float64)
-        colors_set = jnp.where(do_insert[:, None], colors_new, colors_prev)
     else:
-        colors_set = colors_prev
+        colors_new = jnp.zeros((K, 3), dtype=jnp.float64)
+    if sources_new is not None:
+        sources_new = jnp.asarray(sources_new, dtype=jnp.int32).reshape(-1)
+        is_cam = (sources_new == 0).astype(jnp.float64)
+        is_lidar = (sources_new == 1).astype(jnp.float64)
+    else:
+        is_cam = jnp.zeros((K,), dtype=jnp.float64)
+        is_lidar = jnp.ones((K,), dtype=jnp.float64)
+
+    cam_mass_new = weights_new * is_cam
+    lidar_mass_new = weights_new * is_lidar
+    rgb_cam_accum_new = colors_new * cam_mass_new[:, None]
+    rgb_cam_denom_new = cam_mass_new
+    has_cam_new = cam_mass_new > 0.0
+    rgb_new = jnp.where(has_cam_new[:, None], jnp.clip(colors_new, 0.0, 1.0), gray)
+
+    colors_set = jnp.where(do_insert[:, None], rgb_new, colors_prev)
+    cam_mass_set = jnp.where(do_insert, cam_mass_new, cam_mass_prev)
+    lidar_mass_set = jnp.where(do_insert, lidar_mass_new, lidar_mass_prev)
+    rgb_cam_accum_set = jnp.where(do_insert[:, None], rgb_cam_accum_new, rgb_cam_accum_prev)
+    rgb_cam_denom_set = jnp.where(do_insert, rgb_cam_denom_new, rgb_cam_denom_prev)
+    rgb_set = jnp.where(do_insert[:, None], rgb_new, rgb_prev)
 
     Lambdas = tile.Lambdas.at[target_slots].set(Lambdas_set)
     thetas = tile.thetas.at[target_slots].set(thetas_set)
@@ -856,6 +927,11 @@ def primitive_map_insert_masked(
     primitive_ids = tile.primitive_ids.at[target_slots].set(prim_ids_set)
     valid_mask = tile.valid_mask.at[target_slots].set(valid_set)
     colors = tile.colors.at[target_slots].set(colors_set)
+    cam_mass = tile.cam_mass.at[target_slots].set(cam_mass_set)
+    lidar_mass = tile.lidar_mass.at[target_slots].set(lidar_mass_set)
+    rgb_cam_accum = tile.rgb_cam_accum.at[target_slots].set(rgb_cam_accum_set)
+    rgb_cam_denom = tile.rgb_cam_denom.at[target_slots].set(rgb_cam_denom_set)
+    rgb = tile.rgb.at[target_slots].set(rgb_set)
 
     new_tile = PrimitiveMapTile(
         tile_id=tile.tile_id,
@@ -870,6 +946,11 @@ def primitive_map_insert_masked(
         primitive_ids=primitive_ids,
         valid_mask=valid_mask,
         colors=colors,
+        cam_mass=cam_mass,
+        lidar_mass=lidar_mass,
+        rgb_cam_accum=rgb_cam_accum,
+        rgb_cam_denom=rgb_cam_denom,
+        rgb=rgb,
         next_local_id=int(tile.next_local_id),
         count=int(jnp.sum(valid_mask.astype(jnp.int32))),
     )
@@ -921,6 +1002,7 @@ def primitive_map_fuse(
     scan_seq: int = 0,
     valid_mask: Optional[jnp.ndarray] = None,  # (K,) bool; when provided, zero out invalid before segment_sum
     colors_meas: Optional[jnp.ndarray] = None,  # (K, 3) measurement RGB; when provided, weighted blend per target
+    sources_meas: Optional[jnp.ndarray] = None,  # (K,) 0=camera, 1=lidar
     eps_psd: float = constants.GC_EPS_PSD,
     eps_mass: float = constants.GC_EPS_MASS,
     fuse_chunk_size: int = constants.GC_FUSE_CHUNK_SIZE,
@@ -960,6 +1042,10 @@ def primitive_map_fuse(
     d_weights = jnp.zeros((map_size,), dtype=jnp.float64)
     d_color_sum = jnp.zeros((map_size, 3), dtype=jnp.float64)
     d_resp_sum = jnp.zeros((map_size,), dtype=jnp.float64)
+    d_cam_mass = jnp.zeros((map_size,), dtype=jnp.float64)
+    d_lidar_mass = jnp.zeros((map_size,), dtype=jnp.float64)
+    d_rgb_cam_accum = jnp.zeros((map_size, 3), dtype=jnp.float64)
+    d_rgb_cam_denom = jnp.zeros((map_size,), dtype=jnp.float64)
 
     chunk = int(max(1, fuse_chunk_size))
     num_chunks = (K + chunk - 1) // chunk
@@ -995,15 +1081,28 @@ def primitive_map_fuse(
         if colors_meas is not None and colors_meas.shape[0] >= end:
             colors_c = jnp.clip(colors_meas[start:end], 0.0, 1.0)
             d_color_sum = d_color_sum.at[idx].add(colors_c * r_vec)
+        if sources_meas is not None and sources_meas.shape[0] >= end:
+            sources_c = jnp.asarray(sources_meas[start:end], dtype=jnp.int32)
+            is_cam = (sources_c == 0).astype(jnp.float64)
+            is_lidar = (sources_c == 1).astype(jnp.float64)
+            w_cam = resp_vec * w_meas * is_cam
+            w_lidar = resp_vec * w_meas * is_lidar
+            d_cam_mass = d_cam_mass.at[idx].add(w_cam)
+            d_lidar_mass = d_lidar_mass.at[idx].add(w_lidar)
+            if colors_meas is not None and colors_meas.shape[0] >= end:
+                colors_c = jnp.clip(colors_meas[start:end], 0.0, 1.0)
+                d_rgb_cam_accum = d_rgb_cam_accum.at[idx].add(colors_c * w_cam[:, None])
+                d_rgb_cam_denom = d_rgb_cam_denom.at[idx].add(w_cam)
 
-    # Color: responsibility-weighted mean per target (only when colors_meas provided)
-    if colors_meas is not None and colors_meas.shape[0] >= K:
-        sum_r_safe = jnp.maximum(d_resp_sum[:, None], eps_mass)
-        color_agg = jnp.clip(d_color_sum / sum_r_safe, 0.0, 1.0)
-        updated = d_resp_sum > 0.0
-        colors = jnp.where(updated[:, None], color_agg, tile.colors)
-    else:
-        colors = tile.colors
+    gray = jnp.array([0.5, 0.5, 0.5], dtype=jnp.float64)
+    cam_mass = tile.cam_mass + d_cam_mass
+    lidar_mass = tile.lidar_mass + d_lidar_mass
+    rgb_cam_accum = tile.rgb_cam_accum + d_rgb_cam_accum
+    rgb_cam_denom = tile.rgb_cam_denom + d_rgb_cam_denom
+    rgb_cam_est = jnp.clip(rgb_cam_accum / jnp.maximum(rgb_cam_denom[:, None], eps_mass), 0.0, 1.0)
+    has_cam = cam_mass > 0.0
+    rgb = jnp.where(has_cam[:, None], rgb_cam_est, gray)
+    colors = rgb
 
     # Update map (single add per field)
     Lambdas = tile.Lambdas + d_Lambdas
@@ -1036,6 +1135,11 @@ def primitive_map_fuse(
         primitive_ids=tile.primitive_ids,
         valid_mask=tile.valid_mask,
         colors=colors,
+        cam_mass=cam_mass,
+        lidar_mass=lidar_mass,
+        rgb_cam_accum=rgb_cam_accum,
+        rgb_cam_denom=rgb_cam_denom,
+        rgb=rgb,
         next_local_id=tile.next_local_id,
         count=tile.count,
     )
@@ -1159,6 +1263,11 @@ def primitive_map_cull(
         primitive_ids=tile.primitive_ids,
         valid_mask=valid_mask,
         colors=tile.colors,
+        cam_mass=tile.cam_mass,
+        lidar_mass=tile.lidar_mass,
+        rgb_cam_accum=tile.rgb_cam_accum,
+        rgb_cam_denom=tile.rgb_cam_denom,
+        rgb=tile.rgb,
         next_local_id=tile.next_local_id,
         count=new_count,
     )
@@ -1248,6 +1357,11 @@ def primitive_map_forget(
         primitive_ids=tile.primitive_ids,
         valid_mask=tile.valid_mask,
         colors=tile.colors,
+        cam_mass=tile.cam_mass,
+        lidar_mass=tile.lidar_mass,
+        rgb_cam_accum=tile.rgb_cam_accum,
+        rgb_cam_denom=tile.rgb_cam_denom,
+        rgb=tile.rgb,
         next_local_id=tile.next_local_id,
         count=tile.count,
     )
@@ -1333,6 +1447,11 @@ def primitive_map_recency_inflate(
             primitive_ids=tile.primitive_ids,
             valid_mask=tile.valid_mask,
             colors=tile.colors,
+            cam_mass=tile.cam_mass,
+            lidar_mass=tile.lidar_mass,
+            rgb_cam_accum=tile.rgb_cam_accum,
+            rgb_cam_denom=tile.rgb_cam_denom,
+            rgb=tile.rgb,
             next_local_id=tile.next_local_id,
             count=tile.count,
         )
@@ -1390,6 +1509,11 @@ def _merge_reduce_jax(
     etas: jnp.ndarray,
     weights: jnp.ndarray,
     colors: jnp.ndarray,
+    cam_mass: jnp.ndarray,
+    lidar_mass: jnp.ndarray,
+    rgb_cam_accum: jnp.ndarray,
+    rgb_cam_denom: jnp.ndarray,
+    rgb: jnp.ndarray,
     valid: jnp.ndarray,
     timestamps: jnp.ndarray,
     created_timestamps: jnp.ndarray,
@@ -1399,6 +1523,10 @@ def _merge_reduce_jax(
     max_pairs: int,
     eps_psd: float,
 ) -> Tuple[
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
     jnp.ndarray,
     jnp.ndarray,
     jnp.ndarray,
@@ -1461,6 +1589,11 @@ def _merge_reduce_jax(
     etas_new = etas
     weights_new = weights
     colors_new = colors
+    cam_mass_new = cam_mass
+    lidar_mass_new = lidar_mass
+    rgb_cam_accum_new = rgb_cam_accum
+    rgb_cam_denom_new = rgb_cam_denom
+    rgb_new = rgb
     valid_new = valid
     timestamps_new = timestamps
     created_timestamps_new = created_timestamps
@@ -1474,6 +1607,11 @@ def _merge_reduce_jax(
             etas_s,
             weights_s,
             colors_s,
+            cam_mass_s,
+            lidar_mass_s,
+            rgb_cam_accum_s,
+            rgb_cam_denom_s,
+            rgb_s,
             valid_s,
             timestamps_s,
             created_timestamps_s,
@@ -1488,6 +1626,11 @@ def _merge_reduce_jax(
                 etas_m,
                 weights_m,
                 colors_m,
+                cam_mass_m,
+                lidar_mass_m,
+                rgb_cam_accum_m,
+                rgb_cam_denom_m,
+                rgb_m,
                 valid_m,
                 timestamps_m,
                 created_timestamps_m,
@@ -1507,6 +1650,11 @@ def _merge_reduce_jax(
                     etas_a,
                     weights_a,
                     colors_a,
+                    cam_mass_a,
+                    lidar_mass_a,
+                    rgb_cam_accum_a,
+                    rgb_cam_denom_a,
+                    rgb_a,
                     valid_a,
                     timestamps_a,
                     created_timestamps_a,
@@ -1526,13 +1674,24 @@ def _merge_reduce_jax(
                 theta_m = Lambda_m @ mu_m
 
                 eta_m = (w1 * etas_a[i] + w2 * etas_a[j]) / wsum
-                color_m = (w1 * colors_a[i] + w2 * colors_a[j]) / wsum
+                cam_mass_m = cam_mass_a[i] + cam_mass_a[j]
+                lidar_mass_m = lidar_mass_a[i] + lidar_mass_a[j]
+                rgb_cam_accum_m = rgb_cam_accum_a[i] + rgb_cam_accum_a[j]
+                rgb_cam_denom_m = rgb_cam_denom_a[i] + rgb_cam_denom_a[j]
+                gray = jnp.array([0.5, 0.5, 0.5], dtype=jnp.float64)
+                rgb_cam_est = jnp.clip(rgb_cam_accum_m / jnp.maximum(rgb_cam_denom_m, eps_psd_f), 0.0, 1.0)
+                rgb_m = jnp.where(cam_mass_m > 0.0, rgb_cam_est, gray)
 
                 Lambdas_a = Lambdas_a.at[i].set(Lambda_m)
                 thetas_a = thetas_a.at[i].set(theta_m)
                 etas_a = etas_a.at[i].set(eta_m)
                 weights_a = weights_a.at[i].set(wsum)
-                colors_a = colors_a.at[i].set(color_m)
+                colors_a = colors_a.at[i].set(rgb_m)
+                cam_mass_a = cam_mass_a.at[i].set(cam_mass_m)
+                lidar_mass_a = lidar_mass_a.at[i].set(lidar_mass_m)
+                rgb_cam_accum_a = rgb_cam_accum_a.at[i].set(rgb_cam_accum_m)
+                rgb_cam_denom_a = rgb_cam_denom_a.at[i].set(rgb_cam_denom_m)
+                rgb_a = rgb_a.at[i].set(rgb_m)
                 timestamps_a = timestamps_a.at[i].set(jnp.maximum(timestamps_a[i], timestamps_a[j]))
                 created_timestamps_a = created_timestamps_a.at[i].set(
                     jnp.minimum(created_timestamps_a[i], created_timestamps_a[j])
@@ -1552,6 +1711,11 @@ def _merge_reduce_jax(
                     etas_a,
                     weights_a,
                     colors_a,
+                    cam_mass_a,
+                    lidar_mass_a,
+                    rgb_cam_accum_a,
+                    rgb_cam_denom_a,
+                    rgb_a,
                     valid_a,
                     timestamps_a,
                     created_timestamps_a,
@@ -1571,6 +1735,11 @@ def _merge_reduce_jax(
                 etas_s,
                 weights_s,
                 colors_s,
+                cam_mass_s,
+                lidar_mass_s,
+                rgb_cam_accum_s,
+                rgb_cam_denom_s,
+                rgb_s,
                 valid_s,
                 timestamps_s,
                 created_timestamps_s,
@@ -1585,6 +1754,11 @@ def _merge_reduce_jax(
         etas_new,
         weights_new,
         colors_new,
+        cam_mass_new,
+        lidar_mass_new,
+        rgb_cam_accum_new,
+        rgb_cam_denom_new,
+        rgb_new,
         valid_new,
         timestamps_new,
         created_timestamps_new,
@@ -1600,6 +1774,11 @@ def _merge_reduce_jax(
             etas_new,
             weights_new,
             colors_new,
+            cam_mass_new,
+            lidar_mass_new,
+            rgb_cam_accum_new,
+            rgb_cam_denom_new,
+            rgb_new,
             valid_new,
             timestamps_new,
             created_timestamps_new,
@@ -1614,6 +1793,11 @@ def _merge_reduce_jax(
         etas_new,
         weights_new,
         colors_new,
+        cam_mass_new,
+        lidar_mass_new,
+        rgb_cam_accum_new,
+        rgb_cam_denom_new,
+        rgb_new,
         valid_new,
         timestamps_new,
         created_timestamps_new,
@@ -1709,6 +1893,11 @@ def primitive_map_merge_reduce(
     thetas = jnp.asarray(tile.thetas, dtype=jnp.float64)
     etas = jnp.asarray(tile.etas, dtype=jnp.float64)
     colors = jnp.asarray(tile.colors, dtype=jnp.float64)
+    cam_mass = jnp.asarray(tile.cam_mass, dtype=jnp.float64)
+    lidar_mass = jnp.asarray(tile.lidar_mass, dtype=jnp.float64)
+    rgb_cam_accum = jnp.asarray(tile.rgb_cam_accum, dtype=jnp.float64)
+    rgb_cam_denom = jnp.asarray(tile.rgb_cam_denom, dtype=jnp.float64)
+    rgb = jnp.asarray(tile.rgb, dtype=jnp.float64)
     primitive_ids = jnp.asarray(tile.primitive_ids, dtype=jnp.int64)
     timestamps = jnp.asarray(tile.timestamps, dtype=jnp.float64)
     created_timestamps = jnp.asarray(tile.created_timestamps, dtype=jnp.float64)
@@ -1748,6 +1937,11 @@ def primitive_map_merge_reduce(
         etas_new,
         weights_new,
         colors_new,
+        cam_mass_new,
+        lidar_mass_new,
+        rgb_cam_accum_new,
+        rgb_cam_denom_new,
+        rgb_new,
         valid_new,
         timestamps_new,
         created_timestamps_new,
@@ -1765,6 +1959,11 @@ def primitive_map_merge_reduce(
         etas=etas,
         weights=weights,
         colors=colors,
+        cam_mass=cam_mass,
+        lidar_mass=lidar_mass,
+        rgb_cam_accum=rgb_cam_accum,
+        rgb_cam_denom=rgb_cam_denom,
+        rgb=rgb,
         valid=valid,
         timestamps=timestamps,
         created_timestamps=created_timestamps,
@@ -1791,6 +1990,11 @@ def primitive_map_merge_reduce(
         primitive_ids=primitive_ids,
         valid_mask=valid_new,
         colors=colors_new,
+        cam_mass=cam_mass_new,
+        lidar_mass=lidar_mass_new,
+        rgb_cam_accum=rgb_cam_accum_new,
+        rgb_cam_denom=rgb_cam_denom_new,
+        rgb=rgb_new,
         next_local_id=tile.next_local_id,
         count=int(jnp.sum(valid_new.astype(jnp.int32))),
     )

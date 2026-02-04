@@ -4,6 +4,20 @@ Project: Frobenius-Legendre SLAM POC (Impact Project_v1)
 
 This file tracks all significant changes, design decisions, and implementation milestones for the FL-SLAM project.
 
+## 2026-02-04: Map structure, build, visualization, and issues doc
+
+- **Created:** `docs/MAP_STRUCTURE_BUILD_AND_ISSUES.md` — in-depth explanation of current map architecture (atlas, tiles, MA-Hex, no overlap, active vs stencil), how the map is built per scan (measurement batch camera+LiDAR, association, fuse, insert, cull, forget, merge), how it is visualized (live PointCloud2/Rerun, post-run splat export + build_rerun_from_splat, blueprint tabs), and known issues (camera color vs LiDAR grayscale, visual feature cap, sparse/black view, map not “continuously filling,” fixed-cost rationale vs hex+prune alternative). Complements `docs/MAP_AND_VISUALIZATION.md` and GC_SLAM §5.7.
+
+## 2026-02-04: Concurrent pipeline design note (Option A)
+
+- **docs/CODEBASE_SIMPLIFICATION_OPPORTUNITIES.md:** Added §8.1 documenting the concurrent design choice: shared (L, h) with block-wise writers (IMU, odom, scan) at different update rates; one fusion/solve thread synced to the slowest sensor (scan rate); global solve z = L⁻¹h at scan rate; map update and publish read z from shared state. Invariants and sync (per-block or lock-free accumulation, double-buffer snapshot) noted.
+
+## 2026-02-04: Pipeline doc consolidation and README doc refs
+
+- **Pipeline depth contract:** Content from `docs/PIPELINE_DEPTH_CONTRACT.md` was already described in CHANGELOG as merged into `PIPELINE_ORDER_AND_EVIDENCE.md`; the standalone file was still present. Depth contract section in `docs/PIPELINE_ORDER_AND_EVIDENCE.md` expanded with full contract bullets and code alignment; `docs/PIPELINE_DEPTH_CONTRACT.md` removed.
+- **README:** "Docs to Start With" and Documentation table updated to point to existing docs: `PIPELINE_ORDER_AND_EVIDENCE.md`, `SYSTEM_DATAFLOW_DIAGRAM.md`. Removed references to missing docs (`IMU_BELIEF_MAP_AND_FUSION.md`, `PIPELINE_TRACE_SINGLE_DOC.md`, `PREINTEGRATION_STEP_BY_STEP.md`, `EVALUATION.md`, `TESTING.md`).
+- **PIPELINE_DESIGN_GAPS:** Reference to `PIPELINE_TRACE_SINGLE_DOC.md` changed to `PIPELINE_ORDER_AND_EVIDENCE.md`.
+
 ## 2026-02-04: Kimera documentation consolidated into single doc
 
 - **Created:** `docs/KIMERA_DATASET_AND_PIPELINE.md` as single source of truth for the Kimera dataset: hardware (summary table + Velodyne VLP-16, IMU D435i, Jackal odom, camera D435i), bag/topics, frames, calibration, PointCloud2 layout (VLP-16), inspection, message schemas, and config.
@@ -3376,6 +3390,11 @@ Status monitoring: Will report DEAD_RECKONING if no loop factors
 ### Visualization
 - Explicitly spawn Rerun viewer with welcome screen hidden and ensured connection to the current recording.
 ## 2026-02-04
+### GC v2 Map Color + Rerun Fix
+- Added camera-dominant color provenance to primitive map state (cam/lidar mass and camera RGB accumulators) and routed map colors from canonical RGB.
+- Threaded measurement sources into map insert/fuse and extended splat export with RGB provenance fields.
+- Updated rerun builder to prefer exported RGB, enforce strictly monotonic trajectory time, add robot-base POV, and make vMF shading opt-in.
+- Added map-level color provenance tests.
 ### Cleanup / Simplification (GC v2)
 - Removed legacy diagnostics paths; retained minimal tape only and tape-only NPZ/JSONL I/O.
 - Removed deprecated `save_full_diagnostics` config param and associated warning logic.
@@ -3386,3 +3405,7 @@ Status monitoring: Will report DEAD_RECKONING if no loop factors
 - Implemented JAX-only merge-reduce (pair selection + merge application) to eliminate Python loops in `primitive_map_merge_reduce`.
 - Removed unused NumPy helpers from `ma_hex_web`; JAX-only hot path remains.
 - Added merge-reduce unit test and refreshed simplification tracking doc.
+- Updated `docs/CODEBASE_SIMPLIFICATION_OPPORTUNITIES.md` §8 to align hard-cutover pipeline restructure with `docs/GC_SLAM.md` scan clock + deterministic buffering (replaced shared-(L,h) multi-rate writers design).
+- Reworked evaluation pipeline: removed legacy OpReport path, added GT overlap checks and cert summary output, and made lean metrics.json the default output.
+### Timing
+- Expanded minimal tape timing fields (IMU preintegration, surfel extraction, association, visual pose, map branch/update) and enabled timing in unified config.

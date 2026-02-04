@@ -107,7 +107,10 @@ def _build_bev15_rrd(
     data = np.load(splat_npz, allow_pickle=True)
     n = int(data.get("n", data["positions"].shape[0]))
     positions = np.asarray(data["positions"], dtype=np.float64)[:n]
-    colors = np.asarray(data["colors"], dtype=np.float64)[:n]
+    if "rgb" in data:
+        colors = np.asarray(data["rgb"], dtype=np.float64)[:n]
+    else:
+        colors = np.asarray(data["colors"], dtype=np.float64)[:n]
     weights = np.asarray(data["weights"], dtype=np.float64)[:n]
 
     if max_points is not None and n > max_points:
@@ -263,7 +266,7 @@ def _log_splat_views_at_t0(
 
 
 def _load_trajectory_tum(path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
-    """Load TUM file; return (stamps, path_xyz (N,3), path_quat_xyzw (N,4) or None)."""
+    """Load TUM file; return strictly monotonic (stamps, path_xyz, path_quat_xyzw or None)."""
     stamps = []
     xyz_list = []
     quat_list = []
@@ -280,9 +283,35 @@ def _load_trajectory_tum(path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray 
                 quat_list.append([float(parts[4]), float(parts[5]), float(parts[6]), float(parts[7])])
     if not stamps:
         return np.zeros(0), np.zeros((0, 3)), None
+    stamps = np.array(stamps, dtype=np.float64)
     path_xyz = np.array(xyz_list, dtype=np.float64)
     path_quat = np.array(quat_list, dtype=np.float64) if len(quat_list) == len(stamps) else None
-    return np.array(stamps), path_xyz, path_quat
+    # Sort by time (stable), dedupe identical timestamps by keeping the last.
+    order = np.argsort(stamps, kind="mergesort")
+    stamps = stamps[order]
+    path_xyz = path_xyz[order]
+    if path_quat is not None:
+        path_quat = path_quat[order]
+    if stamps.shape[0] > 1:
+        last_idx = np.r_[np.where(stamps[1:] != stamps[:-1])[0], stamps.shape[0] - 1]
+        stamps = stamps[last_idx]
+        path_xyz = path_xyz[last_idx]
+        if path_quat is not None:
+            path_quat = path_quat[last_idx]
+    # Enforce strictly increasing (drop non-increasing).
+    if stamps.shape[0] > 1:
+        keep = np.ones((stamps.shape[0],), dtype=bool)
+        prev = stamps[0]
+        for i in range(1, stamps.shape[0]):
+            if stamps[i] <= prev:
+                keep[i] = False
+            else:
+                prev = stamps[i]
+        stamps = stamps[keep]
+        path_xyz = path_xyz[keep]
+        if path_quat is not None:
+            path_quat = path_quat[keep]
+    return stamps, path_xyz, path_quat
 
 
 def _log_trajectory_transforms(
@@ -291,7 +320,7 @@ def _log_trajectory_transforms(
     stamps: np.ndarray,
     path_quat_xyzw: np.ndarray | None = None,
 ) -> None:
-    """Log each pose as Transform3D under gc/cameras (translation + rotation when quat available)."""
+    """Log each pose as Transform3D under gc/frames/base (translation + rotation when quat available)."""
     n = path_xyz.shape[0]
     if n == 0:
         return
@@ -303,11 +332,11 @@ def _log_trajectory_transforms(
         if has_quat:
             q = path_quat_xyzw[i].tolist()
             rr_module.log(
-                "gc/cameras",
+                "gc/frames/base",
                 rr_module.Transform3D(translation=pos, rotation=rr_module.datatypes.Quaternion(xyzw=q)),
             )
         else:
-            rr_module.log("gc/cameras", rr_module.Transform3D(translation=pos))
+            rr_module.log("gc/frames/base", rr_module.Transform3D(translation=pos))
 
 
 def build_rrd(
@@ -315,10 +344,11 @@ def build_rrd(
     trajectory_tum: str | None,
     output_rrd: str,
     view_deg: float = BEV_15_DEG,
-    fbm_scale: float = 0.15,
+    fbm_scale: float = 0.0,
     max_ellipsoids: int | None = 20000,
     splat_scale: float = 2.0,
     send_blueprint: bool = True,
+    shade_vmf: bool = False,
 ) -> bool:
     """Build .rrd from splat NPZ + optional trajectory TUM. Returns True on success."""
     if rr is None:
@@ -329,7 +359,10 @@ def build_rrd(
     n = int(data.get("n", data["positions"].shape[0]))
     positions = np.asarray(data["positions"], dtype=np.float64)[:n]
     covariances = np.asarray(data["covariances"], dtype=np.float64)[:n]
-    colors = np.asarray(data["colors"], dtype=np.float64)[:n]
+    if "rgb" in data:
+        colors = np.asarray(data["rgb"], dtype=np.float64)[:n]
+    else:
+        colors = np.asarray(data["colors"], dtype=np.float64)[:n]
     weights = np.asarray(data["weights"], dtype=np.float64)[:n]
     directions = np.asarray(data["directions"], dtype=np.float64)[:n]
     kappas = np.asarray(data["kappas"], dtype=np.float64)[:n]
@@ -356,10 +389,13 @@ def build_rrd(
         n = len(top)
 
     half_sizes, quats = _covariances_to_ellipsoids(covariances)
-    colors_shaded = _shaded_colors(
-        positions, colors, directions, kappas,
-        view_deg=view_deg, fbm_scale=fbm_scale,
-    )
+    if shade_vmf:
+        colors_shaded = _shaded_colors(
+            positions, colors, directions, kappas,
+            view_deg=view_deg, fbm_scale=fbm_scale,
+        )
+    else:
+        colors_shaded = np.clip(colors, 0.0, 1.0).astype(np.float32)
     # Rerun expects uint8 0-255 or float 0-1 for colors
     colors_uint8 = (np.clip(colors_shaded, 0, 1) * 255).astype(np.uint8)
 
@@ -447,6 +483,7 @@ def build_rrd(
                     rrb.Spatial3DView(name="Normals (vMF)", origin="gc/map/splats/normals"),
                     rrb.Spatial3DView(name="Weights", origin="gc/map/splats/weights"),
                     rrb.Spatial3DView(name="Trajectory", origin="gc/trajectory"),
+                    rrb.Spatial3DView(name="Robot POV", origin="gc/frames/base"),
                     name="GC Map",
                 ),
                 rrb.SelectionPanel(),
@@ -481,7 +518,8 @@ def main() -> int:
     ap.add_argument("--trajectory", default=None, help="Path to TUM trajectory")
     ap.add_argument("--output", default=None, help="Output .rrd path")
     ap.add_argument("--view-deg", type=float, default=BEV_15_DEG, help="BEV view angle (deg off vertical)")
-    ap.add_argument("--fbm-scale", type=float, default=0.15, help="fBm color modulation 0..1")
+    ap.add_argument("--fbm-scale", type=float, default=0.0, help="fBm color modulation 0..1")
+    ap.add_argument("--shade-vmf", action="store_true", help="Enable vMF+fBm shading (off by default).")
     ap.add_argument("--max-ellipsoids", type=int, default=20000, help="Cap ellipsoids by weight (0 = no cap)")
     ap.add_argument("--splat-scale", type=float, default=2.0, help="Scale for dense/weight point radii (overlap fill)")
     ap.add_argument("--no-blueprint", action="store_true", help="Skip sending blueprint (if viewer version differs)")
@@ -529,6 +567,7 @@ def main() -> int:
         max_ellipsoids=max_ell,
         splat_scale=args.splat_scale,
         send_blueprint=not args.no_blueprint,
+        shade_vmf=args.shade_vmf,
     )
     if ok:
         print(f"Rerun recording written: {out}")

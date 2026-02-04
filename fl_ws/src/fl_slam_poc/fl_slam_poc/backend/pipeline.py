@@ -785,6 +785,7 @@ def process_scan_single_hypothesis(
             min_points_per_voxel=config.surfel_min_points_per_voxel,
             eps_lift=config.eps_lift,
         )
+        t0_surfel_local = time.perf_counter() if config.enable_timing else None
         measurement_batch_local, surfel_cert_local, _ = extract_lidar_surfels(
             points=deskewed_points,
             timestamps=timestamps,
@@ -794,6 +795,8 @@ def process_scan_single_hypothesis(
             chart_id=belief_pred.chart_id,
             anchor_id="surfel_extraction",
         )
+        if config.enable_timing:
+            _record_timing("surfel_extraction_ms", t0_surfel_local, measurement_batch_local)
         local_certs.append(surfel_cert_local)
 
         pose_pred_for_map = belief_pred.mean_world_pose(eps_lift=config.eps_lift)
@@ -861,6 +864,7 @@ def process_scan_single_hypothesis(
             scan_seq=int(scan_seq),
             recency_decay_lambda=float(config.RECENCY_DECAY_LAMBDA),
         )
+        t0_assoc_local = time.perf_counter() if config.enable_timing else None
         assoc_result_local, assoc_cert_local, _ = associate_primitives_ot(
             measurement_batch=measurement_batch_local,
             map_view=map_view_local,
@@ -868,6 +872,8 @@ def process_scan_single_hypothesis(
             chart_id=belief_pred.chart_id,
             anchor_id="primitive_ot",
         )
+        if config.enable_timing:
+            _record_timing("association_ms", t0_assoc_local, assoc_result_local)
         local_certs.append(assoc_cert_local)
 
         candidate_tiles_per_meas_mean_local = 0.0
@@ -898,6 +904,8 @@ def process_scan_single_hypothesis(
                 idx_p95 = min(idx_p95, int(cand_sorted.shape[0]) - 1)
                 candidate_primitives_per_meas_p95_local = float(cand_sorted[idx_p95])
 
+        if config.enable_timing:
+            _record_timing("map_branch_ms", t0_prim_local, assoc_result_local)
         return {
             "certs": local_certs,
             "t0_prim": t0_prim_local,
@@ -1225,6 +1233,7 @@ def process_scan_single_hypothesis(
     # Step 12b: Primitive map update with z_t (post-recompose pose)
     # =========================================================================
     # Evidence used pre-update map; now update map using z_t (belief_recomposed).
+    t0_map_update = time.perf_counter() if config.enable_timing else None
     if (
         primitive_map is not None
         and assoc_result is not None
@@ -1272,6 +1281,7 @@ def process_scan_single_hypothesis(
                 etas_blk = measurement_batch.etas[meas_idx]
                 weights_blk = measurement_batch.weights[meas_idx]
                 colors_blk = measurement_batch.colors[meas_idx]
+                sources_blk = measurement_batch.sources[meas_idx]
 
                 target_flat = slot_blk.reshape(-1).astype(jnp.int32)
                 tile_ids_flat = tile_blk.reshape(-1).astype(jnp.int64)
@@ -1282,6 +1292,7 @@ def process_scan_single_hypothesis(
                 etas_meas = jnp.repeat(etas_blk, k_assoc, axis=0)
                 weights_meas = jnp.repeat(weights_blk, k_assoc, axis=0)
                 colors_meas_flat = jnp.repeat(colors_blk, k_assoc, axis=0)
+                sources_meas_flat = jnp.repeat(sources_blk, k_assoc, axis=0)
 
                 Lambdas_world, thetas_world, etas_world = jax.vmap(transform_gaussian_to_world)(
                     Lambdas_meas, thetas_meas, etas_meas
@@ -1308,6 +1319,7 @@ def process_scan_single_hypothesis(
                         scan_seq=int(scan_seq),
                         valid_mask=valid_t,
                         colors_meas=colors_meas_flat,
+                        sources_meas=sources_meas_flat,
                         eps_mass=config.eps_mass,
                     )
                     primitive_map = fuse_result.atlas_map
@@ -1349,6 +1361,7 @@ def process_scan_single_hypothesis(
                 # If we had to fill budget, zero out those insert masses explicitly.
                 weights_ins = jnp.where(in_tile[ins_idx_j], weights_ins, 0.0)
                 colors_ins = measurement_batch.colors[ins_idx_j]
+                sources_ins = measurement_batch.sources[ins_idx_j]
 
                 insert_mass_total += float(jnp.sum(weights_ins))
                 weights_sorted = jnp.sort(weights_ins)
@@ -1372,6 +1385,7 @@ def process_scan_single_hypothesis(
                     valid_new_mask=valid_new_j,
                     recency_decay_lambda=float(config.RECENCY_DECAY_LAMBDA),
                     colors_new=colors_ins,
+                    sources_new=sources_ins,
                 )
                 primitive_map = result_insert.atlas_map
                 all_certs.append(insert_cert)
@@ -1474,6 +1488,8 @@ def process_scan_single_hypothesis(
         all_certs.append(map_update_cert)
 
         primitive_map_updated = primitive_map
+        if config.enable_timing:
+            _record_timing("map_update_ms", t0_map_update, primitive_map_updated)
     
     # =========================================================================
     # Step 13: AnchorDriftUpdate
@@ -1544,6 +1560,13 @@ def process_scan_single_hypothesis(
         t_total_ms=timing_ms.get("total_ms", 0.0) if timing_ms is not None else 0.0,
         t_point_budget_ms=timing_ms.get("point_budget_ms", 0.0) if timing_ms is not None else 0.0,
         t_deskew_ms=timing_ms.get("deskew_ms", 0.0) if timing_ms is not None else 0.0,
+        t_imu_preint_scan_ms=timing_ms.get("imu_preint_scan_ms", 0.0) if timing_ms is not None else 0.0,
+        t_imu_preint_int_ms=timing_ms.get("imu_preint_int_ms", 0.0) if timing_ms is not None else 0.0,
+        t_surfel_extraction_ms=timing_ms.get("surfel_extraction_ms", 0.0) if timing_ms is not None else 0.0,
+        t_association_ms=timing_ms.get("association_ms", 0.0) if timing_ms is not None else 0.0,
+        t_visual_pose_ms=timing_ms.get("visual_pose_evidence_ms", 0.0) if timing_ms is not None else 0.0,
+        t_map_branch_ms=timing_ms.get("map_branch_ms", 0.0) if timing_ms is not None else 0.0,
+        t_map_update_ms=timing_ms.get("map_update_ms", 0.0) if timing_ms is not None else 0.0,
     )
 
     return ScanPipelineResult(

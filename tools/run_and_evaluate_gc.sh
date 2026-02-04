@@ -17,12 +17,15 @@ DESKEW_ROTATION_ONLY="${DESKEW_ROTATION_ONLY:-false}"
 # Playback duration: only first N seconds of bag (for testing; set BAG_DURATION to play more).
 BAG_PLAY_RATE="${BAG_PLAY_RATE:-0.5}"
 BAG_DURATION="${BAG_DURATION:-60}"
+FULL_REPORT="${FULL_REPORT:-false}"
+RERUN_REPLAY="${RERUN_REPLAY:-true}"
 
 # ============================================================================
 # Canonical bag: single Kimera bag used for all testing. See docs/KIMERA_DATASET_AND_PIPELINE.md.
 # ============================================================================
-BAG_PATH="${BAG_PATH:-$PROJECT_ROOT/rosbags/Kimera_Data/ros2/10_14_acl_jackal-005}"
-GT_FILE="${GT_FILE:-$PROJECT_ROOT/rosbags/Kimera_Data/ground_truth/1014/acl_jackal_gt.tum}"
+EVAL_CONFIG_PATH="${EVAL_CONFIG_PATH:-$PROJECT_ROOT/fl_ws/src/fl_slam_poc/config/gc_unified.yaml}"
+BAG_PATH="${BAG_PATH:-}"
+GT_FILE="${GT_FILE:-}"
 CONFIG_PATH="${CONFIG_PATH:-$PROJECT_ROOT/fl_ws/src/fl_slam_poc/config/gc_unified.yaml}"
 ODOM_FRAME="${ODOM_FRAME:-acl_jackal2/odom}"
 BASE_FRAME="${BASE_FRAME:-acl_jackal2/base}"
@@ -33,6 +36,36 @@ BAG_DURATION="${BAG_DURATION:-60}"
 IMU_ACCEL_SCALE="${IMU_ACCEL_SCALE:-1.0}"
 [ -n "$CONFIG_PATH" ] && CONFIG_ARG="config_path:=$CONFIG_PATH" || CONFIG_ARG=""
 
+# Source common venv so PYTHON is set before reading eval config
+source "$(dirname "$0")/common_venv.sh"
+
+# Resolve BAG_PATH and GT_FILE from eval config if not explicitly set
+if [ -z "$BAG_PATH" ] || [ -z "$GT_FILE" ]; then
+  if [ -f "$EVAL_CONFIG_PATH" ]; then
+    IFS=$'\t' read -r BAG_PATH_FROM_CFG GT_FILE_FROM_CFG < <(env -u PYTHONPATH "$PYTHON" - "$EVAL_CONFIG_PATH" <<'PY'
+import sys, yaml
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as f:
+    cfg = yaml.safe_load(f) or {}
+eval_cfg = cfg.get("eval", {}) if isinstance(cfg, dict) else {}
+bag = str(eval_cfg.get("bag_path", "") or "")
+gt = str(eval_cfg.get("gt_file", "") or "")
+print(f"{bag}\t{gt}")
+PY
+    )
+    if [ -z "$BAG_PATH" ] && [ -n "$BAG_PATH_FROM_CFG" ]; then
+      BAG_PATH="$BAG_PATH_FROM_CFG"
+    fi
+    if [ -z "$GT_FILE" ] && [ -n "$GT_FILE_FROM_CFG" ]; then
+      GT_FILE="$GT_FILE_FROM_CFG"
+    fi
+  fi
+fi
+
+# Fallback defaults if still unset
+BAG_PATH="${BAG_PATH:-$PROJECT_ROOT/rosbags/Kimera_Data/ros2/10_14_acl_jackal-005}"
+GT_FILE="${GT_FILE:-$PROJECT_ROOT/rosbags/Kimera_Data/ground_truth/1014/acl_jackal_gt.tum}"
+
 EST_FILE="/tmp/gc_slam_trajectory.tum"
 EST_BODY="/tmp/gc_slam_trajectory_body.tum"
 GT_ALIGNED="/tmp/gt_ground_truth_aligned.tum"
@@ -40,9 +73,7 @@ WIRING_SUMMARY="/tmp/gc_wiring_summary.json"
 DIAGNOSTICS_FILE="$PROJECT_ROOT/results/gc_slam_diagnostics.npz"
 RESULTS_DIR="$PROJECT_ROOT/results/gc_$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="$RESULTS_DIR/slam_run.log"
-# Source common venv detection
-source "$(dirname "$0")/common_venv.sh"
-# $PYTHON and $VENV_PATH are now set by common_venv.sh
+# $PYTHON and $VENV_PATH already set by common_venv.sh (sourced above)
 
 # Terminal colors
 RED='\033[0;31m'
@@ -73,26 +104,32 @@ clear_status() {
     printf "\r%-80s\r" ""
 }
 
+# ASCII-only progress/stage rendering for terminals without UTF-8 (no unicode box/block chars)
+BAR_FILL="${BAR_FILL:-#}"
+BAR_EMPTY="${BAR_EMPTY:--}"
+HEALTH_CHAR="${HEALTH_CHAR:-*}"
+STAGE_LINE="${STAGE_LINE:-========================================}"
+
 print_stage() {
     local num="$1"
     local total="$2"
     local name="$3"
     echo ""
-    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}${STAGE_LINE}${NC}"
     echo -e "${BOLD}[${num}/${total}] ${name}${NC}"
-    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}${STAGE_LINE}${NC}"
 }
 
 print_ok() {
-    echo -e "${GREEN}✓${NC} $1"
+    echo -e "${GREEN}[OK]${NC} $1"
 }
 
 print_fail() {
-    echo -e "${RED}✗${NC} $1"
+    echo -e "${RED}[FAIL]${NC} $1"
 }
 
 print_warn() {
-    echo -e "${YELLOW}!${NC} $1"
+    echo -e "${YELLOW}[!]${NC} $1"
 }
 
 # ============================================================================
@@ -106,9 +143,9 @@ cleanup() {
     if [ $exit_code -ne 0 ]; then
         clear_status
         echo ""
-        echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "${RED}${STAGE_LINE:-========================================}${NC}"
         echo -e "${RED}${BOLD}CRASHED!${NC} Exit code: $exit_code"
-        echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "${RED}${STAGE_LINE:-========================================}${NC}"
         if [ -f "$LOG_FILE" ]; then
             echo ""
             echo -e "${YELLOW}Last 30 lines of log:${NC}"
@@ -124,9 +161,9 @@ trap cleanup EXIT
 # HEADER
 # ============================================================================
 echo ""
-echo -e "${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}║       ${CYAN}GEOMETRIC COMPOSITIONAL SLAM v2${NC}${BOLD} — Evaluation Pipeline            ║${NC}"
-echo -e "${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
+echo -e "${BOLD}+==============================================================+${NC}"
+echo -e "${BOLD}|       ${CYAN}GEOMETRIC COMPOSITIONAL SLAM v2${NC}${BOLD} - Evaluation Pipeline            |${NC}"
+echo -e "${BOLD}+==============================================================+${NC}"
 echo ""
 echo -e "Bag:     ${CYAN}$(basename "$BAG_PATH")${NC} (play rate ${BAG_PLAY_RATE}, first ${BAG_DURATION}s)"
 echo -e "Results: ${CYAN}$RESULTS_DIR${NC}"
@@ -138,7 +175,7 @@ mkdir -p "$RESULTS_DIR"
 # ============================================================================
 # STAGE 0: PREFLIGHT
 # ============================================================================
-print_stage 0 5 "Preflight Checks"
+print_stage 0 6 "Preflight Checks"
 
 # Venv is already set up by common_venv.sh
 print_ok "Python venv selected: $VENV_PATH"
@@ -190,7 +227,7 @@ print_ok "All preflight checks passed"
 # ============================================================================
 # STAGE 1: BUILD
 # ============================================================================
-print_stage 1 5 "Build Package (Fresh)"
+print_stage 1 6 "Build Package (Fresh)"
 
 # Drop stale paths (e.g. removed livox_ros_driver2) so colcon does not warn
 filter_existing_paths() {
@@ -225,7 +262,7 @@ print_ok "Package built successfully"
 # ============================================================================
 # STAGE 2: RUN SLAM
 # ============================================================================
-print_stage 2 5 "Run Geometric Compositional SLAM"
+print_stage 2 6 "Run Geometric Compositional SLAM"
 
 # ROS environment (use domain 1 to avoid CycloneDDS "free participant index" exhaustion on domain 0)
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-1}"
@@ -257,6 +294,11 @@ if [ "$PROFILE" = "kimera" ]; then
     echo "ERROR: PROFILE=kimera but GT_FILE missing: $GT_FILE"
     exit 1
   fi
+  GT_LINES=$(grep -v '^#' "$GT_FILE" | wc -l)
+  if [ "$GT_LINES" -lt 10 ]; then
+    echo "ERROR: GT_FILE has too few poses ($GT_LINES): $GT_FILE"
+    exit 1
+  fi
 fi
 
 # Launch (pass config_path and frame params when set)
@@ -281,6 +323,12 @@ LAUNCH_OPTS=(
 [ -n "$CONFIG_ARG" ] && LAUNCH_OPTS+=( "$CONFIG_ARG" )
 # Extrinsics from config yaml only (no inline overrides)
 [ -n "$IMU_ACCEL_SCALE" ] && LAUNCH_OPTS+=( "imu_accel_scale:=$IMU_ACCEL_SCALE" )
+
+# Ensure ROS launch uses the same venv Python (required for jax)
+if [ -n "${VENV_PATH:-}" ] && [ -f "${VENV_PATH}/bin/activate" ]; then
+  # shellcheck disable=SC1090
+  source "${VENV_PATH}/bin/activate"
+fi
 
 ros2 launch fl_slam_poc gc_rosbag.launch.py "${LAUNCH_OPTS[@]}" \
   > "$LOG_FILE" 2>&1 &
@@ -367,21 +415,21 @@ while [ $ALIVE = true ]; do
         fi
     fi
     
-    # Health indicator
+    # Health indicator (ASCII so it renders in any terminal)
     if [ $LAST_IMU -gt 0 ] && [ $LAST_SCAN -gt 0 ] && [ $LAST_ODOM -gt 0 ]; then
-        HEALTH="${GREEN}●${NC}"
+        HEALTH="${GREEN}${HEALTH_CHAR}${NC}"
     elif [ $LAST_ODOM -gt 0 ]; then
-        HEALTH="${YELLOW}●${NC}"
+        HEALTH="${YELLOW}${HEALTH_CHAR}${NC}"
     else
-        HEALTH="${RED}●${NC}"
+        HEALTH="${RED}${HEALTH_CHAR}${NC}"
     fi
     
-    # Progress bar
+    # Progress bar (ASCII fill/empty so it renders in any terminal)
     PCT=$((ELAPSED * 100 / TIMEOUT_SEC))
     BAR_LEN=20
     FILLED=$((PCT * BAR_LEN / 100))
     EMPTY=$((BAR_LEN - FILLED))
-    BAR=$(printf "%${FILLED}s" | tr ' ' '█')$(printf "%${EMPTY}s" | tr ' ' '░')
+    BAR=$(printf "%${FILLED}s" | tr ' ' "$BAR_FILL")$(printf "%${EMPTY}s" | tr ' ' "$BAR_EMPTY")
     
     printf "\r  ${BOLD}[${BAR}]${NC} %3d%% | %3ds/${TIMEOUT_SEC}s | odom:${CYAN}%d${NC} scan:${CYAN}%d${NC} imu:${CYAN}%d${NC} %b  " \
         "$PCT" "$ELAPSED" "$LAST_ODOM" "$LAST_SCAN" "$LAST_IMU" "$HEALTH"
@@ -430,9 +478,41 @@ print_ok "SLAM complete: ${CYAN}$POSE_COUNT${NC} poses"
 echo "    odom=$LAST_ODOM  scan=$LAST_SCAN  imu=$LAST_IMU"
 
 # ============================================================================
-# STAGE 3: EVALUATE
+# STAGE 3: AUDIT INVARIANTS CHECK
 # ============================================================================
-print_stage 3 5 "Evaluate Trajectory"
+print_stage 3 6 "Audit Invariants Check"
+
+echo "  Running audit invariant tests..."
+AUDIT_LOG="$RESULTS_DIR/audit_invariants.log"
+
+# Run pytest on audit invariants test file
+cd "$PROJECT_ROOT/fl_ws/src/fl_slam_poc"
+env -u PYTHONPATH PYTHONPATH="$PROJECT_ROOT/fl_ws/src/fl_slam_poc:$PYTHONPATH" \
+    "$PYTHON" -m pytest test/test_audit_invariants.py -v --tb=short 2>&1 | tee "$AUDIT_LOG"
+AUDIT_EXIT_CODE=${PIPESTATUS[0]}
+
+cd "$PROJECT_ROOT"
+
+echo ""
+if [ $AUDIT_EXIT_CODE -eq 0 ]; then
+    print_ok "All audit invariants PASSED"
+    PASSED=$(grep -c "PASSED" "$AUDIT_LOG" 2>/dev/null || echo "0")
+    echo -e "    Tests passed: ${GREEN}$PASSED${NC}"
+else
+    print_warn "Some audit invariants FAILED (exit code: $AUDIT_EXIT_CODE)"
+    FAILED=$(grep -c "FAILED" "$AUDIT_LOG" 2>/dev/null || echo "0")
+    PASSED=$(grep -c "PASSED" "$AUDIT_LOG" 2>/dev/null || echo "0")
+    echo -e "    Tests passed: ${GREEN}$PASSED${NC}"
+    echo -e "    Tests failed: ${RED}$FAILED${NC}"
+    echo ""
+    echo -e "    ${YELLOW}See $AUDIT_LOG for details${NC}"
+    exit 1
+fi
+
+# ============================================================================
+# STAGE 4: EVALUATE
+# ============================================================================
+print_stage 4 6 "Evaluate Trajectory"
 
 # Kimera: estimate and GT are in same body/base convention; no body-frame transform.
 EST_FOR_EVAL="$EST_FILE"
@@ -444,24 +524,76 @@ env -u PYTHONPATH "$PYTHON" "$PROJECT_ROOT/tools/align_ground_truth.py" \
   "$EST_FOR_EVAL" \
   "$GT_ALIGNED" 2>&1 | sed 's/^/    /'
 
-# Create op_report with all required metrics fields
-OP_REPORT_FILE="$RESULTS_DIR/op_report.jsonl"
-cat > "$OP_REPORT_FILE" << 'OPREPORT'
-{"name":"GaussianPredictSE3","exact":false,"approximation_triggers":["GeometricCompositional"],"family_in":"gaussian","family_out":"gaussian","closed_form":true,"domain_projection":true,"metrics":{"state_dim":22,"linearization_point":"identity","process_noise_trace":0.001},"timestamp":0}
-{"name":"AnchorCreate","exact":true,"approximation_triggers":[],"family_in":"gaussian","family_out":"gaussian","closed_form":true,"domain_projection":false,"metrics":{"anchor_id":"gc_anchor","dt_sec":0.0,"timestamp_weight":1.0},"timestamp":0}
-{"name":"LoopFactorPublished","exact":false,"approximation_triggers":["ICP"],"family_in":"gaussian","family_out":"gaussian","closed_form":false,"domain_projection":true,"metrics":{"anchor_id":"gc_anchor","weight":1.0,"mse":0.01,"iterations":10,"converged":true,"point_source":"mid360"},"timestamp":0}
-{"name":"LoopFactorRecomposition","exact":false,"approximation_triggers":["Frobenius"],"family_in":"gaussian","family_out":"gaussian","closed_form":true,"domain_projection":true,"metrics":{"anchor_id":"gc_anchor","weight":1.0,"innovation_norm":0.01},"timestamp":0}
-OPREPORT
+# Verify GT/EST overlap after alignment
+GT_CHECK_JSON="$RESULTS_DIR/gt_check.json"
+env -u PYTHONPATH "$PYTHON" "$PROJECT_ROOT/tools/gt_checks.py" \
+  --gt "$GT_ALIGNED" \
+  --est "$EST_FOR_EVAL" \
+  --out "$GT_CHECK_JSON" 2>&1 | sed 's/^/    /'
+GT_CHECK_EXIT=${PIPESTATUS[0]}
+if [ "$GT_CHECK_EXIT" -ne 0 ]; then
+  echo "ERROR: Ground-truth/estimate overlap check failed."
+  exit 1
+fi
 
-# Run evaluation
+# Copy diagnostics if available and build cert summary
+CERT_SUMMARY="$RESULTS_DIR/cert_summary.json"
+if [ -f "$DIAGNOSTICS_FILE" ]; then
+    cp "$DIAGNOSTICS_FILE" "$RESULTS_DIR/diagnostics.npz"
+    DIAG_SCANS=$(env -u PYTHONPATH "$PYTHON" -c "import numpy as np; d=np.load('$DIAGNOSTICS_FILE'); print(int(d['n_scans']))" 2>/dev/null || echo "0")
+    print_ok "Diagnostics collected: ${CYAN}$DIAG_SCANS${NC} scans"
+    env -u PYTHONPATH "$PYTHON" - "$RESULTS_DIR/diagnostics.npz" "$CERT_SUMMARY" <<'PYSCRIPT'
+import json
+import sys
+import numpy as np
+
+diag_path = sys.argv[1]
+out_path = sys.argv[2]
+d = np.load(diag_path, allow_pickle=True)
+n = int(d.get("n_scans", 0))
+summary = {"n_scans": n}
+if n > 0:
+    def _get(key, default=0.0):
+        return np.asarray(d.get(key, np.full((n,), default)))
+    cert_exact = _get("cert_exact", 1.0).astype(np.float64)
+    frob = _get("cert_frobenius_applied", 0.0).astype(np.float64)
+    n_trig = _get("cert_n_triggers", 0.0).astype(np.float64)
+    summary.update({
+        "cert_exact_frac": float(np.mean(cert_exact)),
+        "frobenius_frac": float(np.mean(frob)),
+        "mean_triggers": float(np.mean(n_trig)),
+        "max_triggers": float(np.max(n_trig)),
+        "support_ess_total_mean": float(np.mean(_get("support_ess_total", 0.0))),
+        "support_frac_mean": float(np.mean(_get("support_frac", 0.0))),
+        "mismatch_nll_per_ess_mean": float(np.mean(_get("mismatch_nll_per_ess", 0.0))),
+        "overconfidence_dt_asymmetry_mean": float(np.mean(_get("overconfidence_dt_asymmetry", 0.0))),
+        "overconfidence_z_to_xy_ratio_mean": float(np.mean(_get("overconfidence_z_to_xy_ratio", 0.0))),
+    })
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(summary, f, indent=2, sort_keys=True)
+print(json.dumps(summary, indent=2, sort_keys=True))
+PYSCRIPT
+fi
+
+# Run evaluation (lean by default)
 echo ""
 echo "  Computing metrics..."
+EVAL_ARGS=(
+  "$GT_ALIGNED"
+  "$EST_FOR_EVAL"
+  "$RESULTS_DIR"
+)
+if [ -f "$CERT_SUMMARY" ]; then
+  EVAL_ARGS+=( --cert-summary "$CERT_SUMMARY" )
+fi
+if [ -f "$AUDIT_LOG" ]; then
+  EVAL_ARGS+=( --audit-log "$AUDIT_LOG" )
+fi
+if [ "$FULL_REPORT" = "true" ]; then
+  EVAL_ARGS+=( --full-report )
+fi
 env -u PYTHONPATH "$PYTHON" "$PROJECT_ROOT/tools/evaluate_slam.py" \
-  "$GT_ALIGNED" \
-  "$EST_FOR_EVAL" \
-  "$RESULTS_DIR" \
-  "$OP_REPORT_FILE" \
-  --no-imu 2>&1 | sed 's/^/    /'
+  "${EVAL_ARGS[@]}" 2>&1 | sed 's/^/    /'
 
 # Copy files
 cp "$EST_FOR_EVAL" "$RESULTS_DIR/estimated_trajectory.tum"
@@ -473,45 +605,45 @@ if [ -f "$WIRING_SUMMARY" ]; then
     cp "$WIRING_SUMMARY" "$RESULTS_DIR/wiring_summary.json"
 fi
 
-# Copy diagnostics if available
-if [ -f "$DIAGNOSTICS_FILE" ]; then
-    cp "$DIAGNOSTICS_FILE" "$RESULTS_DIR/diagnostics.npz"
-    DIAG_SCANS=$(env -u PYTHONPATH "$PYTHON" -c "import numpy as np; d=np.load('$DIAGNOSTICS_FILE'); print(int(d['n_scans']))" 2>/dev/null || echo "0")
-    print_ok "Diagnostics collected: ${CYAN}$DIAG_SCANS${NC} scans"
-fi
-
 print_ok "Evaluation complete"
 
 # ============================================================================
 # STAGE 4: RESULTS SUMMARY
 # ============================================================================
-print_stage 4 5 "Results Summary"
+print_stage 5 6 "Results Summary"
 
 echo ""
 echo -e "  ${BOLD}Rosbag:${NC} $(basename "$BAG_PATH") (first ${BAG_DURATION}s) | ${BOLD}GT:${NC} $(basename "$GT_FILE")"
-if [ -f "$RESULTS_DIR/metrics.txt" ]; then
-    # Extract key metrics from SUMMARY (parsable) section
-    ATE_TRANS=$(grep "ATE translation RMSE" "$RESULTS_DIR/metrics.txt" | head -1 | awk '{print $NF}')
-    ATE_ROT=$(grep "ATE rotation RMSE" "$RESULTS_DIR/metrics.txt" | head -1 | awk '{print $NF}')
-    RPE_1M=$(grep "RPE translation @ 1m" "$RESULTS_DIR/metrics.txt" | head -1 | awk '{print $NF}')
-    
-    echo -e "  ${BOLD}ATE translation RMSE (m):${NC}   ${CYAN}${ATE_TRANS:-N/A}${NC}"
-    echo -e "  ${BOLD}ATE rotation RMSE (deg):${NC}   ${CYAN}${ATE_ROT:-N/A}${NC}"
-    echo -e "  ${BOLD}RPE translation @ 1m (m/m):${NC} ${CYAN}${RPE_1M:-N/A}${NC}"
-    # If ATE/RPE are huge, likely GT vs estimate frame/axis mismatch (e.g. different Z-up vs planar)
-    if [ -n "$ATE_TRANS" ] && [ -n "$RPE_1M" ]; then
-        if awk "BEGIN { exit !($ATE_TRANS > 10 || $RPE_1M > 1) }" 2>/dev/null; then
-            echo -e "  ${YELLOW}Note: Very large ATE/RPE often mean GT and estimate use different frame or axis conventions. See docs/KIMERA_DATASET_AND_PIPELINE.md.${NC}"
-        fi
-    fi
+if [ -f "$RESULTS_DIR/metrics.json" ]; then
+    env -u PYTHONPATH "$PYTHON" - "$RESULTS_DIR/metrics.json" <<'PYSCRIPT'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+ate_t = data.get("ate", {}).get("translation", {}).get("full", {})
+ate_r = data.get("ate", {}).get("rotation", {}).get("full", {})
+rpe_1m = data.get("rpe", {}).get("1m", {}).get("translation", {})
+
+def _fmt(v):
+    try:
+        return f"{float(v):.6f}"
+    except Exception:
+        return "N/A"
+
+print(f"  ATE translation RMSE (m):   {_fmt(ate_t.get('rmse'))}")
+print(f"  ATE rotation RMSE (deg):    {_fmt(ate_r.get('rmse'))}")
+print(f"  RPE translation @ 1m (m/m): {_fmt(rpe_1m.get('rmse'))}")
+PYSCRIPT
 fi
 
 # Display wiring summary if available
 if [ -f "$RESULTS_DIR/wiring_summary.json" ]; then
     echo ""
-    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}${STAGE_LINE}${NC}"
     echo -e "${BOLD}  WIRING SUMMARY${NC}"
-    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}${STAGE_LINE}${NC}"
     
     # Parse JSON with Python
     env -u PYTHONPATH "$PYTHON" - "$RESULTS_DIR/wiring_summary.json" <<'PYSCRIPT'
@@ -537,82 +669,44 @@ if dead:
 
 # Warnings
 if not proc.get('odom_fused') and proc.get('odom_msgs', 0) > 0:
-    print(f"  ⚠ Odom subscribed but NOT FUSED")
+    print(f"  [!] Odom subscribed but NOT FUSED")
 if not proc.get('imu_fused') and proc.get('imu_msgs', 0) > 0:
-    print(f"  ⚠ IMU subscribed but NOT FUSED")
+    print(f"  [!] IMU subscribed but NOT FUSED")
 PYSCRIPT
-    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}${STAGE_LINE}${NC}"
 fi
 
 echo ""
 echo -e "  ${BOLD}Outputs:${NC}"
-ls "$RESULTS_DIR"/*.png 2>/dev/null | while IFS= read -r f; do
-    echo -e "    ${GREEN}✓${NC} $(basename "$f")"
+for f in metrics.json wiring_summary.json audit_invariants.log cert_summary.json gt_check.json diagnostics.npz; do
+    if [ -f "$RESULTS_DIR/$f" ]; then
+        echo -e "    ${GREEN}[OK]${NC} $f"
+    fi
 done
-ls "$RESULTS_DIR"/*.txt "$RESULTS_DIR"/*.csv 2>/dev/null | while IFS= read -r f; do
-    echo -e "    ${GREEN}✓${NC} $(basename "$f")"
-done
-
-# ============================================================================
-# STAGE 5: AUDIT INVARIANTS CHECK
-# ============================================================================
-print_stage 5 5 "Audit Invariants Check"
-
-echo "  Running audit invariant tests..."
-AUDIT_LOG="$RESULTS_DIR/audit_invariants.log"
-
-# Run pytest on audit invariants test file
-cd "$PROJECT_ROOT/fl_ws/src/fl_slam_poc"
-env -u PYTHONPATH PYTHONPATH="$PROJECT_ROOT/fl_ws/src/fl_slam_poc:$PYTHONPATH" \
-    "$PYTHON" -m pytest test/test_audit_invariants.py -v --tb=short 2>&1 | tee "$AUDIT_LOG"
-AUDIT_EXIT_CODE=${PIPESTATUS[0]}
-
-cd "$PROJECT_ROOT"
-
-echo ""
-if [ $AUDIT_EXIT_CODE -eq 0 ]; then
-    print_ok "All audit invariants PASSED"
-    
-    # Extract summary counts
-    PASSED=$(grep -c "PASSED" "$AUDIT_LOG" 2>/dev/null || echo "0")
-    echo -e "    Tests passed: ${GREEN}$PASSED${NC}"
-else
-    print_warn "Some audit invariants FAILED (exit code: $AUDIT_EXIT_CODE)"
-    
-    # Extract failure summary
-    FAILED=$(grep -c "FAILED" "$AUDIT_LOG" 2>/dev/null || echo "0")
-    PASSED=$(grep -c "PASSED" "$AUDIT_LOG" 2>/dev/null || echo "0")
-    echo -e "    Tests passed: ${GREEN}$PASSED${NC}"
-    echo -e "    Tests failed: ${RED}$FAILED${NC}"
-    echo ""
-    echo -e "    ${YELLOW}See $AUDIT_LOG for details${NC}"
+if [ "$FULL_REPORT" = "true" ]; then
+    ls "$RESULTS_DIR"/*.png 2>/dev/null | while IFS= read -r f; do
+        echo -e "    ${GREEN}[OK]${NC} $(basename "$f")"
+    done
+    ls "$RESULTS_DIR"/*.txt "$RESULTS_DIR"/*.csv 2>/dev/null | while IFS= read -r f; do
+        echo -e "    ${GREEN}[OK]${NC} $(basename "$f")"
+    done
 fi
 
-# Summary of audit categories verified
 echo ""
-echo -e "  ${BOLD}Audit Categories Verified:${NC}"
-echo -e "    ${GREEN}✓${NC} Order invariance (info fusion commutativity)"
-echo -e "    ${GREEN}✓${NC} No-gates smoothness (extreme values)"
-echo -e "    ${GREEN}✓${NC} Units/dt discretization (PSD scaling)"
-echo -e "    ${GREEN}✓${NC} SO(3)/SE(3) roundtrip (exp/log consistency)"
-echo -e "    ${GREEN}✓${NC} IW commutative update (sufficient stats)"
-echo -e "    ${GREEN}✓${NC} Vectorized operator correctness"
-
-echo ""
-echo -e "${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}║  ${GREEN}EVALUATION COMPLETE${NC}${BOLD}                                        ║${NC}"
-echo -e "${BOLD}║  Results: ${CYAN}$RESULTS_DIR${NC}"
-echo -e "${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
+echo -e "${BOLD}+==============================================================+${NC}"
+echo -e "${BOLD}|  ${GREEN}EVALUATION COMPLETE${NC}${BOLD}                                        |${NC}"
+echo -e "${BOLD}|  Results: ${CYAN}$RESULTS_DIR${NC}"
+echo -e "${BOLD}+==============================================================+${NC}"
 echo ""
 
 # ============================================================================
-# STAGE 6: Launch Dashboard
+# STAGE 6: Launch Dashboard / Rerun Replay (optional)
 # ============================================================================
-if [ -f "$RESULTS_DIR/diagnostics.npz" ]; then
+if [ "$FULL_REPORT" = "true" ] && [ -f "$RESULTS_DIR/diagnostics.npz" ]; then
     echo ""
-    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}${STAGE_LINE}${NC}"
     echo -e "${BOLD}Launching Diagnostics Dashboard...${NC}"
-    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}${STAGE_LINE}${NC}"
     DASHBOARD_OUT="$RESULTS_DIR/dashboard.html"
     env -u PYTHONPATH "$PYTHON" "$PROJECT_ROOT/tools/slam_dashboard.py" \
         "$RESULTS_DIR/diagnostics.npz" \
@@ -712,6 +806,80 @@ if [ -f "$RESULTS_DIR/diagnostics.npz" ]; then
             print_ok "JAXsplat render saved: ${CYAN}$SPLAT_OUT${NC}"
         else
             print_warn "JAXsplat render skipped (install jaxsplat or check logs). Splat export: ${CYAN}$SPLAT_NPZ${NC}"
+        fi
+    fi
+fi
+
+# Rerun replay without dashboard (lean default)
+if [ "$FULL_REPORT" != "true" ] && [ "$RERUN_REPLAY" = "true" ]; then
+    RERUN_RRD="$RESULTS_DIR/gc_slam.rrd"
+    SPLAT_NPZ="$RESULTS_DIR/splat_export.npz"
+    BEV15_RRD="$RESULTS_DIR/gc_bev15.rrd"
+    if [ -f "$SPLAT_NPZ" ]; then
+        if env -u PYTHONPATH "$PYTHON" "$PROJECT_ROOT/tools/build_rerun_from_splat.py" \
+            "$RESULTS_DIR" --output "$RERUN_RRD" --bev15-output "$BEV15_RRD"; then
+            print_ok "Rerun recording built: ${CYAN}$RERUN_RRD${NC}"
+            print_ok "BEV15 Rerun recording built: ${CYAN}$BEV15_RRD${NC}"
+        else
+            print_warn "Rerun build failed (see above). Splat: ${CYAN}$SPLAT_NPZ${NC}"
+        fi
+    else
+        print_warn "No splat_export.npz (backend may have exited before shutdown). Rerun not built."
+    fi
+    if [ -f "$RERUN_RRD" ]; then
+        RERUN_CMD=""
+        if [ -n "$VENV_PATH" ] && [ -x "$VENV_PATH/bin/rerun" ]; then
+            RERUN_CMD="$VENV_PATH/bin/rerun"
+        elif command -v rerun >/dev/null 2>&1; then
+            RERUN_CMD="rerun"
+        fi
+        if [ -n "$RERUN_CMD" ]; then
+            RERUN_WEB_PORT="${RERUN_WEB_PORT:-9090}"
+            "$RERUN_CMD" --serve-web --web-viewer --web-viewer-port "$RERUN_WEB_PORT" "$RERUN_RRD" 2>/dev/null &
+            RERUN_PID=$!
+            sleep 2
+            RERUN_URL="http://127.0.0.1:$RERUN_WEB_PORT"
+            if command -v xdg-open >/dev/null 2>&1; then
+                xdg-open "$RERUN_URL" 2>/dev/null &
+            elif [ -n "$BROWSER" ]; then
+                "$BROWSER" "$RERUN_URL" 2>/dev/null &
+            fi
+            if kill -0 "$RERUN_PID" 2>/dev/null; then
+                print_ok "Rerun recording opened in web viewer: ${CYAN}$RERUN_RRD${NC} → $RERUN_URL"
+            else
+                print_warn "Rerun viewer may have exited. Open manually: ${CYAN}$RERUN_URL${NC}"
+            fi
+        else
+            print_warn "Rerun recording saved: ${CYAN}$RERUN_RRD${NC} (install rerun-sdk and run: rerun --serve-web --web-viewer \"$RERUN_RRD\")"
+        fi
+    fi
+
+    # BEV15 post-run view-layer (separate Rerun viewer)
+    if [ -f "$BEV15_RRD" ]; then
+        RERUN_CMD=""
+        if [ -n "$VENV_PATH" ] && [ -x "$VENV_PATH/bin/rerun" ]; then
+            RERUN_CMD="$VENV_PATH/bin/rerun"
+        elif command -v rerun >/dev/null 2>&1; then
+            RERUN_CMD="rerun"
+        fi
+        if [ -n "$RERUN_CMD" ]; then
+            BEV15_WEB_PORT="${BEV15_WEB_PORT:-9091}"
+            "$RERUN_CMD" --serve-web --web-viewer --web-viewer-port "$BEV15_WEB_PORT" "$BEV15_RRD" 2>/dev/null &
+            BEV15_PID=$!
+            sleep 2
+            BEV15_URL="http://127.0.0.1:$BEV15_WEB_PORT"
+            if command -v xdg-open >/dev/null 2>&1; then
+                xdg-open "$BEV15_URL" 2>/dev/null &
+            elif [ -n "$BROWSER" ]; then
+                "$BROWSER" "$BEV15_URL" 2>/dev/null &
+            fi
+            if kill -0 "$BEV15_PID" 2>/dev/null; then
+                print_ok "BEV15 Rerun viewer opened: ${CYAN}$BEV15_RRD${NC} → $BEV15_URL"
+            else
+                print_warn "BEV15 Rerun viewer may have exited. Open manually: ${CYAN}$BEV15_URL${NC}"
+            fi
+        else
+            print_warn "BEV15 Rerun recording saved: ${CYAN}$BEV15_RRD${NC} (install rerun-sdk and run: rerun --serve-web --web-viewer \"$BEV15_RRD\")"
         fi
     fi
 fi

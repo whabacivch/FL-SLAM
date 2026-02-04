@@ -913,6 +913,7 @@ class GeometricCompositionalBackend(Node):
         responsibilities = jnp.ones((K_flat,), dtype=jnp.float64)
         valid_flat = jnp.ones((K_flat,), dtype=bool)
         colors_meas = jnp.zeros((K_flat, 3), dtype=jnp.float64)
+        sources_meas = jnp.zeros((K_flat,), dtype=jnp.int32)
 
         _ = primitive_map_fuse(
             atlas_map=self.primitive_map,
@@ -926,6 +927,7 @@ class GeometricCompositionalBackend(Node):
             timestamp=0.0,
             valid_mask=valid_flat,
             colors_meas=colors_meas,
+            sources_meas=sources_meas,
             eps_mass=self.config.eps_mass,
         )
         dt = time.perf_counter() - t0
@@ -2375,12 +2377,17 @@ class GeometricCompositionalBackend(Node):
                 positions_list = []
                 cov_list = []
                 colors_list = []
+                rgb_list = []
                 weights_list = []
                 directions_list = []
                 kappas_list = []
                 timestamps_list = []
                 created_list = []
                 ids_list = []
+                cam_mass_list = []
+                lidar_mass_list = []
+                rgb_cam_accum_list = []
+                rgb_cam_denom_list = []
 
                 for tile_id in sorted(self.primitive_map.tile_ids):
                     tile = self.primitive_map.tiles.get(int(tile_id))
@@ -2398,8 +2405,13 @@ class GeometricCompositionalBackend(Node):
                     ids_list.append(np.asarray(view.primitive_ids))
                     # Slot-local timestamps are direct (avoid ID lookups).
                     slot_idx = np.asarray(view.slot_indices, dtype=np.int64)
+                    rgb_list.append(np.asarray(tile.rgb[slot_idx], dtype=np.float64))
                     timestamps_list.append(np.asarray(tile.timestamps[slot_idx], dtype=np.float64))
                     created_list.append(np.asarray(tile.created_timestamps[slot_idx], dtype=np.float64))
+                    cam_mass_list.append(np.asarray(tile.cam_mass[slot_idx], dtype=np.float64))
+                    lidar_mass_list.append(np.asarray(tile.lidar_mass[slot_idx], dtype=np.float64))
+                    rgb_cam_accum_list.append(np.asarray(tile.rgb_cam_accum[slot_idx], dtype=np.float64))
+                    rgb_cam_denom_list.append(np.asarray(tile.rgb_cam_denom[slot_idx], dtype=np.float64))
 
                 if not positions_list:
                     self.get_logger().info("Splat export skipped: no valid primitives in atlas tiles.")
@@ -2409,12 +2421,17 @@ class GeometricCompositionalBackend(Node):
                     positions = np.concatenate(positions_list, axis=0)
                     covariances = np.concatenate(cov_list, axis=0)
                     colors = np.concatenate(colors_list, axis=0)
+                    rgb = np.concatenate(rgb_list, axis=0)
                     weights = np.concatenate(weights_list, axis=0)
                     directions = np.concatenate(directions_list, axis=0)
                     kappas = np.concatenate(kappas_list, axis=0)
                     timestamps = np.concatenate(timestamps_list, axis=0)
                     created_timestamps = np.concatenate(created_list, axis=0)
                     view_ids = np.concatenate(ids_list, axis=0)
+                    cam_mass = np.concatenate(cam_mass_list, axis=0)
+                    lidar_mass = np.concatenate(lidar_mass_list, axis=0)
+                    rgb_cam_accum = np.concatenate(rgb_cam_accum_list, axis=0)
+                    rgb_cam_denom = np.concatenate(rgb_cam_denom_list, axis=0)
                     n = int(positions.shape[0])
 
                 if n > 0:
@@ -2424,12 +2441,17 @@ class GeometricCompositionalBackend(Node):
                         positions=positions,
                         covariances=covariances,
                         colors=colors,
+                        rgb=rgb,
                         weights=weights,
                         directions=directions,
                         kappas=kappas,
                         timestamps=timestamps,
                         created_timestamps=created_timestamps,
                         primitive_ids=view_ids,
+                        cam_mass=cam_mass,
+                        lidar_mass=lidar_mass,
+                        rgb_cam_accum=rgb_cam_accum,
+                        rgb_cam_denom=rgb_cam_denom,
                         n=n,
                     )
                     self.get_logger().info(f"Splat export saved: {splat_path} ({n} primitives)")

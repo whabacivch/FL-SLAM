@@ -42,7 +42,7 @@ The **primary implementation** is **Geometric Compositional SLAM v2** — a stri
 - **14-step pipeline per scan:** Predict → Deskew → IMU+odom → z_lin → surfel+camera → association → visual_pose_evidence(M_{t-1}, z_lin) → fuse → recompose → map update(z_t) → cull/forget → anchor drift. See `docs/PIPELINE_ORDER_AND_EVIDENCE.md`.
 - **Canonical topic/bag reference:** `docs/KIMERA_DATASET_AND_PIPELINE.md`
 
-**Known limitations** (see `docs/PIPELINE_DESIGN_GAPS.md`): cross-sensor consistency likelihoods are still diagnostics (gyro↔odom↔LiDAR yaw); IMU message covariances and LiDAR intensity are not consumed; nonlinear evidence still uses local quadraticization (vMF/MF → Gaussian info). Pipeline trace and causality: `docs/PIPELINE_TRACE_SINGLE_DOC.md`.
+**Known limitations** (see `docs/PIPELINE_DESIGN_GAPS.md`): cross-sensor consistency likelihoods are still diagnostics (gyro↔odom↔LiDAR yaw); IMU message covariances and LiDAR intensity are not consumed; nonlinear evidence still uses local quadraticization (vMF/MF → Gaussian info).
 
 ---
 
@@ -184,15 +184,15 @@ fl_ws/src/fl_slam_poc/
 - Runs SLAM on the Kimera rosbag, aligns estimated trajectory to ground truth, computes ATE/RPE and per-axis errors, runs audit-invariant tests, and (if diagnostics are exported) builds a diagnostics dashboard.
 - Outputs: `results/gc_YYYYMMDD_HHMMSS/` — `metrics.txt`, `metrics.csv`, trajectory plots, `estimated_trajectory.tum`, `ground_truth_aligned.tum`, `diagnostics.npz`, `wiring_summary.json`, `audit_invariants.log`.
 
-Performance is under active iteration; see `docs/PIPELINE_DESIGN_GAPS.md` for current gaps and `docs/PIPELINE_TRACE_SINGLE_DOC.md` for a full trace.
+Performance is under active iteration; see `docs/PIPELINE_DESIGN_GAPS.md` for current gaps.
 
 ---
 
 ## Docs to Start With
 
-- **Pipeline & dataflow:** `docs/IMU_BELIEF_MAP_AND_FUSION.md`
+- **Pipeline order, evidence, depth:** `docs/PIPELINE_ORDER_AND_EVIDENCE.md` (per-scan spine, invariants, depth contract)
+- **Topics and dataflow:** `docs/SYSTEM_DATAFLOW_DIAGRAM.md`
 - **Design gaps / roadmap:** `docs/PIPELINE_DESIGN_GAPS.md`
-- **Trace (single scan):** `docs/PIPELINE_TRACE_SINGLE_DOC.md`
 - **Frame conventions:** `docs/FRAME_AND_QUATERNION_CONVENTIONS.md`
 
 ---
@@ -204,15 +204,14 @@ Performance is under active iteration; see `docs/PIPELINE_DESIGN_GAPS.md` for cu
 | **[AGENTS.md](AGENTS.md)** | Project invariants, quickstart, canonical references |
 | **[CHANGELOG.md](CHANGELOG.md)** | History and design decisions |
 | **docs/KIMERA_DATASET_AND_PIPELINE.md** | Kimera dataset, topics, frames, hardware, pipeline (canonical) |
-| **docs/PIPELINE_TRACE_SINGLE_DOC.md** | Single pipeline trace: value-as-object, spine, IMU/odom/LiDAR, belief/IW, z/performance |
+| **docs/PIPELINE_ORDER_AND_EVIDENCE.md** | Per-scan spine, invariants, depth contract (camera + LiDAR fused) |
+| **docs/SYSTEM_DATAFLOW_DIAGRAM.md** | Topics, nodes, evidence sum, dead-end audit |
 | **docs/GC_SLAM.md** | GC v2 interface and operator contracts |
-| **docs/IMU_BELIEF_MAP_AND_FUSION.md** | Pipeline reference: topics, steps, evidence, fusion |
 | **docs/FRAME_AND_QUATERNION_CONVENTIONS.md** | Frames, quaternions, SE(3) |
 | **docs/PIPELINE_DESIGN_GAPS.md** | Known limitations (cross-sensor consistency, unused covariances, nonlinear approximations) |
+| **docs/MAP_STRUCTURE_BUILD_AND_ISSUES.md** | Map structure (atlas, tiles, MA-Hex), build (association, fuse, insert), visualization (live/post-run), and known issues (color, sparse fill) |
+| **docs/MAP_AND_VISUALIZATION.md** | Map components, update flow, live/post-run viz (conceptual) |
 | **archive/docs/** | Archived dataset/docs |
-| **docs/PREINTEGRATION_STEP_BY_STEP.md** | IMU preintegration steps (including gravity) |
-| **docs/EVALUATION.md** | Evaluation metrics and workflow |
-| **docs/TESTING.md** | Testing framework |
 | **tools/DIAGNOSTIC_TOOLS.md** | Diagnostic and inspection tools |
 | **tools/README_MCP.md** | Code Graph RAG MCP install (GitHub releases only) |
 

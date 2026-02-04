@@ -58,6 +58,13 @@ class MinimalScanTape:
     t_total_ms: float = 0.0
     t_point_budget_ms: float = 0.0
     t_deskew_ms: float = 0.0
+    t_imu_preint_scan_ms: float = 0.0
+    t_imu_preint_int_ms: float = 0.0
+    t_surfel_extraction_ms: float = 0.0
+    t_association_ms: float = 0.0
+    t_visual_pose_ms: float = 0.0
+    t_map_branch_ms: float = 0.0
+    t_map_update_ms: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -96,6 +103,13 @@ class MinimalScanTape:
             "t_total_ms": self.t_total_ms,
             "t_point_budget_ms": self.t_point_budget_ms,
             "t_deskew_ms": self.t_deskew_ms,
+            "t_imu_preint_scan_ms": self.t_imu_preint_scan_ms,
+            "t_imu_preint_int_ms": self.t_imu_preint_int_ms,
+            "t_surfel_extraction_ms": self.t_surfel_extraction_ms,
+            "t_association_ms": self.t_association_ms,
+            "t_visual_pose_ms": self.t_visual_pose_ms,
+            "t_map_branch_ms": self.t_map_branch_ms,
+            "t_map_update_ms": self.t_map_update_ms,
         }
 
     @classmethod
@@ -136,6 +150,13 @@ class MinimalScanTape:
             t_total_ms=float(d.get("t_total_ms", 0.0)),
             t_point_budget_ms=float(d.get("t_point_budget_ms", 0.0)),
             t_deskew_ms=float(d.get("t_deskew_ms", 0.0)),
+            t_imu_preint_scan_ms=float(d.get("t_imu_preint_scan_ms", 0.0)),
+            t_imu_preint_int_ms=float(d.get("t_imu_preint_int_ms", 0.0)),
+            t_surfel_extraction_ms=float(d.get("t_surfel_extraction_ms", 0.0)),
+            t_association_ms=float(d.get("t_association_ms", 0.0)),
+            t_visual_pose_ms=float(d.get("t_visual_pose_ms", 0.0)),
+            t_map_branch_ms=float(d.get("t_map_branch_ms", 0.0)),
+            t_map_update_ms=float(d.get("t_map_update_ms", 0.0)),
         )
 
 
@@ -235,6 +256,13 @@ class DiagnosticsLog:
             "t_total_ms": np.array([t.t_total_ms for t in self.tape]),
             "t_point_budget_ms": np.array([t.t_point_budget_ms for t in self.tape]),
             "t_deskew_ms": np.array([t.t_deskew_ms for t in self.tape]),
+            "t_imu_preint_scan_ms": np.array([t.t_imu_preint_scan_ms for t in self.tape]),
+            "t_imu_preint_int_ms": np.array([t.t_imu_preint_int_ms for t in self.tape]),
+            "t_surfel_extraction_ms": np.array([t.t_surfel_extraction_ms for t in self.tape]),
+            "t_association_ms": np.array([t.t_association_ms for t in self.tape]),
+            "t_visual_pose_ms": np.array([t.t_visual_pose_ms for t in self.tape]),
+            "t_map_branch_ms": np.array([t.t_map_branch_ms for t in self.tape]),
+            "t_map_update_ms": np.array([t.t_map_update_ms for t in self.tape]),
         }
         np.savez_compressed(path, **data)
 
@@ -288,6 +316,13 @@ class DiagnosticsLog:
                 t_total_ms=float(data["t_total_ms"][i]) if "t_total_ms" in data else 0.0,
                 t_point_budget_ms=float(data["t_point_budget_ms"][i]) if "t_point_budget_ms" in data else 0.0,
                 t_deskew_ms=float(data["t_deskew_ms"][i]) if "t_deskew_ms" in data else 0.0,
+                t_imu_preint_scan_ms=float(data["t_imu_preint_scan_ms"][i]) if "t_imu_preint_scan_ms" in data else 0.0,
+                t_imu_preint_int_ms=float(data["t_imu_preint_int_ms"][i]) if "t_imu_preint_int_ms" in data else 0.0,
+                t_surfel_extraction_ms=float(data["t_surfel_extraction_ms"][i]) if "t_surfel_extraction_ms" in data else 0.0,
+                t_association_ms=float(data["t_association_ms"][i]) if "t_association_ms" in data else 0.0,
+                t_visual_pose_ms=float(data["t_visual_pose_ms"][i]) if "t_visual_pose_ms" in data else 0.0,
+                t_map_branch_ms=float(data["t_map_branch_ms"][i]) if "t_map_branch_ms" in data else 0.0,
+                t_map_update_ms=float(data["t_map_update_ms"][i]) if "t_map_update_ms" in data else 0.0,
             )
             log.tape.append(tape_entry)
         log.total_scans = len(log.tape)

@@ -74,6 +74,8 @@ def numpy_to_json(obj):
         return {k: numpy_to_json(v) for k, v in obj.items()}
     if isinstance(obj, list):
         return [numpy_to_json(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [numpy_to_json(v) for v in obj]
     return obj
 
 
@@ -331,11 +333,11 @@ function renderPlots(scanIdx) {{
   ];
   Plotly.newPlot('plot-approx', approxPlot, {{ title: 'Approx / Overconfidence', paper_bgcolor: '#141821', plot_bgcolor: '#141821', font: {{color:'#e9eef5'}} }});
 
-  const heatmap = [{
+  const heatmap = [{{
     z: diagData.L_pose6[scanIdx],
     type: 'heatmap',
     colorscale: 'Viridis'
-  }];
+  }}];
   Plotly.newPlot('plot-heatmap', heatmap, {{ title: 'L_pose6 Heatmap', paper_bgcolor: '#141821', plot_bgcolor: '#141821', font: {{color:'#e9eef5'}} }});
 
   const trajTraces = [];
