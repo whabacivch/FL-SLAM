@@ -56,10 +56,6 @@ install(TARGETS visual_feature_node
 install(PROGRAMS
   scripts/gc_backend_node
   scripts/gc_sensor_hub
-  scripts/odom_normalizer
-  scripts/imu_normalizer
-  scripts/gc_dead_end_audit_node
-  scripts/wiring_auditor
   DESTINATION lib/${PROJECT_NAME}
 )
 

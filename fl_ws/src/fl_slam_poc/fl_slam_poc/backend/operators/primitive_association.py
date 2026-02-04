@@ -514,14 +514,8 @@ def associate_primitives_ot(
             ess_total=ess_ot,
             support_frac=float(n_nonzero_a) / float(max(N_total, 1)),
         ),
-        influence=InfluenceCert(
-            lift_strength=0.0,
-            psd_projection_delta=0.0,
+        influence=InfluenceCert.identity().with_overrides(
             mass_epsilon_ratio=float(eps_m) / (transport_mass_total + eps_m),
-            anchor_drift_rho=0.0,
-            dt_scale=1.0,
-            extrinsic_scale=1.0,
-            trust_alpha=1.0,
         ),
         compute=compute,
     )

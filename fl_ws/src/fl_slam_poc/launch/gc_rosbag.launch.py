@@ -5,7 +5,7 @@ Launches the Geometric Compositional backend with a rosbag for evaluation.
 Default profile: Kimera (PointCloud2 LiDAR, standard IMU).
 
 Architecture:
-    Rosbag → gc_sensor_hub (pointcloud_passthrough, odom_normalizer, imu_normalizer, dead_end_audit)
+    Rosbag → gc_sensor_hub (pointcloud_passthrough)
            → /gc/sensors/* → gc_backend_node → /gc/state, /gc/trajectory, etc.
 
 Camera (always enabled): camera_rgbd_node → /gc/sensors/camera_rgbd (single RGBD topic).
@@ -49,12 +49,6 @@ def generate_launch_description():
         "trajectory_export_path",
         default_value="/tmp/gc_slam_trajectory.tum",
         description="Path to export trajectory in TUM format",
-    )
-
-    wiring_summary_path_arg = DeclareLaunchArgument(
-        "wiring_summary_path",
-        default_value="/tmp/gc_wiring_summary.json",
-        description="Path to write wiring summary JSON at end of run.",
     )
 
     diagnostics_path_arg = DeclareLaunchArgument(
@@ -135,8 +129,14 @@ def generate_launch_description():
         description="GC config file (sensor hub defaults).",
     )
     lidar_topic_arg = DeclareLaunchArgument("lidar_topic", default_value="/gc/sensors/lidar_points")
-    odom_topic_arg = DeclareLaunchArgument("odom_topic", default_value="/gc/sensors/odom")
-    imu_topic_arg = DeclareLaunchArgument("imu_topic", default_value="/gc/sensors/imu")
+    odom_topic_arg = DeclareLaunchArgument(
+        "odom_topic",
+        default_value="/acl_jackal/jackal_velocity_controller/odom",
+    )
+    imu_topic_arg = DeclareLaunchArgument(
+        "imu_topic",
+        default_value="/acl_jackal/forward/imu",
+    )
     odom_frame_arg = DeclareLaunchArgument(
         "odom_frame",
         default_value="acl_jackal2/odom",
@@ -213,9 +213,7 @@ def generate_launch_description():
                 "depth_scale_mm_to_m": True,
                 "pair_max_dt_sec": LaunchConfiguration("camera_pair_max_dt_sec"),
                 "qos_reliability": "best_effort",
-                "enable_time_alignment": True,
-                "time_reference_topic": "/gc/sensors/time_reference",
-                "max_drift_sec": 0.5,
+                "enable_time_alignment": False,
             }
         ],
     )
@@ -299,20 +297,6 @@ def generate_launch_description():
         ],
     )
 
-    # Wiring auditor: collects status from all nodes and produces end-of-run summary
-    wiring_auditor = Node(
-        package="fl_slam_poc",
-        executable="wiring_auditor",
-        name="wiring_auditor",
-        output="screen",
-        parameters=[
-            {
-                "output_json_path": LaunchConfiguration("wiring_summary_path"),
-                "summary_period_sec": 30.0,  # Periodic log every 30s during run
-            }
-        ],
-    )
-
     # =========================================================================
     # Backend Node: load gc_backend.ros__parameters from config_path, merge with launch overrides
     # =========================================================================
@@ -391,7 +375,6 @@ def generate_launch_description():
     return LaunchDescription([
         bag_arg,
         trajectory_path_arg,
-        wiring_summary_path_arg,
         diagnostics_path_arg,
         splat_export_path_arg,
         imu_gravity_scale_arg,
@@ -429,7 +412,6 @@ def generate_launch_description():
         # Sensor Hub (single process)
         gc_sensor_hub,
         # Audit / observability
-        wiring_auditor,
         # Backend (params from config_path gc_backend.ros__parameters + launch overrides)
         gc_backend_with_config,
         # Rosbag

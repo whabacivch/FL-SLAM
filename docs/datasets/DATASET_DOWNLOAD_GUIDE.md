@@ -9,7 +9,7 @@ This project uses the **Kimera** dataset for evaluation. Other datasets are arch
 - **Source:** [MIT-SPARK/Kimera-Multi-Data](https://github.com/MIT-SPARK/Kimera-Multi-Data)
 - **Location:** `rosbags/Kimera_Data/`
 - **Config:** `fl_ws/src/fl_slam_poc/config/gc_kimera.yaml`
-- **Frame mapping:** [KIMERA_FRAME_MAPPING.md](../KIMERA_FRAME_MAPPING.md), [KIMERA_CALIBRATION_AND_FRAME.md](../KIMERA_CALIBRATION_AND_FRAME.md)
+- **Frame mapping and calibration:** [KIMERA_FRAME_MAPPING.md](../KIMERA_FRAME_MAPPING.md)
 
 ### Canonical bag (only one we use; same as run_and_evaluate_gc.sh)
 
@@ -35,4 +35,4 @@ This project uses the **Kimera** dataset for evaluation. Other datasets are arch
 
 ## Other datasets (archived)
 
-M3DGR Dynamic01 and related docs are in `archive/docs/` (e.g. `M3DGR_DYNAMIC01_ARCHIVE.md`). They are not used by the current evaluation script.
+Other archived datasets and related docs are in `archive/docs/`. They are not used by the current evaluation script.

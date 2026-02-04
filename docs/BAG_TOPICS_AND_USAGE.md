@@ -85,7 +85,7 @@ This is the *runtime topic graph* the MVP launch creates (bag inputs → utility
 | Topic | Message type | Producer | Consumer | Notes |
 | --- | --- | --- | --- | --- |
 | `/sim/odom` | `nav_msgs/msg/Odometry` | `odom_bridge` | `frontend_node` (SensorIO), `backend_node` | Delta-odom (absolute→delta). `pose.covariance` is propagated/approximated; `twist` is unused. |
-| `/lidar/points` | `sensor_msgs/msg/PointCloud2` | `livox_converter` | `frontend_node` (SensorIO) | XYZ is consumed today; extra fields are preserved in the message but ignored by current frontend math. |
+| `/gc/sensors/lidar_points` | `sensor_msgs/msg/PointCloud2` | `pointcloud_passthrough` (gc_sensor_hub) | `backend_node` | Native VLP-16 from bag; backend parses with `pointcloud_layout: vlp16`. |
 | `/camera/image_raw` | `sensor_msgs/msg/Image` | `image_decompress_cpp` | `frontend_node` (SensorIO, optional) | Published as `rgb8`. |
 | `/camera/depth/image_raw` | `sensor_msgs/msg/Image` | `image_decompress_cpp` | `frontend_node` (SensorIO, optional) | Published as `32FC1` depth in meters. |
 
@@ -114,19 +114,11 @@ This is the *runtime topic graph* the MVP launch creates (bag inputs → utility
 | `/cdwm/debug` | `std_msgs/msg/String` | `backend_node` | Logging | Human-readable debug messages (not a stable schema). |
 | `/tf` | TF frames | `backend_node` | ROS TF consumers | Backend publishes `odom_frame -> base_link` TF consistent with `/cdwm/state`. Bags may not include TF. |
 
-### Current LiDAR conversion contract (MVP)
+### Current LiDAR path (Kimera)
 
-- **Converter**: `fl_ws/src/fl_slam_poc/fl_slam_poc/frontend/livox_converter.py`
-- **Output**: `sensor_msgs/msg/PointCloud2` on `/lidar/points`
-- **Fields** (current, deterministic schema):
-  - `x,y,z` (float32)
-  - `intensity` (uint8, from reflectivity)
-  - `ring` (uint8, from line)
-  - `tag` (uint8)
-  - `time_offset` (uint32, **only if present** in the Livox point type; treated as raw units)
-  - `timebase_low`, `timebase_high` (uint32, message-level timebase preserved per point)
-
-**Frontend consumption note:** current frontend 3D path reads only `x/y/z` from `PointCloud2` and ignores the other fields (they are preserved for audit/debug and future use).
+- **Hub:** `pointcloud_passthrough` subscribes to `/acl_jackal/lidar_points`, republishes to `/gc/sensors/lidar_points`.
+- **Backend:** Subscribes to `/gc/sensors/lidar_points`; parses with `parse_pointcloud2_vlp16` when `pointcloud_layout: vlp16`. See [POINTCLOUD2_LAYOUTS.md](POINTCLOUD2_LAYOUTS.md).
+- **Fields used:** `x`, `y`, `z`, `ring`; optional `t`/`time` for per-point timestamps; optional `intensity` (not yet consumed).
 
 ### Standard message usage (exact field-level behavior)
 

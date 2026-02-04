@@ -10,7 +10,7 @@ Architecture:
     Rosbag (raw topics)
         │
         ▼
-    gc_sensor_hub: pointcloud_passthrough, odom_normalizer, imu_normalizer, dead_end_audit
+    gc_sensor_hub: pointcloud_passthrough
         │
         ▼
     /gc/sensors/* (canonical topics for backend)
@@ -29,17 +29,11 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
 from fl_slam_poc.frontend.sensors.pointcloud_passthrough import PointcloudPassthroughNode
-from fl_slam_poc.frontend.sensors.odom_normalizer import OdomNormalizerNode
-from fl_slam_poc.frontend.sensors.imu_normalizer import ImuNormalizerNode
-from fl_slam_poc.frontend.audit.dead_end_audit_node import DeadEndAuditNode
 
 
 @dataclass(frozen=True)
 class SensorHubConfig:
     pointcloud_passthrough: Dict[str, Any]
-    odom: Dict[str, Any]
-    imu: Dict[str, Any]
-    dead_end: Dict[str, Any]
 
 
 def _load_hub_config(path: str) -> SensorHubConfig:
@@ -50,17 +44,11 @@ def _load_hub_config(path: str) -> SensorHubConfig:
 
     hub = (data.get("gc_sensor_hub") or {}).get("ros__parameters") or {}
     pointcloud_passthrough = dict(hub.get("pointcloud_passthrough") or {})
-    odom = dict(hub.get("odom_normalizer") or {})
-    imu = dict(hub.get("imu_normalizer") or {})
-    dead_end = dict(hub.get("dead_end_audit") or {})
 
     missing = [
         name
         for name, cfg in [
             ("pointcloud_passthrough", pointcloud_passthrough),
-            ("odom_normalizer", odom),
-            ("imu_normalizer", imu),
-            ("dead_end_audit", dead_end),
         ]
         if not cfg
     ]
@@ -73,9 +61,6 @@ def _load_hub_config(path: str) -> SensorHubConfig:
 
     return SensorHubConfig(
         pointcloud_passthrough=pointcloud_passthrough,
-        odom=odom,
-        imu=imu,
-        dead_end=dead_end,
     )
 
 
@@ -117,14 +102,9 @@ def main() -> None:
     lidar_node = PointcloudPassthroughNode(parameter_overrides=hub_cfg.pointcloud_passthrough)
 
     # Create all frontend nodes with parameter overrides from config.
-    # NOTE: DeadEndAuditNode handles list param type issues internally
-    # (see ROS 2 Jazzy bug workaround in dead_end_audit_node.py).
     nodes = [
         hub_node,
         lidar_node,
-        OdomNormalizerNode(parameter_overrides=hub_cfg.odom),
-        ImuNormalizerNode(parameter_overrides=hub_cfg.imu),
-        DeadEndAuditNode(parameter_overrides=hub_cfg.dead_end),
     ]
 
     threads = int(hub_node.get_parameter("executor_threads").value)

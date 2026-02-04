@@ -21,8 +21,11 @@ Corrected spine for Geometric Compositional SLAM v2 per-scan pipeline: evidence 
 1. **Evidence uses pre-update map.** Visual pose evidence is computed from M_{t-1} and association (π). No fuse/insert before visual_pose_evidence.
 2. **z_lin is IMU+odom-informed.** The linearization point for visual evidence is the posterior mean after fusing only IMU+odom with the predicted belief, not the raw prediction.
 
+## Depth contract
+
+**camera_depth is the authoritative depth sensor (RGB-D).** LiDAR is fused into it via `lidar_depth_evidence` in `splat_prep_fused` (Product-of-Experts: Λf = Λc + Λ_ell, θf = θc + θ_ell). No separate use of raw camera_depth for a different likelihood; one fused depth path only (camera Λc, θc from feature meta + LiDAR Λ_ell, θ_ell from `lidar_depth_evidence`). **Code:** `splat_prep_fused` (frontend/sensors/splat_prep.py) uses camera depth from feature meta and `lidar_depth_evidence` from lidar_camera_depth_fusion.py; backend builds camera batch from RGB + depth; no second path consumes camera_depth.
+
 ## References
 
 - Pipeline and data flow: `docs/IMU_BELIEF_MAP_AND_FUSION.md`
 - Geometric Compositional spec: `docs/GC_SLAM.md`
-- Depth contract: `docs/PIPELINE_DEPTH_CONTRACT.md`

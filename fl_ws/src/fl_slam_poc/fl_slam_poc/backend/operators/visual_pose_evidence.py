@@ -387,12 +387,12 @@ def visual_pose_evidence(
     h_pose = jnp.zeros((22,), dtype=jnp.float64)
 
     # Set translation block [0:3, 0:3]
-    L_pose = L_pose.at[:3, :3].set(L_trans)
-    h_pose = h_pose.at[:3].set(h_trans)
+    L_pose = L_pose.at[constants.GC_IDX_TRANS, constants.GC_IDX_TRANS].set(L_trans)
+    h_pose = h_pose.at[constants.GC_IDX_TRANS].set(h_trans)
 
     # Set rotation block [3:6, 3:6]
-    L_pose = L_pose.at[3:6, 3:6].set(L_rot)
-    h_pose = h_pose.at[3:6].set(h_rot)
+    L_pose = L_pose.at[constants.GC_IDX_ROT, constants.GC_IDX_ROT].set(L_rot)
+    h_pose = h_pose.at[constants.GC_IDX_ROT].set(h_rot)
 
     # Compute diagnostics
     # Note: row_masses = sum_k pi[i,k] is transported mass per measurement (not normalized)
@@ -422,14 +422,8 @@ def visual_pose_evidence(
             ess_total=float(jnp.sum(row_masses)),
             support_frac=float(N_assoc) / float(max(N_meas, 1)),
         ),
-        influence=InfluenceCert(
+        influence=InfluenceCert.identity().with_overrides(
             lift_strength=eps_lift,
-            psd_projection_delta=0.0,
-            mass_epsilon_ratio=0.0,
-            anchor_drift_rho=0.0,
-            dt_scale=1.0,
-            extrinsic_scale=1.0,
-            trust_alpha=1.0,
         ),
     )
 

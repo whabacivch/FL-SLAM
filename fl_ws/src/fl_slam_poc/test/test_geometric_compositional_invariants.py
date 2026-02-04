@@ -226,27 +226,6 @@ class TestSensorHubWiring:
         assert 'executable="gc_sensor_hub"' in text
         assert "gc_unified.yaml" in text
 
-    def test_dead_end_audit_yaml_exists_and_has_topic_specs(self):
-        pkg_root = os.path.dirname(os.path.dirname(__file__))
-        path = os.path.join(pkg_root, "config", "gc_dead_end_audit.yaml")
-        if not os.path.exists(path):
-            pytest.skip("gc_dead_end_audit.yaml not found")
-        with open(path, "r", encoding="utf-8") as f:
-            text = f.read()
-        assert "topic_specs:" in text
-        assert "/camera/imu|sensor_msgs/msg/Imu" in text
-        assert "/vrpn_client_node/UGV/pose|geometry_msgs/msg/PoseStamped" in text
-
-    def test_unified_yaml_contains_dead_end_audit_topic_specs(self):
-        pkg_root = os.path.dirname(os.path.dirname(__file__))
-        path = os.path.join(pkg_root, "config", "gc_unified.yaml")
-        if not os.path.exists(path):
-            pytest.skip("gc_unified.yaml not found")
-        with open(path, "r", encoding="utf-8") as f:
-            text = f.read()
-        assert "dead_end_audit:" in text
-        assert "topic_specs:" in text
-
     def test_gc_rosbag_launch_uses_camera_rgbd_node(self):
         """Single-path camera: launch must use camera_rgbd_node and must not wire the legacy two-node path."""
         pkg_root = os.path.dirname(os.path.dirname(__file__))

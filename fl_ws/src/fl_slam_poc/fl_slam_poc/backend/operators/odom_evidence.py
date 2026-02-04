@@ -54,12 +54,12 @@ def _odom_quadratic_evidence_core(
     T_err = se3_jax.se3_relative(odom_pose, belief_pred_pose)
     xi_err = se3_jax.se3_log(T_err)
     delta_pose_z = pose_se3_to_z_delta(xi_err)
-    delta_z_star = jnp.zeros((D_Z,), dtype=jnp.float64).at[0:6].set(delta_pose_z)
+    delta_z_star = jnp.zeros((D_Z,), dtype=jnp.float64).at[constants.GC_IDX_POSE].set(delta_pose_z)
 
     cov_psd, _ = domain_projection_psd_core(cov_ros, eps_psd)
     L_pose, lift_strength = spd_cholesky_inverse_lifted_core(cov_psd, eps_lift)
 
-    L = jnp.zeros((D_Z, D_Z), dtype=jnp.float64).at[0:6, 0:6].set(L_pose)
+    L = jnp.zeros((D_Z, D_Z), dtype=jnp.float64).at[constants.GC_IDX_POSE, constants.GC_IDX_POSE].set(L_pose)
     h = L @ delta_z_star
 
     nll_proxy = 0.5 * (delta_pose_z @ L_pose @ delta_pose_z)
@@ -140,14 +140,8 @@ def odom_quadratic_evidence(
             near_null_count=int(near_null_count),
         ),
         mismatch=MismatchCert(nll_per_ess=float(nll_proxy), directional_score=0.0),
-        influence=InfluenceCert(
+        influence=InfluenceCert.identity().with_overrides(
             lift_strength=float(lift_strength),
-            psd_projection_delta=0.0,
-            mass_epsilon_ratio=0.0,
-            anchor_drift_rho=0.0,
-            dt_scale=1.0,
-            extrinsic_scale=1.0,
-            trust_alpha=1.0,
         ),
     )
 
@@ -158,4 +152,3 @@ def odom_quadratic_evidence(
     )
 
     return OdomEvidenceResult(L_odom=L, h_odom=h, delta_z_star=delta_z_star), cert, effect
-

@@ -135,12 +135,12 @@ def imu_preintegration_factor(
     h = jnp.zeros((D_Z,), dtype=jnp.float64)
 
     # Position evidence at indices 0:3
-    L = L.at[0:3, 0:3].set(L_p_scaled)
-    h = h.at[0:3].set(L_p_scaled @ r_pos)
+    L = L.at[constants.GC_IDX_TRANS, constants.GC_IDX_TRANS].set(L_p_scaled)
+    h = h.at[constants.GC_IDX_TRANS].set(L_p_scaled @ r_pos)
 
     # Velocity evidence at indices 6:9
-    L = L.at[6:9, 6:9].set(L_v_scaled)
-    h = h.at[6:9].set(L_v_scaled @ r_vel)
+    L = L.at[constants.GC_IDX_VEL, constants.GC_IDX_VEL].set(L_v_scaled)
+    h = h.at[constants.GC_IDX_VEL].set(L_v_scaled @ r_vel)
 
     # NLL proxy for diagnostics
     nll_vel = 0.5 * float(r_vel @ L_v @ r_vel)
@@ -166,14 +166,8 @@ def imu_preintegration_factor(
             near_null_count=int(jnp.sum(eigvals < eps_psd)),
         ),
         mismatch=MismatchCert(nll_per_ess=nll_proxy, directional_score=0.0),
-        influence=InfluenceCert(
+        influence=InfluenceCert.identity().with_overrides(
             lift_strength=float(lift_v + lift_p),
-            psd_projection_delta=0.0,
-            mass_epsilon_ratio=0.0,
-            anchor_drift_rho=0.0,
-            dt_scale=1.0,
-            extrinsic_scale=1.0,
-            trust_alpha=1.0,
         ),
     )
 

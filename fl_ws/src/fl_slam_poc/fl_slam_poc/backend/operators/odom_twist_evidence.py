@@ -110,11 +110,11 @@ def odom_velocity_evidence(
 
     # Build 22D information matrix (velocity at indices 6:9)
     L_vel = jnp.zeros((D_Z, D_Z), dtype=jnp.float64)
-    L_vel = L_vel.at[6:9, 6:9].set(L_vel_3x3)
+    L_vel = L_vel.at[constants.GC_IDX_VEL, constants.GC_IDX_VEL].set(L_vel_3x3)
 
     # Information vector
     h_vel = jnp.zeros((D_Z,), dtype=jnp.float64)
-    h_vel = h_vel.at[6:9].set(L_vel_3x3 @ r_vel)
+    h_vel = h_vel.at[constants.GC_IDX_VEL].set(L_vel_3x3 @ r_vel)
 
     # NLL proxy
     nll_proxy = 0.5 * float(r_vel @ L_vel_3x3 @ r_vel)
@@ -135,14 +135,8 @@ def odom_velocity_evidence(
             cond=cond,
             near_null_count=int(jnp.sum(eigvals < 1e-12)),
         ),
-        influence=InfluenceCert(
+        influence=InfluenceCert.identity().with_overrides(
             lift_strength=float(lift_strength),
-            psd_projection_delta=0.0,
-            mass_epsilon_ratio=0.0,
-            anchor_drift_rho=0.0,
-            dt_scale=1.0,
-            extrinsic_scale=1.0,
-            trust_alpha=1.0,
         ),
     )
 
@@ -208,11 +202,12 @@ def odom_yawrate_evidence(
     # For yaw rate, we constrain the z-component of the rotation block
     # Rotation is at indices 3:6, and z (yaw) is the third component (index 5)
     L_wz = jnp.zeros((D_Z, D_Z), dtype=jnp.float64)
-    L_wz = L_wz.at[5, 5].set(precision_wz)
+    yaw_idx = constants.GC_IDX_ROT.start + 2
+    L_wz = L_wz.at[yaw_idx, yaw_idx].set(precision_wz)
 
     # Information vector
     h_wz = jnp.zeros((D_Z,), dtype=jnp.float64)
-    h_wz = h_wz.at[5].set(precision_wz * r_wz)
+    h_wz = h_wz.at[yaw_idx].set(precision_wz * r_wz)
 
     # NLL proxy
     nll_proxy = 0.5 * r_wz ** 2 * precision_wz
@@ -221,15 +216,7 @@ def odom_yawrate_evidence(
         chart_id=chart_id,
         anchor_id=anchor_id,
         triggers=["OdomYawRateEvidence"],
-        influence=InfluenceCert(
-            lift_strength=0.0,
-            psd_projection_delta=0.0,
-            mass_epsilon_ratio=0.0,
-            anchor_drift_rho=0.0,
-            dt_scale=1.0,
-            extrinsic_scale=1.0,
-            trust_alpha=1.0,
-        ),
+        influence=InfluenceCert.identity(),
     )
 
     effect = ExpectedEffect(
@@ -361,13 +348,13 @@ def pose_twist_kinematic_consistency(
     # Build 22D information matrix
     # Translation at indices 0:3, rotation at indices 3:6
     L_consistency = jnp.zeros((D_Z, D_Z), dtype=jnp.float64)
-    L_consistency = L_consistency.at[0:3, 0:3].set(L_trans_3x3)
-    L_consistency = L_consistency.at[3:6, 3:6].set(L_rot_3x3)
+    L_consistency = L_consistency.at[constants.GC_IDX_TRANS, constants.GC_IDX_TRANS].set(L_trans_3x3)
+    L_consistency = L_consistency.at[constants.GC_IDX_ROT, constants.GC_IDX_ROT].set(L_rot_3x3)
 
     # Information vector
     h_consistency = jnp.zeros((D_Z,), dtype=jnp.float64)
-    h_consistency = h_consistency.at[0:3].set(L_trans_3x3 @ r_trans)
-    h_consistency = h_consistency.at[3:6].set(L_rot_3x3 @ r_rot)
+    h_consistency = h_consistency.at[constants.GC_IDX_TRANS].set(L_trans_3x3 @ r_trans)
+    h_consistency = h_consistency.at[constants.GC_IDX_ROT].set(L_rot_3x3 @ r_rot)
 
     # NLL proxy
     nll_trans = 0.5 * float(r_trans @ L_trans_3x3 @ r_trans)
@@ -391,14 +378,8 @@ def pose_twist_kinematic_consistency(
             cond=cond,
             near_null_count=0,
         ),
-        influence=InfluenceCert(
+        influence=InfluenceCert.identity().with_overrides(
             lift_strength=float(lift_trans + lift_rot),
-            psd_projection_delta=0.0,
-            mass_epsilon_ratio=0.0,
-            anchor_drift_rho=0.0,
-            dt_scale=1.0,
-            extrinsic_scale=1.0,
-            trust_alpha=1.0,
         ),
     )
 
@@ -437,13 +418,7 @@ def odom_dependence_inflation(
         chart_id=chart_id,
         anchor_id=anchor_id,
         triggers=["OdomDependenceInflation"],
-        influence=InfluenceCert(
-            lift_strength=0.0,
-            psd_projection_delta=0.0,
-            mass_epsilon_ratio=0.0,
-            anchor_drift_rho=0.0,
-            dt_scale=1.0,
-            extrinsic_scale=1.0,
+        influence=InfluenceCert.identity().with_overrides(
             trust_alpha=float(scale),
         ),
     )

@@ -100,14 +100,15 @@ def planar_z_prior(
     # Build 22D information matrix with z constraint
     # State ordering: [trans(0:3), rot(3:6), vel(6:9), bg(9:12), ba(12:15), dt(15:16), ex(16:22)]
     # z is at index 2
+    z_idx = constants.GC_IDX_TRANS.start + 2
     L_planar = jnp.zeros((D_Z, D_Z), dtype=jnp.float64)
-    L_planar = L_planar.at[2, 2].set(precision_z)
+    L_planar = L_planar.at[z_idx, z_idx].set(precision_z)
 
     # Information vector: h = L @ delta, where delta is the desired increment.
     # For this unary prior, the desired pose increment is delta_z = (z_ref - z_pred),
     # so h[2] = precision_z * (z_ref - z_pred).
     h_planar = jnp.zeros((D_Z,), dtype=jnp.float64)
-    h_planar = h_planar.at[2].set(precision_z * r_z)
+    h_planar = h_planar.at[z_idx].set(precision_z * r_z)
 
     # NLL proxy for diagnostics
     nll_proxy = 0.5 * r_z ** 2 * precision_z
@@ -117,15 +118,7 @@ def planar_z_prior(
         chart_id=chart_id,
         anchor_id=anchor_id,
         triggers=["PlanarZPrior"],
-        influence=InfluenceCert(
-            lift_strength=0.0,
-            psd_projection_delta=0.0,
-            mass_epsilon_ratio=0.0,
-            anchor_drift_rho=0.0,
-            dt_scale=1.0,
-            extrinsic_scale=1.0,
-            trust_alpha=1.0,
-        ),
+        influence=InfluenceCert.identity(),
     )
 
     effect = ExpectedEffect(
@@ -174,12 +167,13 @@ def velocity_z_prior(
     precision_vz = 1.0 / (sigma_vz ** 2)
 
     # Build 22D information matrix with vel_z constraint
+    vz_idx = constants.GC_IDX_VEL.start + 2
     L_vz = jnp.zeros((D_Z, D_Z), dtype=jnp.float64)
-    L_vz = L_vz.at[8, 8].set(precision_vz)
+    L_vz = L_vz.at[vz_idx, vz_idx].set(precision_vz)
 
     # Information vector: h[8] = precision * (0 - v_z_pred) (pulling toward 0)
     h_vz = jnp.zeros((D_Z,), dtype=jnp.float64)
-    h_vz = h_vz.at[8].set(precision_vz * r_vz)
+    h_vz = h_vz.at[vz_idx].set(precision_vz * r_vz)
 
     # NLL proxy
     nll_proxy = 0.5 * r_vz ** 2 * precision_vz
@@ -189,15 +183,7 @@ def velocity_z_prior(
         chart_id=chart_id,
         anchor_id=anchor_id,
         triggers=["VelocityZPrior"],
-        influence=InfluenceCert(
-            lift_strength=0.0,
-            psd_projection_delta=0.0,
-            mass_epsilon_ratio=0.0,
-            anchor_drift_rho=0.0,
-            dt_scale=1.0,
-            extrinsic_scale=1.0,
-            trust_alpha=1.0,
-        ),
+        influence=InfluenceCert.identity(),
     )
 
     effect = ExpectedEffect(

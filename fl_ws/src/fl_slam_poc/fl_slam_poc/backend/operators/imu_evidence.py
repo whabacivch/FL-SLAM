@@ -230,9 +230,9 @@ def imu_vmf_gravity_evidence(
 
     L = jnp.zeros((D_Z, D_Z), dtype=jnp.float64)
     # GC ordering: [trans(0:3), rot(3:6)] - rotation evidence goes to [3:6] block
-    L = L.at[3:6, 3:6].set(H_rot_psd)
+    L = L.at[constants.GC_IDX_ROT, constants.GC_IDX_ROT].set(H_rot_psd)
     h = jnp.zeros((D_Z,), dtype=jnp.float64)
-    h = h.at[3:6].set(-g_rot)
+    h = h.at[constants.GC_IDX_ROT].set(-g_rot)
 
     nll_proxy = float(-kappa_f * (mu0 @ xbar))
     # Conditioning comes from the PSD projection certificate (already clamped).
@@ -254,14 +254,8 @@ def imu_vmf_gravity_evidence(
         ),
         support=SupportCert(ess_total=float(ess), support_frac=1.0),
         mismatch=MismatchCert(nll_per_ess=nll_proxy / (float(ess) + eps_mass), directional_score=float(Rbar)),
-        influence=InfluenceCert(
-            lift_strength=0.0,
+        influence=InfluenceCert.identity().with_overrides(
             psd_projection_delta=proj_delta,
-            mass_epsilon_ratio=0.0,
-            anchor_drift_rho=0.0,
-            dt_scale=1.0,
-            extrinsic_scale=1.0,
-            trust_alpha=1.0,
         ),
     )
 
@@ -506,9 +500,9 @@ def imu_vmf_gravity_evidence_time_resolved(
     H_rot_psd, H_cert_vec = domain_projection_psd_core(H_rot, eps_psd)
 
     L = jnp.zeros((D_Z, D_Z), dtype=jnp.float64)
-    L = L.at[3:6, 3:6].set(H_rot_psd)
+    L = L.at[constants.GC_IDX_ROT, constants.GC_IDX_ROT].set(H_rot_psd)
     h = jnp.zeros((D_Z,), dtype=jnp.float64)
-    h = h.at[3:6].set(-g_rot)
+    h = h.at[constants.GC_IDX_ROT].set(-g_rot)
 
     nll_proxy = float(-kappa_f * (mu0 @ xbar))
 
@@ -539,13 +533,9 @@ def imu_vmf_gravity_evidence_time_resolved(
             nll_per_ess=nll_proxy / (float(ess_weighted) + eps_mass),
             directional_score=float(Rbar),
         ),
-        influence=InfluenceCert(
-            lift_strength=0.0,
+        influence=InfluenceCert.identity().with_overrides(
             psd_projection_delta=proj_delta,
             mass_epsilon_ratio=float(ess_weighted) / (float(ess_raw) + eps_mass),  # Reliability ratio
-            anchor_drift_rho=0.0,
-            dt_scale=1.0,
-            extrinsic_scale=1.0,
             trust_alpha=mean_reliability,
         ),
     )
@@ -587,13 +577,7 @@ def imu_dependence_inflation(
         chart_id=chart_id,
         anchor_id=anchor_id,
         triggers=["ImuDependenceInflation"],
-        influence=InfluenceCert(
-            lift_strength=0.0,
-            psd_projection_delta=0.0,
-            mass_epsilon_ratio=0.0,
-            anchor_drift_rho=0.0,
-            dt_scale=1.0,
-            extrinsic_scale=1.0,
+        influence=InfluenceCert.identity().with_overrides(
             trust_alpha=float(scale),
         ),
     )

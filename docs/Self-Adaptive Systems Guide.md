@@ -1898,7 +1898,7 @@ class AdaptiveDiagnosticsPublisher:
 
 ### 7.1 Mathematical Foundation
 
-Monge-Ampère equations govern optimal transport between probability densities, enabling self-adaptive warping of maps or covariances in dynamic environments. This is ideal for handling edge cases like scene flow (e.g., moving objects in M3DGR bag) or merging degraded submaps.
+Monge-Ampère equations govern optimal transport between probability densities, enabling self-adaptive warping of maps or covariances in dynamic environments. This is ideal for handling edge cases like scene flow (e.g., moving objects in dynamic scenes) or merging degraded submaps.
 
 **Key Equation (Monge-Ampère):**
 
@@ -2352,7 +2352,7 @@ class AdaptiveCoordinator:
 
 ### 7.5 Evaluation Notes
 
-For benchmarking on dynamic sequences (e.g., TUM RGB-D dynamic, M3DGR):
+For benchmarking on dynamic sequences (e.g., TUM RGB-D dynamic):
 
 1. **Metric:** Compare ATE/RPE with and without transport adaptation
 2. **Target:** <5% drift reduction in dynamic scenes

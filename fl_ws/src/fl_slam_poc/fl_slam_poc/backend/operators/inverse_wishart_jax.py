@@ -96,25 +96,27 @@ def process_noise_iw_suffstats_from_info_jax(
     # GC state ordering: [trans(0:3), rot(3:6), vel, bg, ba, dt, ex]
     # IW blocks follow GC ordering: 0=trans, 1=rot, 2=vel, 3=bg, 4=ba, 5=dt, 6=ex
     r_pad = jnp.zeros((7, 6), dtype=jnp.float64)
-    r_pad = r_pad.at[0, :3].set(r[0:3])       # trans (from GC indices 0:3)
-    r_pad = r_pad.at[1, :3].set(r[3:6])       # rot (from GC indices 3:6)
-    r_pad = r_pad.at[2, :3].set(r[6:9])       # vel
-    r_pad = r_pad.at[3, :3].set(r[9:12])      # bg
-    r_pad = r_pad.at[4, :3].set(r[12:15])     # ba
-    r_pad = r_pad.at[5, 0].set(r[15])         # dt
-    r_pad = r_pad.at[6, :6].set(r[16:22])     # ex
+    r_pad = r_pad.at[0, :3].set(r[C.GC_IDX_TRANS])   # trans (from GC indices 0:3)
+    r_pad = r_pad.at[1, :3].set(r[C.GC_IDX_ROT])     # rot (from GC indices 3:6)
+    r_pad = r_pad.at[2, :3].set(r[C.GC_IDX_VEL])     # vel
+    r_pad = r_pad.at[3, :3].set(r[C.GC_IDX_BG])      # bg
+    r_pad = r_pad.at[4, :3].set(r[C.GC_IDX_BA])      # ba
+    r_pad = r_pad.at[5, 0].set(r[C.GC_IDX_DT])       # dt
+    r_pad = r_pad.at[6, :6].set(r[C.GC_IDX_EX])      # ex
 
     rrT = jnp.einsum("bi,bj->bij", r_pad, r_pad)  # (7,6,6)
 
     # Same mapping: IW blocks follow GC ordering [trans, rot, ...]
     Sigma_blocks = jnp.zeros((7, 6, 6), dtype=jnp.float64)
-    Sigma_blocks = Sigma_blocks.at[0, :3, :3].set(Sigma_post[0:3, 0:3])    # trans block
-    Sigma_blocks = Sigma_blocks.at[1, :3, :3].set(Sigma_post[3:6, 3:6])    # rot block
-    Sigma_blocks = Sigma_blocks.at[2, :3, :3].set(Sigma_post[6:9, 6:9])    # vel
-    Sigma_blocks = Sigma_blocks.at[3, :3, :3].set(Sigma_post[9:12, 9:12])  # bg
-    Sigma_blocks = Sigma_blocks.at[4, :3, :3].set(Sigma_post[12:15, 12:15])  # ba
-    Sigma_blocks = Sigma_blocks.at[5, :1, :1].set(Sigma_post[15:16, 15:16])  # dt
-    Sigma_blocks = Sigma_blocks.at[6, :6, :6].set(Sigma_post[16:22, 16:22])  # ex
+    Sigma_blocks = Sigma_blocks.at[0, :3, :3].set(Sigma_post[C.GC_IDX_TRANS, C.GC_IDX_TRANS])  # trans block
+    Sigma_blocks = Sigma_blocks.at[1, :3, :3].set(Sigma_post[C.GC_IDX_ROT, C.GC_IDX_ROT])      # rot block
+    Sigma_blocks = Sigma_blocks.at[2, :3, :3].set(Sigma_post[C.GC_IDX_VEL, C.GC_IDX_VEL])      # vel
+    Sigma_blocks = Sigma_blocks.at[3, :3, :3].set(Sigma_post[C.GC_IDX_BG, C.GC_IDX_BG])        # bg
+    Sigma_blocks = Sigma_blocks.at[4, :3, :3].set(Sigma_post[C.GC_IDX_BA, C.GC_IDX_BA])        # ba
+    Sigma_blocks = Sigma_blocks.at[5, :1, :1].set(
+        Sigma_post[slice(C.GC_IDX_DT, C.GC_IDX_DT + 1), slice(C.GC_IDX_DT, C.GC_IDX_DT + 1)]
+    )  # dt
+    Sigma_blocks = Sigma_blocks.at[6, :6, :6].set(Sigma_post[C.GC_IDX_EX, C.GC_IDX_EX])        # ex
 
     dPsi = (rrT + Sigma_blocks) * PROCESS_BLOCK_MASKS
     dnu = jnp.ones((7,), dtype=jnp.float64)

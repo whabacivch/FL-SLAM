@@ -65,7 +65,7 @@ from fl_slam_poc.backend.operators import (
     visual_pose_evidence,
     build_visual_pose_evidence_22d,
 )
-from fl_slam_poc.backend.diagnostics import ScanDiagnostics, MinimalScanTape
+from fl_slam_poc.backend.diagnostics import MinimalScanTape
 
 # Stage 1: PrimitiveMap + OT imports
 from fl_slam_poc.backend.structures import (
@@ -165,8 +165,8 @@ class PipelineConfig:
     # Profiling / timing
     enable_timing: bool = False  # If True, record per-stage timings (ms) in diagnostics
 
-    # Diagnostics: minimal tape (default) vs full ScanDiagnostics per scan
-    save_full_diagnostics: bool = False  # If True, build full ScanDiagnostics; else minimal tape only
+    # Diagnostics: minimal tape only (full ScanDiagnostics removed)
+    save_full_diagnostics: bool = False  # Deprecated; minimal tape is always recorded
 
     # Parallelize independent stages (IMU+odom evidence vs surfel/association prep)
     enable_parallel_stages: bool = False
@@ -190,6 +190,10 @@ class PipelineConfig:
     primitive_cull_weight_threshold: float = constants.GC_PRIMITIVE_CULL_WEIGHT_THRESHOLD
     # Fixed-budget insertion each scan (per-tile)
     k_insert_tile: int = constants.GC_K_INSERT_TILE
+    # Fixed-budget merge-reduce per tile (number of pairs to merge)
+    k_merge_pairs_tile: int = constants.GC_K_MERGE_PAIRS_PER_TILE
+    # Fixed-budget merge-reduce cap (avoid O(M^2) when tile is large)
+    primitive_merge_max_tile_size: int = constants.GC_PRIMITIVE_MERGE_MAX_TILE_SIZE
 
     # Atlas tiling budgets (Phase 6 end state; spec §5.7)
     H_TILE: float = constants.GC_H_TILE
@@ -239,15 +243,15 @@ class ScanPipelineResult:
     iw_lidar_bucket_dnu: jnp.ndarray   # (K,)
     all_certs: List[CertBundle]
     aggregated_cert: CertBundle
-    # Per-scan diagnostics for dashboard (Stage-0 schema)
-    diagnostics: Optional[ScanDiagnostics] = None
-    diagnostics_tape: Optional[MinimalScanTape] = None  # When save_full_diagnostics is False
+    # Per-scan diagnostics tape for dashboard (minimal-only)
+    diagnostics_tape: Optional[MinimalScanTape] = None
     # PrimitiveMap update results
     primitive_map_updated: Optional[AtlasMap] = None
     measurement_batch: Optional[MeasurementBatch] = None
     n_primitives_inserted: int = 0
     n_primitives_fused: int = 0
     n_primitives_culled: int = 0
+    n_primitives_merged: int = 0
     event_log_entries: Optional[list] = None
 
 
@@ -431,7 +435,7 @@ def process_scan_single_hypothesis(
     # =========================================================================
     # Time-warp width from dt uncertainty (continuous; no thresholding)
     _mu_pred, Sigma_pred, _lift = belief_pred.to_moments(eps_lift=config.eps_lift)
-    dt_std = jnp.sqrt(Sigma_pred[15, 15])
+    dt_std = jnp.sqrt(Sigma_pred[constants.GC_IDX_DT, constants.GC_IDX_DT])
     sigma_warp = float(jnp.maximum(dt_std, 0.01))
     # Two IMU membership windows:
     # - w_imu_scan: within-scan window for deskew (uses per-point timestamps)
@@ -451,8 +455,8 @@ def process_scan_single_hypothesis(
 
     # Biases from predicted belief increment
     mu_inc = belief_pred.mean_increment(eps_lift=config.eps_lift)
-    gyro_bias = mu_inc[9:12]
-    accel_bias = mu_inc[12:15]
+    gyro_bias = mu_inc[constants.GC_IDX_BG]
+    accel_bias = mu_inc[constants.GC_IDX_BA]
 
     pose0 = belief_prev.mean_world_pose(eps_lift=config.eps_lift)
     rotvec0 = pose0[3:6]
@@ -524,41 +528,6 @@ def process_scan_single_hypothesis(
     valid_mask_np = imu_stamps_np > 0.0
     n_valid = int(np.sum(valid_mask_np))
     if n_valid >= 2:
-        valid_stamps_raw = imu_stamps_np[valid_mask_np]
-        dt_valid = np.diff(valid_stamps_raw)
-        imu_dt_valid_min = float(np.min(dt_valid))
-        imu_dt_valid_max = float(np.max(dt_valid))
-        imu_dt_valid_mean = float(np.mean(dt_valid))
-        imu_dt_valid_median = float(np.median(dt_valid))
-        imu_dt_valid_std = float(np.std(dt_valid, ddof=1)) if dt_valid.size > 1 else 0.0
-        imu_dt_valid_nonpos = int(np.sum(dt_valid <= 0.0))
-    else:
-        imu_dt_valid_min = 0.0
-        imu_dt_valid_max = 0.0
-        imu_dt_valid_mean = 0.0
-        imu_dt_valid_median = 0.0
-        imu_dt_valid_std = 0.0
-        imu_dt_valid_nonpos = 0
-
-    dt_full = np.concatenate([imu_stamps_np[1:] - imu_stamps_np[:-1], np.zeros((1,), dtype=np.float64)], axis=0)
-    dt_full = np.maximum(dt_full, 0.0)
-    w_imu_int_np = np.asarray(w_imu_int, dtype=np.float64).reshape(-1)
-    w_floor = float(constants.GC_WEIGHT_FLOOR)
-    denom = max(1.0 - w_floor, 1e-12)
-    w_raw = (w_imu_int_np - w_floor) / denom
-    w_raw = np.maximum(w_raw, 0.0)
-    w_raw = w_raw * valid_mask_np.astype(np.float64)
-    w_sum = float(np.sum(w_raw))
-    if w_sum > 0.0:
-        imu_dt_weighted_mean = float(np.sum(w_raw * dt_full) / w_sum)
-        imu_dt_weighted_std = float(np.sqrt(np.sum(w_raw * (dt_full - imu_dt_weighted_mean) ** 2) / w_sum))
-        imu_dt_weighted_sum = float(np.sum(w_raw * dt_full))
-    else:
-        imu_dt_weighted_mean = 0.0
-        imu_dt_weighted_std = 0.0
-        imu_dt_weighted_sum = 0.0
-
-    if n_valid >= 2:
         valid = np.sort(imu_stamps_np[valid_mask_np])
         dt_imu = float((valid[-1] - valid[0]) / max(n_valid - 1, 1))
     else:
@@ -575,10 +544,9 @@ def process_scan_single_hypothesis(
     w_norm_imu_int = w_imu_int_valid / w_sum_imu_int
     omega_avg = jnp.einsum("m,mi->i", w_norm_imu_int, (imu_gyro - gyro_bias[None, :]))
     
-    # Diagnostic: omega_avg sanity (no heuristics / no gating).
-    _omega_avg_np = np.array(omega_avg)
-    if not np.all(np.isfinite(_omega_avg_np)):
-        raise ValueError(f"omega_avg contains non-finite values: {_omega_avg_np}")
+    # Diagnostic: omega_avg sanity (no heuristics / no gating). JAX check, sync only on failure.
+    if not bool(jnp.all(jnp.isfinite(omega_avg))):
+        raise ValueError(f"omega_avg contains non-finite values: {omega_avg}")
 
     iw_meas_gyro_dPsi, iw_meas_gyro_dnu = imu_gyro_meas_iw_suffstats_from_avg_rate_jax(
         imu_gyro=imu_gyro,
@@ -662,15 +630,13 @@ def process_scan_single_hypothesis(
         )
         local_certs.append(dep_cert_local)
         Sigma_g_local = jnp.asarray(config.Sigma_g, dtype=jnp.float64)
-        _rotvec0_np = np.array(rotvec0)
-        _pose_pred_np = np.array(pose_pred_local)
-        _delta_pose_int_np = np.array(delta_pose_int)
-        if not np.all(np.isfinite(_rotvec0_np)):
-            raise ValueError(f"rotvec0 contains NaN: {_rotvec0_np}")
-        if not np.all(np.isfinite(_pose_pred_np)):
-            raise ValueError(f"pose_pred contains NaN: {_pose_pred_np}")
-        if not np.all(np.isfinite(_delta_pose_int_np)):
-            raise ValueError(f"delta_pose_int contains NaN: {_delta_pose_int_np}")
+        # JAX finite checks; sync only on failure for error message.
+        if not bool(jnp.all(jnp.isfinite(rotvec0))):
+            raise ValueError(f"rotvec0 contains NaN: {rotvec0}")
+        if not bool(jnp.all(jnp.isfinite(pose_pred_local))):
+            raise ValueError(f"pose_pred contains NaN: {pose_pred_local}")
+        if not bool(jnp.all(jnp.isfinite(delta_pose_int))):
+            raise ValueError(f"delta_pose_int contains NaN: {delta_pose_int}")
         gyro_result_local, gyro_cert_local, _ = imu_gyro_rotation_evidence(
             rotvec_start_WB=rotvec0,
             rotvec_end_pred_WB=pose_pred_local[3:6],
@@ -684,8 +650,8 @@ def process_scan_single_hypothesis(
         )
         local_certs.append(gyro_cert_local)
         mu_prev_local = belief_prev.mean_increment(eps_lift=config.eps_lift)
-        v_start_world_local = mu_prev_local[6:9]
-        v_pred_world_local = mu_inc[6:9]
+        v_start_world_local = mu_prev_local[constants.GC_IDX_VEL]
+        v_pred_world_local = mu_inc[constants.GC_IDX_VEL]
         Sigma_a_local = jnp.asarray(config.Sigma_a, dtype=jnp.float64)
         preint_result_local, preint_cert_local, _ = imu_preintegration_factor(
             p_start_world=pose0[0:3],
@@ -712,7 +678,7 @@ def process_scan_single_hypothesis(
             anchor_id=belief_pred.anchor_id,
         )
         local_certs.append(planar_cert_local)
-        vz_pred_local = float(mu_inc[8])
+        vz_pred_local = float(mu_inc[constants.GC_IDX_VEL][2])
         vz_result_local, vz_cert_local, _ = velocity_z_prior(
             v_z_pred=vz_pred_local,
             sigma_vz=config.planar_vz_sigma,
@@ -720,7 +686,7 @@ def process_scan_single_hypothesis(
             anchor_id=belief_pred.anchor_id,
         )
         local_certs.append(vz_cert_local)
-        v_pred_world_early = mu_inc[6:9]
+        v_pred_world_early = mu_inc[constants.GC_IDX_VEL]
         R_world_body_early = se3_jax.so3_exp(pose_pred_local[3:6])
         odom_vel_result_local, odom_vel_cert_local, _ = odom_velocity_evidence(
             v_pred_world=v_pred_world_early,
@@ -787,7 +753,7 @@ def process_scan_single_hypothesis(
         h_fused_local = belief_pred.h + h_imu_odom_local
         L_fused_psd_local = domain_projection_psd(L_fused_local, config.eps_psd).M_psd
         z_lin_22d_local = spd_cholesky_solve_lifted(L_fused_psd_local, h_fused_local, config.eps_lift).x
-        z_lin_pose_local = z_lin_22d_local[0:6]
+        z_lin_pose_local = z_lin_22d_local[constants.GC_IDX_POSE]
         return {
             "certs": local_certs,
             "odom_cert": odom_cert_local,
@@ -957,6 +923,7 @@ def process_scan_single_hypothesis(
     n_primitives_inserted = 0
     n_primitives_fused = 0
     n_primitives_culled = 0
+    n_primitives_merged = 0
     fused_mass_total = 0.0
     insert_mass_total = 0.0
     insert_mass_p95 = 0.0
@@ -1064,13 +1031,12 @@ def process_scan_single_hypothesis(
     L_evidence_raw = L_imu_odom + L_lidar
     h_evidence_raw = h_imu_odom + h_lidar
 
-    # Diagnostic: check which evidence component has NaN
+    # Diagnostic: check which evidence component has NaN. JAX checks; sync only on failure.
     for name, L in [("L_lidar", L_lidar), ("L_odom", odom_result.L_odom),
                     ("L_imu", imu_result.L_imu), ("L_gyro", gyro_result.L_gyro),
                     ("L_imu_preint", preint_result.L_imu_preint)]:
-        L_np = np.array(L)
-        if not np.all(np.isfinite(L_np)):
-            nan_pos = np.argwhere(~np.isfinite(L_np))[:5]
+        if not bool(jnp.all(jnp.isfinite(L))):
+            nan_pos = np.array(jnp.argwhere(~jnp.isfinite(L))[:5])
             raise ValueError(f"{name} contains NaN at positions {nan_pos.tolist()}")
 
     # -------------------------------------------------------------------------
@@ -1095,8 +1061,16 @@ def process_scan_single_hypothesis(
 
     # Observability sentinels are computed from the *raw* evidence to avoid fixed-point iteration.
     eps = float(config.eps_mass)
-    dt_pose_raw = jnp.linalg.norm(L_evidence_raw[15, 0:6]) + jnp.linalg.norm(L_evidence_raw[0:6, 15])
-    dt_vel_raw = jnp.linalg.norm(L_evidence_raw[15, 6:9]) + jnp.linalg.norm(L_evidence_raw[6:9, 15])
+    dt_pose_raw = jnp.linalg.norm(
+        L_evidence_raw[constants.GC_IDX_DT, constants.GC_IDX_POSE]
+    ) + jnp.linalg.norm(
+        L_evidence_raw[constants.GC_IDX_POSE, constants.GC_IDX_DT]
+    )
+    dt_vel_raw = jnp.linalg.norm(
+        L_evidence_raw[constants.GC_IDX_DT, constants.GC_IDX_VEL]
+    ) + jnp.linalg.norm(
+        L_evidence_raw[constants.GC_IDX_VEL, constants.GC_IDX_DT]
+    )
     dt_asym_raw = jnp.abs(dt_vel_raw - dt_pose_raw) / (dt_vel_raw + dt_pose_raw + eps)
     dt_asym_raw = jnp.clip(dt_asym_raw, 0.0, 1.0)
     L_xx_raw = jnp.abs(L_evidence_raw[0, 0])
@@ -1129,10 +1103,7 @@ def process_scan_single_hypothesis(
         anchor_id=belief_pred.anchor_id,
         triggers=["PowerTempering"],
         frobenius_applied=abs(1.0 - beta) > 0.0,
-        influence=InfluenceCert(
-            dt_scale=1.0,
-            extrinsic_scale=1.0,
-            trust_alpha=1.0,
+        influence=InfluenceCert.identity().with_overrides(
             power_beta=beta,
         ),
     )
@@ -1152,14 +1123,9 @@ def process_scan_single_hypothesis(
         chart_id=belief_pred.chart_id,
         anchor_id=belief_pred.anchor_id,
         triggers=["ExcitationPriorScaling"],
-        influence=InfluenceCert(
-            lift_strength=0.0,
-            psd_projection_delta=0.0,
-            mass_epsilon_ratio=0.0,
-            anchor_drift_rho=0.0,
+        influence=InfluenceCert.identity().with_overrides(
             dt_scale=exc_dt_scale,
             extrinsic_scale=exc_ex_scale,
-            trust_alpha=1.0,
         ),
     )
     all_certs.append(exc_cert)
@@ -1182,7 +1148,10 @@ def process_scan_single_hypothesis(
     # Effective conditioning for trust alpha: evaluated on pose block (6x6) in JAX; no host round-trip.
     # Full 22x22 would be dominated by physically-null directions (yaw under gravity, weak bias/extrinsic).
     eps_cond = float(config.eps_psd)
-    L_pose = 0.5 * (L_evidence[0:6, 0:6] + L_evidence[0:6, 0:6].T)
+    L_pose = 0.5 * (
+        L_evidence[constants.GC_IDX_POSE, constants.GC_IDX_POSE]
+        + L_evidence[constants.GC_IDX_POSE, constants.GC_IDX_POSE].T
+    )
     L_pose = jnp.nan_to_num(L_pose, nan=0.0, posinf=0.0, neginf=0.0)
     eigvals_pose = jnp.linalg.eigvalsh(L_pose)
     eigvals_safe = jnp.nan_to_num(eigvals_pose, nan=eps_cond, posinf=eps_cond, neginf=eps_cond)
@@ -1278,7 +1247,7 @@ def process_scan_single_hypothesis(
             eta_w = (R_t @ eta_b.T).T
             return Lambda_w, theta_w, eta_w
 
-        if measurement_batch.n_valid > 0 and active_tile_ids is not None:
+        if active_tile_ids is not None:
             (
                 meas_idx_blocks,
                 tile_blocks,
@@ -1348,7 +1317,7 @@ def process_scan_single_hypothesis(
 
         # Fixed-budget insertion every scan: novelty mass from unbalanced OT coupling.
         # This replaces the legacy "insert only when map empty" behavior.
-        if measurement_batch.n_valid > 0 and assoc_result is not None and active_tile_ids is not None:
+        if assoc_result is not None and active_tile_ids is not None:
             a = measurement_batch.valid_mask.astype(jnp.float64)
             a = a / jnp.maximum(jnp.sum(a), config.eps_mass)  # fixed total mass
             row_mass = assoc_result.row_masses.astype(jnp.float64)
@@ -1449,6 +1418,21 @@ def process_scan_single_hypothesis(
                 primitive_map = forget_result.atlas_map
                 all_certs.append(forget_cert)
 
+                merge_result, merge_cert, merge_effect = primitive_map_merge_reduce(
+                    atlas_map=primitive_map,
+                    tile_id=tid_i,
+                    merge_threshold=config.primitive_merge_threshold,
+                    max_pairs=int(config.k_merge_pairs_tile),
+                    max_tile_size=int(config.primitive_merge_max_tile_size),
+                    eps_psd=config.eps_psd,
+                    eps_lift=config.eps_lift,
+                    chart_id=belief_pred.chart_id,
+                    anchor_id="primitive_map_merge_reduce",
+                )
+                primitive_map = merge_result.atlas_map
+                all_certs.append(merge_cert)
+                n_primitives_merged += int(merge_result.n_merged)
+
         # Cache hit/miss for active tiles.
         active_set = set(active_tile_ids or [])
         tile_cache_hits = len([t for t in (active_tile_ids or []) if t in primitive_map.tiles])
@@ -1485,6 +1469,7 @@ def process_scan_single_hypothesis(
                 evicted_mass_total=float(evicted_mass_total),
                 fused_count=int(n_primitives_fused),
                 fused_mass_total=float(fused_mass_total),
+                merged_count=int(n_primitives_merged),
             ),
         )
         all_certs.append(map_update_cert)
@@ -1512,224 +1497,55 @@ def process_scan_single_hypothesis(
         else 1.0
     )
 
-    diagnostics = None
     diagnostics_tape = None
-    if config.save_full_diagnostics:
-        # =========================================================================
-        # Build full diagnostics (Stage-0 schema for dashboard)
-        # =========================================================================
-        import numpy as np
+    # Minimal tape only (crash-tolerant, low overhead) + certificate summary.
+    import numpy as np
+    cert_support = aggregated_cert.support
+    cert_mismatch = aggregated_cert.mismatch
+    cert_excitation = aggregated_cert.excitation
+    cert_influence = aggregated_cert.influence
+    cert_over = aggregated_cert.overconfidence
 
-        # Extract pose from final belief
-        pose_final = belief_final.mean_world_pose(eps_lift=config.eps_lift)
-        trans_final = np.array(pose_final[:3])
-        rotvec_final = np.array(pose_final[3:6])
+    if config.enable_timing:
+        timing_ms["total_ms"] = (time.perf_counter() - t_total_start) * 1000.0
 
-        # Convert rotvec to rotation matrix
-        from scipy.spatial.transform import Rotation as R_scipy
-        R_final = R_scipy.from_rotvec(rotvec_final).as_matrix()
-
-        # Rotation-binding diagnostics: verify residuals decrease after fusion.
-        pose_pred_np = np.array(belief_pred.mean_world_pose(eps_lift=config.eps_lift))
-        R_pred = R_scipy.from_rotvec(pose_pred_np[3:6]).as_matrix()
-
-        odom_pose_np = np.array(odom_pose)
-        R_odom = R_scipy.from_rotvec(odom_pose_np[3:6]).as_matrix()
-
-        # With primitives, we don't have a separate R_hat from Matrix Fisher.
-        # Use the posterior belief rotation as the "LiDAR" rotation estimate.
-        R_lidar = R_final  # Best estimate from visual_pose_evidence + fusion
-
-        # Compute rotation errors robustly (handle non-orthogonal matrices from numerical issues)
-        def _safe_rotation_error_deg(R1: np.ndarray, R2: np.ndarray) -> float:
-            """Compute rotation error in degrees, handling numerical edge cases."""
-            try:
-                R_diff = R1.T @ R2
-                # Force orthogonality via SVD projection
-                U, _, Vt = np.linalg.svd(R_diff)
-                R_diff_ortho = U @ Vt
-                # Ensure proper rotation (det = +1)
-                if np.linalg.det(R_diff_ortho) < 0:
-                    R_diff_ortho = -R_diff_ortho
-                return float(np.linalg.norm(R_scipy.from_matrix(R_diff_ortho).as_rotvec()) * (180.0 / np.pi))
-            except Exception:
-                return float("nan")
-
-        rot_err_lidar_deg_pred = _safe_rotation_error_deg(R_pred, R_lidar)
-        rot_err_lidar_deg_post = _safe_rotation_error_deg(R_final, R_lidar)
-        rot_err_odom_deg_pred = _safe_rotation_error_deg(R_pred, R_odom)
-        rot_err_odom_deg_post = _safe_rotation_error_deg(R_final, R_odom)
-
-        # IMU gravity direction coherence probe (in body frame).
-        imu_accel_np = np.array(imu_accel, dtype=np.float64)
-        w_imu_np = np.array(w_imu_int, dtype=np.float64).reshape(-1)
-        accel_bias_np = np.array(accel_bias, dtype=np.float64).reshape(-1)
-        a_corr = imu_accel_np - accel_bias_np[None, :]
-        a_norm = np.linalg.norm(a_corr, axis=1)
-        accel_mag_mean = float(np.sum(w_imu_np * a_norm) / (np.sum(w_imu_np) + 1e-12))
-        x = a_corr / (a_norm[:, None] + 1e-12)
-        S = np.sum(w_imu_np[:, None] * x, axis=0)
-        xbar = S / (np.linalg.norm(S) + 1e-12)
-        g = np.array(constants.GC_GRAVITY_W, dtype=np.float64).reshape(-1)
-        g_hat = g / (np.linalg.norm(g) + 1e-12)
-        mu0 = R_pred.T @ (-g_hat)
-        accel_dir_dot_mu0 = float(np.dot(xbar, mu0))
-
-        # Compute evidence diagnostics
-        L_total_np = np.array(L_evidence)
-        h_total_np = np.array(h_evidence)
-
-        # Diagnostic: check for non-finite values before eigvalsh (deterministic check, not a gate)
-        if not np.all(np.isfinite(L_total_np)):
-            nan_count = np.sum(~np.isfinite(L_total_np))
-            max_abs = np.nanmax(np.abs(L_total_np))
-            # Identify which block has the issue
-            block_info = []
-            for name, sl in [("trans", slice(0, 3)), ("rot", slice(3, 6)), ("vel", slice(6, 9)),
-                             ("bg", slice(9, 12)), ("ba", slice(12, 15)), ("dt", slice(15, 16)),
-                             ("ex", slice(16, 22))]:
-                block = L_total_np[sl, sl]
-                if not np.all(np.isfinite(block)):
-                    block_info.append(f"{name}:NaN")
-            raise ValueError(
-                f"L_total contains {nan_count} non-finite values (max_abs={max_abs:.2e}). "
-                f"Blocks with NaN: {block_info}. Check evidence operators for source."
-            )
-
-        # Safe logdet computation (handle near-singular matrices)
-        eigvals = np.linalg.eigvalsh(L_total_np)
-        eigvals_pos = np.maximum(eigvals, 1e-12)
-        logdet_L = float(np.sum(np.log(eigvals_pos)))
-        trace_L = float(np.trace(L_total_np))
-        L_dt_val = float(L_total_np[15, 15])
-        trace_L_ex = float(np.trace(L_total_np[16:22, 16:22]))
-
-        # PSD diagnostics from aggregated certificate
-        psd_delta = 0.0
-        psd_min_eig_before = 0.0
-        psd_min_eig_after = float(np.min(eigvals))
-        if aggregated_cert.influence is not None:
-            psd_delta = aggregated_cert.influence.psd_projection_delta
-        if aggregated_cert.conditioning is not None:
-            psd_min_eig_before = aggregated_cert.conditioning.eig_min
-
-        # Primitive-based diagnostics (no bin or Matrix Fisher paths)
-
-        if config.enable_timing:
-            timing_ms["total_ms"] = (time.perf_counter() - t_total_start) * 1000.0
-
-        # Twist-derived validation scalars
-        pose0_np = np.array(pose0, dtype=np.float64)
-        pose_pred_np = np.array(pose_pred, dtype=np.float64)
-        odom_twist_np = np.array(odom_twist, dtype=np.float64)
-        distance_pose_val = float(np.linalg.norm(pose_pred_np[:3] - pose0_np[:3]))
-        speed_odom_val = float(np.linalg.norm(odom_twist_np[:3]))  # ||v_body||
-        distance_twist_val = speed_odom_val * dt_sec
-        speed_pose_val = distance_pose_val / dt_sec if dt_sec > 1e-6 else 0.0
-
-        # IMU jerk diagnostics: ||a_{i+1} - a_i|| / dt_i for consecutive samples
-        imu_accel_np = np.array(imu_accel, dtype=np.float64)
-        imu_stamps_np = np.array(imu_stamps, dtype=np.float64)
-        jerk_norms = []
-        for i in range(len(imu_accel_np) - 1):
-            dt_i = imu_stamps_np[i + 1] - imu_stamps_np[i]
-            if dt_i > 1e-6:
-                da = imu_accel_np[i + 1] - imu_accel_np[i]
-                jerk_norms.append(float(np.linalg.norm(da) / dt_i))
-        imu_jerk_norm_mean_val = float(np.mean(jerk_norms)) if jerk_norms else 0.0
-        imu_jerk_norm_max_val = float(np.max(jerk_norms)) if jerk_norms else 0.0
-
-        diagnostics = ScanDiagnostics(
-            scan_number=0,  # Will be set by backend_node
-            timestamp=scan_end_time,
-            dt_sec=dt_sec,
-            dt_scan=float(scan_end_time - scan_start_time),
-            dt_int=dt_int,  # IMU integration time: sum of sample intervals in (t_last_scan, t_scan)
-            num_imu_samples=int(
-                np.sum(
-                    (np.asarray(imu_stamps, dtype=np.float64) > (float(t_last_scan) - 1e-9))
-                    & (np.asarray(imu_stamps, dtype=np.float64) <= (float(t_scan) + 1e-9))
-                    & (np.asarray(imu_stamps, dtype=np.float64) > 0.0)
-                )
-            ),
-            n_points_raw=int(raw_points.shape[0]),
-            n_points_budget=int(points.shape[0]),
-            p_W=trans_final,
-            R_WL=R_final,
-            L_total=L_total_np,
-            h_total=h_total_np,
-            L_lidar=np.array(L_lidar),
-            L_odom=np.array(odom_result.L_odom),
-            L_imu=np.array(imu_result.L_imu),
-            L_gyro=np.array(gyro_result.L_gyro),
-            L_imu_preint=np.array(preint_result.L_imu_preint),
-            logdet_L_total=logdet_L,
-            trace_L_total=trace_L,
-            L_dt=L_dt_val,
-            trace_L_ex=trace_L_ex,
-            s_dt=float(s_dt),
-            s_ex=float(s_ex),
-            psd_delta_fro=psd_delta,
-            psd_min_eig_before=psd_min_eig_before,
-            psd_min_eig_after=psd_min_eig_after,
-            rot_err_lidar_deg_pred=rot_err_lidar_deg_pred,
-            rot_err_lidar_deg_post=rot_err_lidar_deg_post,
-            rot_err_odom_deg_pred=rot_err_odom_deg_pred,
-            rot_err_odom_deg_post=rot_err_odom_deg_post,
-            accel_dir_dot_mu0=accel_dir_dot_mu0,
-            accel_mag_mean=accel_mag_mean,
-            imu_a_body_mean=np.array(imu_a_body_mean),
-            imu_a_world_nog_mean=np.array(imu_a_world_nog_mean),
-            imu_a_world_mean=np.array(imu_a_world_mean),
-            imu_dt_eff_sum=float(imu_dt_eff_sum),
-            imu_dt_valid_min=imu_dt_valid_min,
-            imu_dt_valid_max=imu_dt_valid_max,
-            imu_dt_valid_mean=imu_dt_valid_mean,
-            imu_dt_valid_median=imu_dt_valid_median,
-            imu_dt_valid_std=imu_dt_valid_std,
-            imu_dt_valid_nonpos=imu_dt_valid_nonpos,
-            imu_dt_weighted_mean=imu_dt_weighted_mean,
-            imu_dt_weighted_std=imu_dt_weighted_std,
-            imu_dt_weighted_sum=imu_dt_weighted_sum,
-            fusion_alpha=float(alpha),
-            total_trigger_magnitude=total_trigger_mag,
-            conditioning_number=cond_number,
-            conditioning_pose6=float(cond_pose6),
-            preint_r_vel=np.array(preint_result.r_vel),
-            preint_r_pos=np.array(preint_result.r_pos),
-            dyaw_gyro=float(dyaw_gyro),
-            dyaw_odom=float(dyaw_odom),
-            distance_pose=distance_pose_val,
-            distance_twist=distance_twist_val,
-            speed_odom=speed_odom_val,
-            speed_pose=speed_pose_val,
-            imu_jerk_norm_mean=imu_jerk_norm_mean_val,
-            imu_jerk_norm_max=imu_jerk_norm_max_val,
-            t_total_ms=timing_ms.get("total_ms", 0.0) if timing_ms is not None else 0.0,
-            t_point_budget_ms=timing_ms.get("point_budget_ms", 0.0) if timing_ms is not None else 0.0,
-            t_imu_preint_scan_ms=timing_ms.get("imu_preint_scan_ms", 0.0) if timing_ms is not None else 0.0,
-            t_imu_preint_int_ms=timing_ms.get("imu_preint_int_ms", 0.0) if timing_ms is not None else 0.0,
-            t_deskew_ms=timing_ms.get("deskew_ms", 0.0) if timing_ms is not None else 0.0,
-        )
-    else:
-        # Minimal tape only (crash-tolerant, low overhead)
-        import numpy as np
-        diagnostics_tape = MinimalScanTape(
-            scan_number=0,
-            timestamp=scan_end_time,
-            dt_sec=dt_sec,
-            n_points_raw=int(raw_points.shape[0]),
-            n_points_budget=int(points.shape[0]),
-            fusion_alpha=float(alpha),
-            cond_pose6=float(cond_pose6),
-            conditioning_number=cond_number,
-            eigmin_pose6=float(eig_min_pose),
-            L_pose6=np.array(L_evidence[0:6, 0:6], dtype=np.float64),
-            total_trigger_magnitude=total_trigger_mag,
-            t_total_ms=timing_ms.get("total_ms", 0.0) if timing_ms is not None else 0.0,
-            t_point_budget_ms=timing_ms.get("point_budget_ms", 0.0) if timing_ms is not None else 0.0,
-            t_deskew_ms=timing_ms.get("deskew_ms", 0.0) if timing_ms is not None else 0.0,
-        )
+    diagnostics_tape = MinimalScanTape(
+        scan_number=0,
+        timestamp=scan_end_time,
+        dt_sec=dt_sec,
+        n_points_raw=int(raw_points.shape[0]),
+        n_points_budget=int(points.shape[0]),
+        fusion_alpha=float(alpha),
+        cond_pose6=float(cond_pose6),
+        conditioning_number=cond_number,
+        eigmin_pose6=float(eig_min_pose),
+        L_pose6=np.array(L_evidence[constants.GC_IDX_POSE, constants.GC_IDX_POSE], dtype=np.float64),
+        total_trigger_magnitude=total_trigger_mag,
+        cert_exact=bool(aggregated_cert.exact),
+        cert_frobenius_applied=bool(aggregated_cert.frobenius_applied),
+        cert_n_triggers=int(len(aggregated_cert.approximation_triggers)),
+        support_ess_total=float(cert_support.ess_total),
+        support_frac=float(cert_support.support_frac),
+        mismatch_nll_per_ess=float(cert_mismatch.nll_per_ess),
+        mismatch_directional_score=float(cert_mismatch.directional_score),
+        excitation_dt_effect=float(cert_excitation.dt_effect),
+        excitation_extrinsic_effect=float(cert_excitation.extrinsic_effect),
+        influence_psd_projection_delta=float(cert_influence.psd_projection_delta),
+        influence_mass_epsilon_ratio=float(cert_influence.mass_epsilon_ratio),
+        influence_anchor_drift_rho=float(cert_influence.anchor_drift_rho),
+        influence_dt_scale=float(cert_influence.dt_scale),
+        influence_extrinsic_scale=float(cert_influence.extrinsic_scale),
+        influence_trust_alpha=float(cert_influence.trust_alpha),
+        influence_power_beta=float(cert_influence.power_beta),
+        overconfidence_excitation_total=float(cert_over.excitation_total),
+        overconfidence_ess_to_excitation=float(cert_over.ess_to_excitation),
+        overconfidence_cond_to_support=float(cert_over.cond_to_support),
+        overconfidence_dt_asymmetry=float(cert_over.dt_asymmetry),
+        overconfidence_z_to_xy_ratio=float(cert_over.z_to_xy_ratio),
+        t_total_ms=timing_ms.get("total_ms", 0.0) if timing_ms is not None else 0.0,
+        t_point_budget_ms=timing_ms.get("point_budget_ms", 0.0) if timing_ms is not None else 0.0,
+        t_deskew_ms=timing_ms.get("deskew_ms", 0.0) if timing_ms is not None else 0.0,
+    )
 
     return ScanPipelineResult(
         belief_updated=belief_final,
@@ -1741,7 +1557,6 @@ def process_scan_single_hypothesis(
         iw_lidar_bucket_dnu=iw_lidar_bucket_dnu,
         all_certs=all_certs,
         aggregated_cert=aggregated_cert,
-        diagnostics=diagnostics,
         diagnostics_tape=diagnostics_tape,
         # Stage 1: PrimitiveMap results
         primitive_map_updated=primitive_map_updated,
@@ -1749,6 +1564,7 @@ def process_scan_single_hypothesis(
         n_primitives_inserted=n_primitives_inserted,
         n_primitives_fused=n_primitives_fused,
         n_primitives_culled=n_primitives_culled,
+        n_primitives_merged=n_primitives_merged,
         event_log_entries=event_log_entries if event_log_entries else None,
     )
 
@@ -1836,6 +1652,8 @@ class RuntimeManifest:
     # Fixed-cost budgets (compile-time constants, spec §6)
     K_ASSOC: int = constants.GC_K_ASSOC  # Candidate neighborhood size
     K_INSERT_TILE: int = constants.GC_K_INSERT_TILE  # Insertion budget per tile
+    K_MERGE_PAIRS_TILE: int = constants.GC_K_MERGE_PAIRS_PER_TILE  # Merge-reduce budget per tile
+    MERGE_MAX_TILE_SIZE: int = constants.GC_PRIMITIVE_MERGE_MAX_TILE_SIZE  # Merge-reduce cap
     M_TILE: int = constants.GC_PRIMITIVE_MAP_MAX_SIZE  # Max primitives per tile (single-tile for now)
     # Atlas tiling budgets (spec §5.7)
     H_TILE: float = constants.GC_H_TILE
@@ -1884,7 +1702,7 @@ class RuntimeManifest:
                 "odom_evidence": "fl_slam_poc.backend.operators.odom_evidence (Gaussian SE(3) pose factor)",
                 "lidar_evidence": "fl_slam_poc.backend.operators.visual_pose_evidence (primitive alignment; Laplace at z_lin)",
                 "hypothesis_barycenter": "fl_slam_poc.backend.operators.hypothesis (vectorized over hypotheses)",
-                "map_update": "fl_slam_poc.backend.structures.primitive_map (Fuse/Insert/Cull/Forget)",
+                "map_update": "fl_slam_poc.backend.structures.primitive_map (Fuse/Insert/Cull/Forget/MergeReduce)",
                 "lidar_converter": "fl_slam_poc.frontend.sensors.pointcloud_passthrough",
                 "pointcloud_parser": "fl_slam_poc.backend.backend_node.parse_pointcloud2",
             }
@@ -1932,6 +1750,7 @@ class RuntimeManifest:
             # Fixed-cost budgets (spec §6)
             "K_ASSOC": self.K_ASSOC,
             "K_INSERT_TILE": self.K_INSERT_TILE,
+            "K_MERGE_PAIRS_TILE": self.K_MERGE_PAIRS_TILE,
             "M_TILE": self.M_TILE,
             # Atlas tiling budgets (spec §5.7)
             "H_TILE": self.H_TILE,

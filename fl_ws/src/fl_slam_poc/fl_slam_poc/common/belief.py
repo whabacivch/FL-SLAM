@@ -308,14 +308,9 @@ class BeliefGaussianInfo:
                 cond=L_psd_result.conditioning.cond,
                 near_null_count=L_psd_result.conditioning.near_null_count,
             ),
-            influence=InfluenceCert(
+            influence=InfluenceCert.identity().with_overrides(
                 lift_strength=lift_strength,
                 psd_projection_delta=cov_psd_result.projection_delta + L_psd_result.projection_delta,
-                mass_epsilon_ratio=0.0,
-                anchor_drift_rho=0.0,
-                dt_scale=1.0,
-                extrinsic_scale=1.0,
-                trust_alpha=1.0,
             ),
         )
         

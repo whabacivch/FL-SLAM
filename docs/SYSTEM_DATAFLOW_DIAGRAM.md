@@ -61,10 +61,7 @@ Topics present in the bag but **explicitly not consumed** by the GC v2 pipeline 
 ## Node Responsibilities
 
 ### gc_sensor_hub (Single Process)
-- **livox_converter**: Converts Livox CustomMsg to PointCloud2
-- **odom_normalizer**: Normalizes odometry messages
-- **imu_normalizer**: Normalizes IMU messages
-- **dead_end_audit**: Tracks unused topics for accountability
+- **pointcloud_passthrough**: Republishes bag LiDAR topic to `/gc/sensors/lidar_points` (VLP-16 PointCloud2)
 
 ### gc_backend_node
 - Subscribes **ONLY** to canonical topics (`/gc/sensors/*`)

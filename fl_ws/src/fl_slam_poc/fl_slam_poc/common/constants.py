@@ -33,6 +33,19 @@ EXTRINSICS:
 """
 
 # =============================================================================
+# CONSTANTS INDEX (AUDIT QUICK GUIDE)
+# =============================================================================
+# 1) Manifest constants: chart/dimensions/budgets
+# 2) Epsilons / stabilization
+# 3) State slices / indices
+# 4) Adaptive noise priors (Inverse-Wishart)
+# 5) Sensor noise priors
+# 6) Process diffusion priors
+# 7) OU damping parameters
+# 8) Map / tiling / primitive budgets
+# =============================================================================
+
+# =============================================================================
 # GEOMETRIC COMPOSITIONAL MANIFEST CONSTANTS (RuntimeManifest)
 # Reference: docs/GC_SLAM.md Section 6
 # These are HARD CONSTANTS - do not modify without spec change
@@ -113,6 +126,16 @@ GC_SLICE_TIME_OFFSET_START = 15
 GC_SLICE_TIME_OFFSET_END = 16
 GC_SLICE_EXTRINSIC_START = 16
 GC_SLICE_EXTRINSIC_END = 22
+
+# GC 22D state slices (Python slice objects for auditability)
+GC_IDX_TRANS = slice(GC_SLICE_TRANS_START, GC_SLICE_TRANS_END)
+GC_IDX_ROT = slice(GC_SLICE_SO3_START, GC_SLICE_SO3_END)
+GC_IDX_VEL = slice(GC_SLICE_VEL_START, GC_SLICE_VEL_END)
+GC_IDX_BG = slice(GC_SLICE_GYRO_BIAS_START, GC_SLICE_GYRO_BIAS_END)
+GC_IDX_BA = slice(GC_SLICE_ACCEL_BIAS_START, GC_SLICE_ACCEL_BIAS_END)
+GC_IDX_DT = GC_SLICE_TIME_OFFSET_START
+GC_IDX_EX = slice(GC_SLICE_EXTRINSIC_START, GC_SLICE_EXTRINSIC_END)
+GC_IDX_POSE = slice(GC_SLICE_TRANS_START, GC_SLICE_SO3_END)
 
 
 # Time-warp / membership kernel width as a fraction of scan duration.
@@ -420,6 +443,11 @@ GC_PRIMITIVE_FORGETTING_FACTOR = 0.995
 
 # Merge threshold: primitives with Bhattacharyya distance below this are merged
 GC_PRIMITIVE_MERGE_THRESHOLD = 0.1
+# Fixed budget: number of merge pairs per tile per scan (Phase 6 map maintenance)
+# Default 4 per user direction; keep fixed for auditability.
+GC_K_MERGE_PAIRS_PER_TILE = 4
+# Fixed budget: maximum tile size for merge-reduce O(M^2) work (Phase 6 safety cap)
+GC_PRIMITIVE_MERGE_MAX_TILE_SIZE = 2048
 
 # Cull threshold: primitives with weight below this are removed
 GC_PRIMITIVE_CULL_WEIGHT_THRESHOLD = 1e-4

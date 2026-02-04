@@ -4,12 +4,10 @@ Stage-0 Per-Scan Diagnostics for Geometric Compositional SLAM v2.
 This module provides data structures and utilities for capturing per-scan
 diagnostic data needed for the debugging dashboard.
 
-Stage-0 Schema (no map atoms):
-- Pose estimates (position + orientation)
-- Evidence matrices (L_total 22x22, h_total 22)
-- Excitation scalars (s_dt, s_ex)
-- PSD projection diagnostics
-- Noise trace summaries
+Minimal tape schema (canonical):
+- Pose6 conditioning + L_pose6 heatmap data
+- Certificate-derived support/mismatch/excitation/influence summaries
+- Fusion alpha + trigger magnitude
 """
 
 from __future__ import annotations
@@ -286,7 +284,7 @@ class ScanDiagnostics:
 class MinimalScanTape:
     """
     Minimal per-scan tape for crash-tolerant, low-overhead diagnostics.
-    Hot path stores only this; full ScanDiagnostics is optional at config.
+    Hot path stores only this; full ScanDiagnostics is legacy-only.
     """
     scan_number: int
     timestamp: float
@@ -299,6 +297,28 @@ class MinimalScanTape:
     eigmin_pose6: float
     L_pose6: np.ndarray  # (6, 6) pose block of L_evidence
     total_trigger_magnitude: float
+    # Certificate summary (aggregated)
+    cert_exact: bool
+    cert_frobenius_applied: bool
+    cert_n_triggers: int
+    support_ess_total: float
+    support_frac: float
+    mismatch_nll_per_ess: float
+    mismatch_directional_score: float
+    excitation_dt_effect: float
+    excitation_extrinsic_effect: float
+    influence_psd_projection_delta: float
+    influence_mass_epsilon_ratio: float
+    influence_anchor_drift_rho: float
+    influence_dt_scale: float
+    influence_extrinsic_scale: float
+    influence_trust_alpha: float
+    influence_power_beta: float
+    overconfidence_excitation_total: float
+    overconfidence_ess_to_excitation: float
+    overconfidence_cond_to_support: float
+    overconfidence_dt_asymmetry: float
+    overconfidence_z_to_xy_ratio: float
     # Optional timing (when enable_timing)
     t_total_ms: float = 0.0
     t_point_budget_ms: float = 0.0
@@ -399,6 +419,27 @@ class DiagnosticsLog:
             "eigmin_pose6": np.array([t.eigmin_pose6 for t in self.tape]),
             "L_pose6": np.stack([t.L_pose6 for t in self.tape]),
             "total_trigger_magnitude": np.array([t.total_trigger_magnitude for t in self.tape]),
+            "cert_exact": np.array([t.cert_exact for t in self.tape]),
+            "cert_frobenius_applied": np.array([t.cert_frobenius_applied for t in self.tape]),
+            "cert_n_triggers": np.array([t.cert_n_triggers for t in self.tape]),
+            "support_ess_total": np.array([t.support_ess_total for t in self.tape]),
+            "support_frac": np.array([t.support_frac for t in self.tape]),
+            "mismatch_nll_per_ess": np.array([t.mismatch_nll_per_ess for t in self.tape]),
+            "mismatch_directional_score": np.array([t.mismatch_directional_score for t in self.tape]),
+            "excitation_dt_effect": np.array([t.excitation_dt_effect for t in self.tape]),
+            "excitation_extrinsic_effect": np.array([t.excitation_extrinsic_effect for t in self.tape]),
+            "influence_psd_projection_delta": np.array([t.influence_psd_projection_delta for t in self.tape]),
+            "influence_mass_epsilon_ratio": np.array([t.influence_mass_epsilon_ratio for t in self.tape]),
+            "influence_anchor_drift_rho": np.array([t.influence_anchor_drift_rho for t in self.tape]),
+            "influence_dt_scale": np.array([t.influence_dt_scale for t in self.tape]),
+            "influence_extrinsic_scale": np.array([t.influence_extrinsic_scale for t in self.tape]),
+            "influence_trust_alpha": np.array([t.influence_trust_alpha for t in self.tape]),
+            "influence_power_beta": np.array([t.influence_power_beta for t in self.tape]),
+            "overconfidence_excitation_total": np.array([t.overconfidence_excitation_total for t in self.tape]),
+            "overconfidence_ess_to_excitation": np.array([t.overconfidence_ess_to_excitation for t in self.tape]),
+            "overconfidence_cond_to_support": np.array([t.overconfidence_cond_to_support for t in self.tape]),
+            "overconfidence_dt_asymmetry": np.array([t.overconfidence_dt_asymmetry for t in self.tape]),
+            "overconfidence_z_to_xy_ratio": np.array([t.overconfidence_z_to_xy_ratio for t in self.tape]),
             "t_total_ms": np.array([t.t_total_ms for t in self.tape]),
             "t_point_budget_ms": np.array([t.t_point_budget_ms for t in self.tape]),
             "t_deskew_ms": np.array([t.t_deskew_ms for t in self.tape]),
@@ -409,6 +450,55 @@ class DiagnosticsLog:
     def load_npz(cls, path: str) -> "DiagnosticsLog":
         """Load from NumPy archive."""
         data = np.load(path, allow_pickle=True)
+
+        if str(data.get("format", "")) == "minimal_tape":
+            n = int(data["n_scans"])
+            if n == 0:
+                return cls()
+            log = cls()
+            log.run_id = str(data.get("run_id", ""))
+            log.start_time = float(data.get("start_time", 0.0))
+            for i in range(n):
+                tape_entry = MinimalScanTape(
+                    scan_number=int(data["scan_numbers"][i]),
+                    timestamp=float(data["timestamps"][i]),
+                    dt_sec=float(data["dt_secs"][i]),
+                    n_points_raw=int(data["n_points_raw"][i]),
+                    n_points_budget=int(data["n_points_budget"][i]),
+                    fusion_alpha=float(data["fusion_alpha"][i]),
+                    cond_pose6=float(data["cond_pose6"][i]),
+                    conditioning_number=float(data["conditioning_number"][i]),
+                    eigmin_pose6=float(data["eigmin_pose6"][i]),
+                    L_pose6=data["L_pose6"][i],
+                    total_trigger_magnitude=float(data["total_trigger_magnitude"][i]),
+                    cert_exact=bool(data["cert_exact"][i]) if "cert_exact" in data else True,
+                    cert_frobenius_applied=bool(data["cert_frobenius_applied"][i]) if "cert_frobenius_applied" in data else False,
+                    cert_n_triggers=int(data["cert_n_triggers"][i]) if "cert_n_triggers" in data else 0,
+                    support_ess_total=float(data["support_ess_total"][i]) if "support_ess_total" in data else 0.0,
+                    support_frac=float(data["support_frac"][i]) if "support_frac" in data else 0.0,
+                    mismatch_nll_per_ess=float(data["mismatch_nll_per_ess"][i]) if "mismatch_nll_per_ess" in data else 0.0,
+                    mismatch_directional_score=float(data["mismatch_directional_score"][i]) if "mismatch_directional_score" in data else 0.0,
+                    excitation_dt_effect=float(data["excitation_dt_effect"][i]) if "excitation_dt_effect" in data else 0.0,
+                    excitation_extrinsic_effect=float(data["excitation_extrinsic_effect"][i]) if "excitation_extrinsic_effect" in data else 0.0,
+                    influence_psd_projection_delta=float(data["influence_psd_projection_delta"][i]) if "influence_psd_projection_delta" in data else 0.0,
+                    influence_mass_epsilon_ratio=float(data["influence_mass_epsilon_ratio"][i]) if "influence_mass_epsilon_ratio" in data else 0.0,
+                    influence_anchor_drift_rho=float(data["influence_anchor_drift_rho"][i]) if "influence_anchor_drift_rho" in data else 0.0,
+                    influence_dt_scale=float(data["influence_dt_scale"][i]) if "influence_dt_scale" in data else 1.0,
+                    influence_extrinsic_scale=float(data["influence_extrinsic_scale"][i]) if "influence_extrinsic_scale" in data else 1.0,
+                    influence_trust_alpha=float(data["influence_trust_alpha"][i]) if "influence_trust_alpha" in data else 1.0,
+                    influence_power_beta=float(data["influence_power_beta"][i]) if "influence_power_beta" in data else 1.0,
+                    overconfidence_excitation_total=float(data["overconfidence_excitation_total"][i]) if "overconfidence_excitation_total" in data else 0.0,
+                    overconfidence_ess_to_excitation=float(data["overconfidence_ess_to_excitation"][i]) if "overconfidence_ess_to_excitation" in data else 0.0,
+                    overconfidence_cond_to_support=float(data["overconfidence_cond_to_support"][i]) if "overconfidence_cond_to_support" in data else 0.0,
+                    overconfidence_dt_asymmetry=float(data["overconfidence_dt_asymmetry"][i]) if "overconfidence_dt_asymmetry" in data else 0.0,
+                    overconfidence_z_to_xy_ratio=float(data["overconfidence_z_to_xy_ratio"][i]) if "overconfidence_z_to_xy_ratio" in data else 0.0,
+                    t_total_ms=float(data["t_total_ms"][i]) if "t_total_ms" in data else 0.0,
+                    t_point_budget_ms=float(data["t_point_budget_ms"][i]) if "t_point_budget_ms" in data else 0.0,
+                    t_deskew_ms=float(data["t_deskew_ms"][i]) if "t_deskew_ms" in data else 0.0,
+                )
+                log.tape.append(tape_entry)
+            log.total_scans = len(log.tape)
+            return log
 
         n = int(data["n_scans"])
         if n == 0:

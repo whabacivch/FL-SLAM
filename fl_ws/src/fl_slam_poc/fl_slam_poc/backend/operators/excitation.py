@@ -22,10 +22,10 @@ def compute_excitation_scales_jax(
       s_dt = e_dt / (e_dt + pi_dt + eps)
       s_ex = e_ex / (e_ex + pi_ex + eps)
     """
-    e_dt = L_evidence[15, 15]
-    e_ex = jnp.trace(L_evidence[16:22, 16:22])
-    pi_dt = L_prior[15, 15]
-    pi_ex = jnp.trace(L_prior[16:22, 16:22])
+    e_dt = L_evidence[constants.GC_IDX_DT, constants.GC_IDX_DT]
+    e_ex = jnp.trace(L_evidence[constants.GC_IDX_EX, constants.GC_IDX_EX])
+    pi_dt = L_prior[constants.GC_IDX_DT, constants.GC_IDX_DT]
+    pi_ex = jnp.trace(L_prior[constants.GC_IDX_EX, constants.GC_IDX_EX])
     s_dt = e_dt / (e_dt + pi_dt + eps)
     s_ex = e_ex / (e_ex + pi_ex + eps)
     return s_dt, s_ex
@@ -52,14 +52,13 @@ def apply_excitation_prior_scaling_jax(
     a_ex = 1.0 - s_ex
 
     # dt index 15
-    Lp = Lp.at[15, :].set(a_dt * Lp[15, :])
-    Lp = Lp.at[:, 15].set(a_dt * Lp[:, 15])
-    hp = hp.at[15].set(a_dt * hp[15])
+    Lp = Lp.at[constants.GC_IDX_DT, :].set(a_dt * Lp[constants.GC_IDX_DT, :])
+    Lp = Lp.at[:, constants.GC_IDX_DT].set(a_dt * Lp[:, constants.GC_IDX_DT])
+    hp = hp.at[constants.GC_IDX_DT].set(a_dt * hp[constants.GC_IDX_DT])
 
     # extrinsic block 16:22
-    Lp = Lp.at[16:22, :].set(a_ex * Lp[16:22, :])
-    Lp = Lp.at[:, 16:22].set(a_ex * Lp[:, 16:22])
-    hp = hp.at[16:22].set(a_ex * hp[16:22])
+    Lp = Lp.at[constants.GC_IDX_EX, :].set(a_ex * Lp[constants.GC_IDX_EX, :])
+    Lp = Lp.at[:, constants.GC_IDX_EX].set(a_ex * Lp[:, constants.GC_IDX_EX])
+    hp = hp.at[constants.GC_IDX_EX].set(a_ex * hp[constants.GC_IDX_EX])
 
     return Lp, hp
-

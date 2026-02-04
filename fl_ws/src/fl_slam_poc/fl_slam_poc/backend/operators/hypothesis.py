@@ -204,14 +204,9 @@ def hypothesis_barycenter_projection(
             ess_total=float(1.0 / jnp.sum(weights_normalized**2)),  # ESS
             support_frac=float(jnp.sum(weights_normalized > HYP_WEIGHT_FLOOR) / K_HYP),
         ),
-        influence=InfluenceCert(
-            lift_strength=0.0,
+        influence=InfluenceCert.identity().with_overrides(
             psd_projection_delta=psd_projection_delta,
             mass_epsilon_ratio=float(floor_adjustment) / K_HYP,
-            anchor_drift_rho=0.0,
-            dt_scale=1.0,
-            extrinsic_scale=1.0,
-            trust_alpha=1.0,
         ),
     )
 

@@ -2,7 +2,7 @@
 Frontend package for Geometric Compositional SLAM v2.
 
 Architecture:
-    Rosbag → gc_sensor_hub (pointcloud_passthrough, odom_normalizer, imu_normalizer, dead_end_audit)
+    Rosbag → gc_sensor_hub (pointcloud_passthrough)
            → /gc/sensors/* (canonical topics for backend)
 
 ROS-dependent nodes (rclpy) are not imported here so that backend/pipeline can be

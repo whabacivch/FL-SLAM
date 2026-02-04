@@ -9,7 +9,7 @@ Reference: docs/GC_SLAM.md Section 2.3
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import List, Optional, Dict, Any
 
 
@@ -86,6 +86,13 @@ class InfluenceCert:
     extrinsic_scale: float = 1.0  # Extrinsic coupling factor
     trust_alpha: float = 1.0  # Fusion trust factor
     power_beta: float = 1.0  # Tempered posterior / power EP scaling of evidence in (0,1]
+
+    @classmethod
+    def identity(cls) -> "InfluenceCert":
+        return cls()
+
+    def with_overrides(self, **kwargs: Any) -> "InfluenceCert":
+        return replace(self, **kwargs)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -226,6 +233,8 @@ class MapUpdateCert:
     # Fusion statistics
     fused_count: int = 0  # Primitives fused this scan
     fused_mass_total: float = 0.0  # Total mass fused
+    # Merge-reduce statistics
+    merged_count: int = 0  # Primitives merged (count reduced) this scan
     # Recency inflation statistics
     staleness_inflation_strength: float = 0.0
     staleness_cov_inflation_trace: float = 0.0
@@ -249,6 +258,7 @@ class MapUpdateCert:
             "evicted_mass_total": self.evicted_mass_total,
             "fused_count": self.fused_count,
             "fused_mass_total": self.fused_mass_total,
+            "merged_count": self.merged_count,
             "staleness_inflation_strength": self.staleness_inflation_strength,
             "staleness_cov_inflation_trace": self.staleness_cov_inflation_trace,
             "stale_precision_downscale_total": self.stale_precision_downscale_total,
@@ -674,6 +684,7 @@ def aggregate_certificates(certs: List[CertBundle]) -> CertBundle:
             evicted_mass_total=sum(c.evicted_mass_total for c in map_certs),
             fused_count=sum(c.fused_count for c in map_certs),
             fused_mass_total=sum(c.fused_mass_total for c in map_certs),
+            merged_count=sum(c.merged_count for c in map_certs),
             staleness_inflation_strength=max(c.staleness_inflation_strength for c in map_certs),
             staleness_cov_inflation_trace=max(c.staleness_cov_inflation_trace for c in map_certs),
             stale_precision_downscale_total=sum(c.stale_precision_downscale_total for c in map_certs),

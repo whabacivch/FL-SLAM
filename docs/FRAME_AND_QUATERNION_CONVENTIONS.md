@@ -66,13 +66,9 @@ Body axes convention (GC assumes a standard mobile base convention):
 - **CONFIRMED (Kimera)**: The odom twist is purely planar (`v_x` and `ω_z` nonzero; `v_y=v_z=ω_x=ω_y=0`)
   and the pose+twist satisfy `dp_parent ≈ R_parent_child @ v_child * dt` in XY.
 
-### Frame Names (Kimera)
-- **odom_frame**: `acl_jackal2/odom` — Odometry / world parent frame.
-- **base_frame**: `acl_jackal2/base` — Body/base frame (planar base; Z-up).
-- **LiDAR frame**: `acl_jackal2/velodyne_link` — Velodyne VLP-16; **Z-up** (ground normal · Z ≈ 0.996).
-- **IMU frame**: `acl_jackal2/forward_imu_optical_frame` — Forward camera/IMU optical frame.
+### Frame names (Kimera)
 
-**Reference:** [KIMERA_FRAME_MAPPING.md](KIMERA_FRAME_MAPPING.md).
+See [KIMERA_FRAME_MAPPING.md](KIMERA_FRAME_MAPPING.md) for Kimera frame names, axis confirmation, and diagnostic results.
 
 ### Odometry Message Semantics (nav_msgs/Odometry) - MUST MATCH SE(3) MATH
 
@@ -248,7 +244,7 @@ LiDAR:
 
 - **CONFIRMED (code)**: `t_scan` is `PointCloud2.header.stamp` (scan reference time).
 - Per-point time offsets (if present) are only for **within-scan** deskew. For this
-  bag (`livox_ros_driver2`), offsets are often all zeros.
+  bag, per-point offsets are often all zeros.
 
 IMU:
 

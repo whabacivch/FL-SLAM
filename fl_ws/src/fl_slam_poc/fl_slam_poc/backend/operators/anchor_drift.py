@@ -165,14 +165,8 @@ def anchor_drift_update(
         chart_id=belief.chart_id,
         anchor_id=new_anchor_id,
         triggers=["AnchorDriftUpdate"],
-        influence=InfluenceCert(
-            lift_strength=0.0,
-            psd_projection_delta=0.0,
-            mass_epsilon_ratio=0.0,
+        influence=InfluenceCert.identity().with_overrides(
             anchor_drift_rho=rho,
-            dt_scale=1.0,
-            extrinsic_scale=1.0,
-            trust_alpha=1.0,
         ),
     )
     

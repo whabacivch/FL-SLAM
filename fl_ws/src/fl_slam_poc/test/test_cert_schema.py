@@ -30,13 +30,36 @@ from fl_slam_poc.common.certificates import (
 
 
 # =============================================================================
+# Helpers
+# =============================================================================
+
+
+def make_exact_cert(chart_id: str = "chart", anchor_id: str = "anchor") -> CertBundle:
+    return CertBundle.create_exact(chart_id=chart_id, anchor_id=anchor_id)
+
+
+def make_approx_cert(
+    chart_id: str = "chart",
+    anchor_id: str = "anchor",
+    triggers: list[str] | None = None,
+    frobenius_applied: bool = False,
+) -> CertBundle:
+    return CertBundle.create_approx(
+        chart_id=chart_id,
+        anchor_id=anchor_id,
+        triggers=triggers or ["test"],
+        frobenius_applied=frobenius_applied,
+    )
+
+
+# =============================================================================
 # Schema Completeness Tests
 # =============================================================================
 
 
 def test_certbundle_compute_schema_exists():
     """Verify ComputeCert has all required fields per spec §2.3."""
-    cert = CertBundle.create_exact(chart_id="chart", anchor_id="anchor")
+    cert = make_exact_cert()
     assert hasattr(cert, "compute")
     assert isinstance(cert.compute, ComputeCert)
     assert isinstance(cert.compute.alloc_bytes_est, int)
@@ -65,7 +88,7 @@ def test_certbundle_compute_schema_exists():
 
 def test_certbundle_overconfidence_growth_sentinels():
     """Verify OverconfidenceCert has growth sentinel fields per spec §5.8."""
-    cert = CertBundle.create_exact(chart_id="chart", anchor_id="anchor")
+    cert = make_exact_cert()
     assert hasattr(cert, "overconfidence")
     assert isinstance(cert.overconfidence, OverconfidenceCert)
 
@@ -95,7 +118,7 @@ def test_certbundle_overconfidence_growth_sentinels():
 
 def test_certbundle_all_component_certs_present():
     """Verify CertBundle has all component certificates."""
-    cert = CertBundle.create_exact(chart_id="chart", anchor_id="anchor")
+    cert = make_exact_cert()
 
     # Core fields
     assert hasattr(cert, "chart_id")
@@ -116,7 +139,7 @@ def test_certbundle_all_component_certs_present():
 
 def test_certbundle_to_dict_completeness():
     """Verify to_dict includes all required keys."""
-    cert = CertBundle.create_approx(
+    cert = make_approx_cert(
         chart_id="test_chart",
         anchor_id="test_anchor",
         triggers=["test_trigger"],
@@ -168,8 +191,8 @@ def test_certbundle_to_dict_completeness():
 
 def test_certbundle_scan_seq_monotonic_when_present():
     """Verify aggregation picks highest scan_seq."""
-    c1 = CertBundle.create_exact(chart_id="chart", anchor_id="anchor")
-    c2 = CertBundle.create_exact(chart_id="chart", anchor_id="anchor")
+    c1 = make_exact_cert()
+    c2 = make_exact_cert()
     c1.compute.scan_io.scan_seq = 1
     c2.compute.scan_io.scan_seq = 2
     agg = aggregate_certificates([c1, c2])
@@ -178,12 +201,8 @@ def test_certbundle_scan_seq_monotonic_when_present():
 
 def test_aggregate_certificates_preserves_schema():
     """Verify aggregation produces valid schema."""
-    c1 = CertBundle.create_exact(chart_id="chart", anchor_id="anchor")
-    c2 = CertBundle.create_approx(
-        chart_id="chart",
-        anchor_id="anchor",
-        triggers=["test"],
-    )
+    c1 = make_exact_cert()
+    c2 = make_approx_cert(triggers=["test"])
     c1.overconfidence.ess_growth_rate = 0.1
     c2.overconfidence.excitation_growth_rate = 0.2
 
@@ -222,8 +241,8 @@ def _cert_snapshot_id(cert: CertBundle) -> str:
 
 def test_snapshot_determinism_exact():
     """Same inputs produce same snapshot_id for exact certs."""
-    c1 = CertBundle.create_exact(chart_id="chart", anchor_id="anchor")
-    c2 = CertBundle.create_exact(chart_id="chart", anchor_id="anchor")
+    c1 = make_exact_cert()
+    c2 = make_exact_cert()
 
     id1 = _cert_snapshot_id(c1)
     id2 = _cert_snapshot_id(c2)
@@ -233,18 +252,8 @@ def test_snapshot_determinism_exact():
 
 def test_snapshot_determinism_approx():
     """Same inputs produce same snapshot_id for approx certs."""
-    c1 = CertBundle.create_approx(
-        chart_id="chart",
-        anchor_id="anchor",
-        triggers=["test", "another"],
-        frobenius_applied=True,
-    )
-    c2 = CertBundle.create_approx(
-        chart_id="chart",
-        anchor_id="anchor",
-        triggers=["test", "another"],
-        frobenius_applied=True,
-    )
+    c1 = make_approx_cert(triggers=["test", "another"], frobenius_applied=True)
+    c2 = make_approx_cert(triggers=["test", "another"], frobenius_applied=True)
 
     id1 = _cert_snapshot_id(c1)
     id2 = _cert_snapshot_id(c2)
@@ -254,8 +263,8 @@ def test_snapshot_determinism_approx():
 
 def test_snapshot_different_inputs():
     """Different inputs produce different snapshot_id."""
-    c1 = CertBundle.create_exact(chart_id="chart1", anchor_id="anchor")
-    c2 = CertBundle.create_exact(chart_id="chart2", anchor_id="anchor")
+    c1 = make_exact_cert(chart_id="chart1")
+    c2 = make_exact_cert(chart_id="chart2")
 
     id1 = _cert_snapshot_id(c1)
     id2 = _cert_snapshot_id(c2)

@@ -2,9 +2,12 @@
 """
 Post-run Rerun builder: build .rrd from splat_export.npz + trajectory.
 
-Uses Ellipsoids3D (covariance → half_sizes + quaternions), BEV 15 shaded colors
-(vMF + fBm from fl_slam_poc.backend.rendering), trajectory as LineStrips3D and
-optional Transform3D per pose. No live recording; run after eval finishes.
+Logs multiple archetypes under gc/map/splats/: dense colored Points3D, ellipsoids
+duplicate, Arrows3D normals (vMF directions scaled by kappa), weight-colored
+Points3D (viridis LUT). Ellipsoids3D from covariances; BEV 15 shaded colors
+(vMF + fBm from fl_slam_poc.backend.rendering). Trajectory as LineStrips3D and
+optional Transform3D per pose. Blueprint with tabs for each view + panels.
+No live recording; run after eval finishes.
 
 Optional BEV15 post-run view layer: creates a second .rrd with 2D BEV projections
 for each of 15 oblique views. This is a view-only artifact (not used in runtime).
@@ -12,6 +15,7 @@ for each of 15 oblique views. This is a view-only artifact (not used in runtime)
 Usage:
   python tools/build_rerun_from_splat.py RESULTS_DIR [--output RESULTS_DIR/gc_slam.rrd]
   python tools/build_rerun_from_splat.py --splat path.npz --trajectory path.tum --output out.rrd
+  python tools/build_rerun_from_splat.py RESULTS_DIR --splat-scale 2.0 [--no-blueprint]
   python tools/build_rerun_from_splat.py RESULTS_DIR --bev15-output RESULTS_DIR/gc_bev15.rrd
 """
 
@@ -176,6 +180,88 @@ def _shaded_colors(
     return np.clip(out, 0.0, 1.0).astype(np.float32)
 
 
+def _viridis_lut_uint8() -> np.ndarray:
+    """256×3 RGB uint8 LUT, viridis-like (no matplotlib)."""
+    # Keyframes (t, R, G, B) approx viridis 0–1
+    t = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
+    r = np.array([0.267, 0.283, 0.154, 0.369, 0.993])
+    g = np.array([0.005, 0.141, 0.515, 0.788, 0.906])
+    b = np.array([0.329, 0.458, 0.486, 0.383, 0.144])
+    x = np.linspace(0.0, 1.0, 256)
+    lut = np.column_stack([
+        np.interp(x, t, r),
+        np.interp(x, t, g),
+        np.interp(x, t, b),
+    ])
+    return (np.clip(lut, 0.0, 1.0) * 255).astype(np.uint8)
+
+
+def _log_splat_views_at_t0(
+    positions: np.ndarray,
+    half_sizes: np.ndarray,
+    quats: np.ndarray,
+    colors_uint8: np.ndarray,
+    directions: np.ndarray,
+    kappas: np.ndarray,
+    weights: np.ndarray,
+    radii: np.ndarray,
+    ref_scale: float,
+) -> None:
+    """Log dense colored, ellipsoids duplicate, normals, weight-colored at gc/map/splats/* once at t=0."""
+    n = positions.shape[0]
+    if n == 0:
+        rr.log("gc/map/splats/ellipsoids", rr.Ellipsoids3D(centers=np.zeros((0, 3)), half_sizes=np.zeros((0, 3))))
+        rr.log("gc/map/splats/colored", rr.Points3D(positions=np.zeros((0, 3), dtype=np.float32), radii=np.zeros(0, dtype=np.float32)))
+        rr.log("gc/map/splats/normals", rr.Arrows3D(origins=np.zeros((0, 3)), vectors=np.zeros((0, 3))))
+        rr.log("gc/map/splats/weights", rr.Points3D(positions=np.zeros((0, 3), dtype=np.float32), radii=np.zeros(0, dtype=np.float32)))
+        return
+    # Duplicate ellipsoids for blueprint tab
+    rr.log(
+        "gc/map/splats/ellipsoids",
+        rr.Ellipsoids3D(
+            centers=positions.astype(np.float32),
+            half_sizes=half_sizes.astype(np.float32),
+            quaternions=quats.astype(np.float32),
+            colors=colors_uint8,
+        ),
+    )
+    rr.log(
+        "gc/map/splats/colored",
+        rr.Points3D(
+            positions=positions.astype(np.float32),
+            colors=colors_uint8,
+            radii=radii,
+        ),
+    )
+    # Arrows3D: length from kappa (relative), scaled by ref_scale so arrows fit the scene
+    kappa_p95 = float(np.percentile(kappas, 95)) + 1e-12
+    length_rel = np.clip(kappas / kappa_p95, 0.1, 2.0)
+    length_world = ref_scale * 0.2 * length_rel
+    vectors = (directions * length_world[:, np.newaxis]).astype(np.float32)
+    rr.log(
+        "gc/map/splats/normals",
+        rr.Arrows3D(
+            origins=positions.astype(np.float32),
+            vectors=vectors,
+            colors=[255, 200, 0, 200],
+        ),
+    )
+    # Weight colormap: 5th–95th percentile, viridis LUT
+    w_min = float(np.percentile(weights, 5))
+    w_max = float(np.percentile(weights, 95))
+    idx = np.clip((weights - w_min) / (w_max - w_min + 1e-12) * 255, 0, 255).astype(np.int32)
+    lut = _viridis_lut_uint8()
+    weight_rgb_uint8 = lut[idx]
+    rr.log(
+        "gc/map/splats/weights",
+        rr.Points3D(
+            positions=positions.astype(np.float32),
+            colors=weight_rgb_uint8,
+            radii=radii * 0.5,
+        ),
+    )
+
+
 def _load_trajectory_tum(path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     """Load TUM file; return (stamps, path_xyz (N,3), path_quat_xyzw (N,4) or None)."""
     stamps = []
@@ -231,6 +317,8 @@ def build_rrd(
     view_deg: float = BEV_15_DEG,
     fbm_scale: float = 0.15,
     max_ellipsoids: int | None = 20000,
+    splat_scale: float = 2.0,
+    send_blueprint: bool = True,
 ) -> bool:
     """Build .rrd from splat NPZ + optional trajectory TUM. Returns True on success."""
     if rr is None:
@@ -262,6 +350,7 @@ def build_rrd(
         positions = positions[top]
         covariances = covariances[top]
         colors = colors[top]
+        weights = weights[top]
         directions = directions[top]
         kappas = kappas[top]
         n = len(top)
@@ -273,6 +362,21 @@ def build_rrd(
     )
     # Rerun expects uint8 0-255 or float 0-1 for colors
     colors_uint8 = (np.clip(colors_shaded, 0, 1) * 255).astype(np.uint8)
+
+    # Adaptive scale: derive ref from data so radii and arrows render naturally (no magic m)
+    raw_radii = np.linalg.norm(half_sizes, axis=1).astype(np.float64)
+    ref_scale = float(np.median(raw_radii))
+    if ref_scale < 1e-9 and n > 0:
+        extent = np.linalg.norm(
+            np.percentile(positions, 95, axis=0) - np.percentile(positions, 5, axis=0)
+        )
+        ref_scale = max(1e-6, extent * 0.005)
+    elif n == 0:
+        ref_scale = 1e-6
+    # Radii: splat_scale for overlap; clamp to data-relative floor/cap
+    radii = raw_radii * splat_scale
+    radii = np.clip(radii, ref_scale * 0.01, ref_scale * 4.0)
+    radii = radii.astype(np.float32)
 
     if trajectory_tum and os.path.isfile(trajectory_tum):
         stamps, path_xyz, path_quat = _load_trajectory_tum(trajectory_tum)
@@ -299,6 +403,10 @@ def build_rrd(
                     colors=colors_uint8[i : i + 1],
                 ),
             )
+        rr.set_time("time", timestamp=0.0)
+        _log_splat_views_at_t0(
+            positions, half_sizes, quats, colors_uint8, directions, kappas, weights, radii, ref_scale
+        )
     else:
         rr.set_time("time", timestamp=0.0)
         if n > 0:
@@ -316,6 +424,9 @@ def build_rrd(
                 "gc/map/ellipsoids",
                 rr.Ellipsoids3D(centers=np.zeros((0, 3)), half_sizes=np.zeros((0, 3))),
             )
+        _log_splat_views_at_t0(
+            positions, half_sizes, quats, colors_uint8, directions, kappas, weights, radii, ref_scale
+        )
 
     if path_xyz.shape[0] > 0:
         # Replay trajectory over time (prefix line strip), so the recording is useful for debugging.
@@ -324,6 +435,27 @@ def build_rrd(
             rr.set_time("time", timestamp=t_sec)
             rr.log("gc/trajectory", rr.LineStrips3D([path_xyz[: i + 1].astype(np.float32)]))
         _log_trajectory_transforms(rr, path_xyz, stamps, path_quat)
+
+    if send_blueprint:
+        try:
+            import rerun.blueprint as rrb
+
+            blueprint = rrb.Blueprint(
+                rrb.Tabs(
+                    rrb.Spatial3DView(name="Dense Color", origin="gc/map/splats/colored"),
+                    rrb.Spatial3DView(name="Uncertainty Ellipsoids", origin="gc/map/splats/ellipsoids"),
+                    rrb.Spatial3DView(name="Normals (vMF)", origin="gc/map/splats/normals"),
+                    rrb.Spatial3DView(name="Weights", origin="gc/map/splats/weights"),
+                    rrb.Spatial3DView(name="Trajectory", origin="gc/trajectory"),
+                    name="GC Map",
+                ),
+                rrb.SelectionPanel(),
+                rrb.TimePanel(),
+                collapse_panels=False,
+            )
+            rr.send_blueprint(blueprint)
+        except Exception:
+            pass
 
     try:
         rec = rr.get_global_data_recording()
@@ -351,6 +483,8 @@ def main() -> int:
     ap.add_argument("--view-deg", type=float, default=BEV_15_DEG, help="BEV view angle (deg off vertical)")
     ap.add_argument("--fbm-scale", type=float, default=0.15, help="fBm color modulation 0..1")
     ap.add_argument("--max-ellipsoids", type=int, default=20000, help="Cap ellipsoids by weight (0 = no cap)")
+    ap.add_argument("--splat-scale", type=float, default=2.0, help="Scale for dense/weight point radii (overlap fill)")
+    ap.add_argument("--no-blueprint", action="store_true", help="Skip sending blueprint (if viewer version differs)")
     ap.add_argument("--bev15-output", default=None, help="Optional BEV15 .rrd output path (post-run)")
     ap.add_argument("--bev15-n", type=int, default=15, help="BEV15 number of views")
     ap.add_argument("--bev15-center-deg", type=float, default=10.0, help="BEV15 center oblique angle (deg)")
@@ -393,6 +527,8 @@ def main() -> int:
         view_deg=args.view_deg,
         fbm_scale=args.fbm_scale,
         max_ellipsoids=max_ell,
+        splat_scale=args.splat_scale,
+        send_blueprint=not args.no_blueprint,
     )
     if ok:
         print(f"Rerun recording written: {out}")

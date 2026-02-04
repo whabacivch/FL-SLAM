@@ -10,7 +10,10 @@ Reference: docs/GC_SLAM.md
 import json
 import struct
 import time
-from typing import Optional, List, Tuple
+import threading
+from collections import deque
+from dataclasses import dataclass
+from typing import Optional, List, Tuple, Callable, Any, Dict
 
 import numpy as np
 import rclpy
@@ -98,6 +101,150 @@ from fl_slam_poc.frontend.sensors.lidar_camera_depth_fusion import (
 
 from scipy.spatial.transform import Rotation
 
+
+def _cast_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+@dataclass(frozen=True)
+class ParamSpec:
+    name: str
+    default: Any
+    cast: Optional[Callable[[Any], Any]] = None
+
+
+PARAM_SPECS: List[ParamSpec] = [
+    ParamSpec("odom_frame", "odom", str),
+    ParamSpec("base_frame", "base_link", str),
+    # Backend subscribes ONLY to /gc/sensors/* (canonical topics from sensor hub)
+    ParamSpec("lidar_topic", "/gc/sensors/lidar_points", str),
+    ParamSpec("odom_topic", "/gc/sensors/odom", str),
+    ParamSpec("imu_topic", "/gc/sensors/imu", str),
+    ParamSpec("trajectory_export_path", "/tmp/gc_slam_trajectory.tum", str),
+    ParamSpec("diagnostics_export_path", "results/gc_slam_diagnostics.npz", str),
+    ParamSpec("splat_export_path", "", str),
+    ParamSpec("status_check_period_sec", 5.0, float),
+    # No-TF extrinsics (T_{base<-sensor}) in [x, y, z, rx, ry, rz] rotvec (radians).
+    # extrinsics_source: inline | file. When file: load from T_base_lidar_file, T_base_imu_file (fail if missing).
+    ParamSpec("extrinsics_source", "inline", str),
+    ParamSpec("T_base_lidar_file", "", str),
+    ParamSpec("T_base_imu_file", "", str),
+    ParamSpec("T_base_lidar", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], list),
+    ParamSpec("T_base_imu", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], list),
+    # LiDAR measurement noise prior (m² isotropic). Kimera VLP-16: 1e-3.
+    ParamSpec("lidar_sigma_meas", 0.01, float),
+    # When true, derive Sigma_g/Sigma_a from first N IMU messages (units/fallback doc'd). When false, use priors only.
+    ParamSpec("use_imu_message_covariance", False, _cast_bool),
+    # Hard single-path enforcement: if enabled, missing topics are hard errors.
+    ParamSpec("use_imu", True, _cast_bool),
+    ParamSpec("use_odom", True, _cast_bool),
+    # IMU gravity scaling (1.0 = nominal; 0.0 disables gravity contribution)
+    ParamSpec("imu_gravity_scale", 1.0, float),
+    ParamSpec("imu_accel_scale", 1.0, float),
+    # Deskew rotation-only mode: removes hidden IMU translation leak through deskew
+    ParamSpec("deskew_rotation_only", False, _cast_bool),
+    # Timing/profiling
+    ParamSpec("enable_timing", False, _cast_bool),
+    # Parallelize independent stages
+    ParamSpec("enable_parallel_stages", False, _cast_bool),
+    # JAX warmup (compile before first scan; no state mutation)
+    ParamSpec("warmup_enable", True, _cast_bool),
+    # Numerical epsilons (domain stabilization)
+    ParamSpec("eps_psd", constants.GC_EPS_PSD, float),
+    ParamSpec("eps_lift", constants.GC_EPS_LIFT, float),
+    ParamSpec("eps_mass", constants.GC_EPS_MASS, float),
+    # Fusion conditioning
+    ParamSpec("alpha_min", constants.GC_ALPHA_MIN, float),
+    ParamSpec("alpha_max", constants.GC_ALPHA_MAX, float),
+    ParamSpec("kappa_scale", constants.GC_KAPPA_SCALE, float),
+    ParamSpec("c0_cond", constants.GC_C0_COND, float),
+    # Power tempering
+    ParamSpec("power_beta_min", 0.25, float),
+    ParamSpec("power_beta_exc_c", 50.0, float),
+    ParamSpec("power_beta_z_c", 1.0, float),
+    # Excitation coupling
+    ParamSpec("c_dt", constants.GC_C_DT, float),
+    ParamSpec("c_ex", constants.GC_C_EX, float),
+    ParamSpec("c_frob", constants.GC_C_FROB, float),
+    # Planar prior (soft constraints)
+    ParamSpec("planar_z_ref", constants.GC_PLANAR_Z_REF, float),
+    ParamSpec("planar_z_sigma", constants.GC_PLANAR_Z_SIGMA, float),
+    ParamSpec("planar_vz_sigma", constants.GC_PLANAR_VZ_SIGMA, float),
+    ParamSpec("enable_planar_prior", True, _cast_bool),
+    # Odom twist evidence
+    ParamSpec("enable_odom_twist", True, _cast_bool),
+    ParamSpec("odom_twist_vel_sigma", constants.GC_ODOM_TWIST_VEL_SIGMA, float),
+    ParamSpec("odom_twist_wz_sigma", constants.GC_ODOM_TWIST_WZ_SIGMA, float),
+    ParamSpec("odom_z_variance_prior", constants.GC_ODOM_Z_VARIANCE_PRIOR, float),
+    # Association OT params
+    ParamSpec("ot_epsilon", 0.1, float),
+    ParamSpec("ot_tau_a", 0.5, float),
+    ParamSpec("ot_tau_b", 0.5, float),
+    # PrimitiveMap + association budgets (fixed-cost)
+    ParamSpec("n_feat", constants.GC_N_FEAT, int),
+    ParamSpec("n_surfel", constants.GC_N_SURFEL, int),
+    ParamSpec("k_assoc", constants.GC_K_ASSOC, int),
+    ParamSpec("k_sinkhorn", constants.GC_K_SINKHORN, int),
+    ParamSpec("primitive_map_max_size", constants.GC_PRIMITIVE_MAP_MAX_SIZE, int),
+    ParamSpec("primitive_forgetting_factor", constants.GC_PRIMITIVE_FORGETTING_FACTOR, float),
+    ParamSpec("k_insert_tile", constants.GC_K_INSERT_TILE, int),
+    ParamSpec("k_merge_pairs_tile", constants.GC_K_MERGE_PAIRS_PER_TILE, int),
+    ParamSpec("primitive_merge_max_tile_size", constants.GC_PRIMITIVE_MERGE_MAX_TILE_SIZE, int),
+    # Phase 6 (Real tiling): deterministic MA-Hex 3D tiling + fixed active/stencil budgets.
+    # These are fixed-cost budgets; runtime YAML must match compiled constants (fail-fast).
+    ParamSpec("H_TILE", constants.GC_H_TILE, float),
+    ParamSpec("R_ACTIVE_TILES_XY", constants.GC_R_ACTIVE_TILES_XY, int),
+    ParamSpec("R_ACTIVE_TILES_Z", constants.GC_R_ACTIVE_TILES_Z, int),
+    ParamSpec("N_ACTIVE_TILES", constants.GC_N_ACTIVE_TILES, int),
+    ParamSpec("R_STENCIL_TILES_XY", constants.GC_R_STENCIL_TILES_XY, int),
+    ParamSpec("R_STENCIL_TILES_Z", constants.GC_R_STENCIL_TILES_Z, int),
+    ParamSpec("N_STENCIL_TILES", constants.GC_N_STENCIL_TILES, int),
+    ParamSpec("M_TILE_VIEW", constants.GC_M_TILE_VIEW, int),
+    ParamSpec("primitive_merge_threshold", constants.GC_PRIMITIVE_MERGE_THRESHOLD, float),
+    ParamSpec("primitive_cull_weight_threshold", constants.GC_PRIMITIVE_CULL_WEIGHT_THRESHOLD, float),
+    # Surfel extraction config
+    ParamSpec("surfel_voxel_size_m", 0.1, float),
+    ParamSpec("surfel_min_points_per_voxel", 3, int),
+    # Diagnostics
+    ParamSpec("save_full_diagnostics", False, _cast_bool),
+    # Smoothed initial reference: buffer first K odom, then set first_odom_pose = aggregate (PIPELINE_DESIGN_GAPS §5.4.1)
+    ParamSpec("init_window_odom_count", 10, int),
+    # PointCloud2 layout: vlp16 (Kimera/VLP-16). See docs/POINTCLOUD2_LAYOUTS.md.
+    ParamSpec("pointcloud_layout", "vlp16", str),
+    # Odom vs belief diagnostic: when non-empty, write CSV (raw odom, belief start, belief end) per scan.
+    ParamSpec("odom_belief_diagnostic_file", "", str),
+    ParamSpec("odom_belief_diagnostic_max_scans", 0, int),
+    # Camera (required): single RGBD topic from camera_rgbd_node
+    ParamSpec("camera_rgbd_topic", "/gc/sensors/camera_rgbd", str),
+    # Visual feature batch (from C++ visual_feature_node)
+    ParamSpec("visual_feature_topic", "/gc/sensors/visual_features", str),
+    ParamSpec("camera_K", [500.0, 500.0, 320.0, 240.0], list),
+    ParamSpec("T_base_camera", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], list),
+    ParamSpec("ringbuf_len", constants.GC_RINGBUF_LEN, int),
+    # Backend time alignment (calibrated profile; continuous, no gates)
+    ParamSpec("time_alignment_profile", "", str),
+    ParamSpec("time_alignment_reference_topic", "", str),
+    # Async LiDAR processing: bounded queues to avoid callback blocking.
+    ParamSpec("lidar_queue_len", 2, int),
+    ParamSpec("publish_queue_len", 4, int),
+    ParamSpec("publish_timer_period_sec", 0.01, float),
+    ParamSpec("use_rerun", True, _cast_bool),
+    ParamSpec("rerun_recording_path", "", str),
+    ParamSpec("rerun_spawn", False, _cast_bool),
+    ParamSpec("event_log_path", "", str),
+    # Manifest-only flags (view layer)
+    ParamSpec("bev_backend_enabled", False, _cast_bool),
+    ParamSpec("bev_views_n", 0, int),
+    # Explicit backend selection (single-path)
+    ParamSpec("map_backend", constants.GC_MAP_BACKEND_PRIMITIVE_MAP, str),
+    ParamSpec("pose_evidence_backend", constants.GC_POSE_EVIDENCE_BACKEND_PRIMITIVES, str),
+]
 
 def _parse_T_base_sensor_6d(xyz_rxyz) -> tuple[np.ndarray, np.ndarray]:
     """
@@ -347,146 +494,63 @@ class GeometricCompositionalBackend(Node):
 
     def _declare_parameters(self):
         """Declare ROS parameters."""
-        self.declare_parameter("odom_frame", "odom")
-        self.declare_parameter("base_frame", "base_link")
-        # Backend subscribes ONLY to /gc/sensors/* (canonical topics from sensor hub)
-        self.declare_parameter("lidar_topic", "/gc/sensors/lidar_points")
-        self.declare_parameter("odom_topic", "/gc/sensors/odom")
-        self.declare_parameter("imu_topic", "/gc/sensors/imu")
-        self.declare_parameter("trajectory_export_path", "/tmp/gc_slam_trajectory.tum")
-        self.declare_parameter("diagnostics_export_path", "results/gc_slam_diagnostics.npz")
-        self.declare_parameter("splat_export_path", "")
-        self.declare_parameter("status_check_period_sec", 5.0)
-        # No-TF extrinsics (T_{base<-sensor}) in [x, y, z, rx, ry, rz] rotvec (radians).
-        # extrinsics_source: inline | file. When file: load from T_base_lidar_file, T_base_imu_file (fail if missing).
-        self.declare_parameter("extrinsics_source", "inline")
-        self.declare_parameter("T_base_lidar_file", "")
-        self.declare_parameter("T_base_imu_file", "")
-        self.declare_parameter("T_base_lidar", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-        self.declare_parameter("T_base_imu", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-        # LiDAR measurement noise prior (m² isotropic). Kimera VLP-16: 1e-3.
-        self.declare_parameter("lidar_sigma_meas", 0.01)
-        # When true, derive Sigma_g/Sigma_a from first N IMU messages (units/fallback doc'd). When false, use priors only.
-        self.declare_parameter("use_imu_message_covariance", False)
-        # Hard single-path enforcement: if enabled, missing topics are hard errors.
-        self.declare_parameter("use_imu", True)
-        self.declare_parameter("use_odom", True)
-        # IMU gravity scaling (1.0 = nominal; 0.0 disables gravity contribution)
-        self.declare_parameter("imu_gravity_scale", 1.0)
-        self.declare_parameter("imu_accel_scale", 1.0)  # 1.0 when bag publishes m/s² (Kimera/ROS)
-        # Deskew rotation-only mode: removes hidden IMU translation leak through deskew
-        self.declare_parameter("deskew_rotation_only", False)
-        # Timing/profiling
-        self.declare_parameter("enable_timing", False)
-        # Parallelize independent stages
-        self.declare_parameter("enable_parallel_stages", False)
-        # JAX warmup (compile before first scan; no state mutation)
-        self.declare_parameter("warmup_enable", True)
-        # Numerical epsilons (domain stabilization)
-        self.declare_parameter("eps_psd", constants.GC_EPS_PSD)
-        self.declare_parameter("eps_lift", constants.GC_EPS_LIFT)
-        self.declare_parameter("eps_mass", constants.GC_EPS_MASS)
-        # Fusion conditioning
-        self.declare_parameter("alpha_min", constants.GC_ALPHA_MIN)
-        self.declare_parameter("alpha_max", constants.GC_ALPHA_MAX)
-        self.declare_parameter("kappa_scale", constants.GC_KAPPA_SCALE)
-        self.declare_parameter("c0_cond", constants.GC_C0_COND)
-        # Power tempering
-        self.declare_parameter("power_beta_min", 0.25)
-        self.declare_parameter("power_beta_exc_c", 50.0)
-        self.declare_parameter("power_beta_z_c", 1.0)
-        # Excitation coupling
-        self.declare_parameter("c_dt", constants.GC_C_DT)
-        self.declare_parameter("c_ex", constants.GC_C_EX)
-        self.declare_parameter("c_frob", constants.GC_C_FROB)
-        # Planar prior (soft constraints)
-        self.declare_parameter("planar_z_ref", constants.GC_PLANAR_Z_REF)
-        self.declare_parameter("planar_z_sigma", constants.GC_PLANAR_Z_SIGMA)
-        self.declare_parameter("planar_vz_sigma", constants.GC_PLANAR_VZ_SIGMA)
-        self.declare_parameter("enable_planar_prior", True)
-        # Odom twist evidence
-        self.declare_parameter("enable_odom_twist", True)
-        self.declare_parameter("odom_twist_vel_sigma", constants.GC_ODOM_TWIST_VEL_SIGMA)
-        self.declare_parameter("odom_twist_wz_sigma", constants.GC_ODOM_TWIST_WZ_SIGMA)
-        self.declare_parameter("odom_z_variance_prior", constants.GC_ODOM_Z_VARIANCE_PRIOR)
-        # Association OT params
-        self.declare_parameter("ot_epsilon", 0.1)
-        self.declare_parameter("ot_tau_a", 0.5)
-        self.declare_parameter("ot_tau_b", 0.5)
-        # PrimitiveMap + association budgets (fixed-cost)
-        self.declare_parameter("n_feat", constants.GC_N_FEAT)
-        self.declare_parameter("n_surfel", constants.GC_N_SURFEL)
-        self.declare_parameter("k_assoc", constants.GC_K_ASSOC)
-        self.declare_parameter("k_sinkhorn", constants.GC_K_SINKHORN)
-        self.declare_parameter("primitive_map_max_size", constants.GC_PRIMITIVE_MAP_MAX_SIZE)
-        self.declare_parameter("primitive_forgetting_factor", constants.GC_PRIMITIVE_FORGETTING_FACTOR)
-        self.declare_parameter("k_insert_tile", constants.GC_K_INSERT_TILE)
-        # Phase 6 (Real tiling): deterministic MA-Hex 3D tiling + fixed active/stencil budgets.
-        # These are fixed-cost budgets; runtime YAML must match compiled constants (fail-fast).
-        self.declare_parameter("H_TILE", constants.GC_H_TILE)
-        self.declare_parameter("R_ACTIVE_TILES_XY", constants.GC_R_ACTIVE_TILES_XY)
-        self.declare_parameter("R_ACTIVE_TILES_Z", constants.GC_R_ACTIVE_TILES_Z)
-        self.declare_parameter("N_ACTIVE_TILES", constants.GC_N_ACTIVE_TILES)
-        self.declare_parameter("R_STENCIL_TILES_XY", constants.GC_R_STENCIL_TILES_XY)
-        self.declare_parameter("R_STENCIL_TILES_Z", constants.GC_R_STENCIL_TILES_Z)
-        self.declare_parameter("N_STENCIL_TILES", constants.GC_N_STENCIL_TILES)
-        self.declare_parameter("M_TILE_VIEW", constants.GC_M_TILE_VIEW)
-        self.declare_parameter("primitive_merge_threshold", constants.GC_PRIMITIVE_MERGE_THRESHOLD)
-        self.declare_parameter("primitive_cull_weight_threshold", constants.GC_PRIMITIVE_CULL_WEIGHT_THRESHOLD)
-        # Surfel extraction config
-        self.declare_parameter("surfel_voxel_size_m", 0.1)
-        self.declare_parameter("surfel_min_points_per_voxel", 3)
-        # Diagnostics
-        self.declare_parameter("save_full_diagnostics", False)
-        # Smoothed initial reference: buffer first K odom, then set first_odom_pose = aggregate (PIPELINE_DESIGN_GAPS §5.4.1)
-        self.declare_parameter("init_window_odom_count", 10)
-        # PointCloud2 layout: vlp16 (Kimera/VLP-16). See docs/POINTCLOUD2_LAYOUTS.md.
-        self.declare_parameter("pointcloud_layout", "vlp16")
-        # Odom vs belief diagnostic: when non-empty, write CSV (raw odom, belief start, belief end) per scan.
-        self.declare_parameter("odom_belief_diagnostic_file", "")
-        self.declare_parameter("odom_belief_diagnostic_max_scans", 0)  # 0 = all scans
-        # Camera (required): single RGBD topic from camera_rgbd_node
-        self.declare_parameter("camera_rgbd_topic", "/gc/sensors/camera_rgbd")
-        # Visual feature batch (from C++ visual_feature_node)
-        self.declare_parameter("visual_feature_topic", "/gc/sensors/visual_features")
-        self.declare_parameter("camera_K", [500.0, 500.0, 320.0, 240.0])  # [fx, fy, cx, cy]
-        self.declare_parameter("T_base_camera", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])  # 6D rotvec
-        self.declare_parameter("ringbuf_len", constants.GC_RINGBUF_LEN)
-        self.declare_parameter("use_rerun", True)
-        self.declare_parameter("rerun_recording_path", "")
-        self.declare_parameter("rerun_spawn", False)
-        self.declare_parameter("event_log_path", "")
-        # Manifest-only flags (view layer)
-        self.declare_parameter("bev_backend_enabled", False)
-        self.declare_parameter("bev_views_n", 0)
-        # Explicit backend selection (single-path)
-        self.declare_parameter("map_backend", constants.GC_MAP_BACKEND_PRIMITIVE_MAP)
-        self.declare_parameter("pose_evidence_backend", constants.GC_POSE_EVIDENCE_BACKEND_PRIMITIVES)
+        for spec in PARAM_SPECS:
+            self.declare_parameter(spec.name, spec.default)
+
+    def _load_parameters(self) -> None:
+        """Load parameters into a typed cache (single source of truth)."""
+        params: Dict[str, Any] = {}
+        for spec in PARAM_SPECS:
+            value = self.get_parameter(spec.name).value
+            cast = spec.cast
+            if cast is None:
+                if isinstance(spec.default, bool):
+                    cast = _cast_bool
+                elif isinstance(spec.default, int):
+                    cast = int
+                elif isinstance(spec.default, float):
+                    cast = float
+                elif isinstance(spec.default, str):
+                    cast = str
+                elif isinstance(spec.default, list):
+                    cast = list
+                else:
+                    cast = lambda v: v
+            params[spec.name] = cast(value)
+        self._params = params
 
     def _init_state(self):
         """Initialize Geometric Compositional state."""
         # Pipeline configuration
         self.config = PipelineConfig()
+        self._load_parameters()
+        p = self._params
 
         # Apply fixed-cost budgets from parameters (single source: config yaml)
-        self.config.n_feat = int(self.get_parameter("n_feat").value)
-        self.config.n_surfel = int(self.get_parameter("n_surfel").value)
-        self.config.k_assoc = int(self.get_parameter("k_assoc").value)
-        self.config.k_sinkhorn = int(self.get_parameter("k_sinkhorn").value)
-        self.config.k_insert_tile = int(self.get_parameter("k_insert_tile").value)
-        self.config.primitive_map_max_size = int(self.get_parameter("primitive_map_max_size").value)
-        self.config.primitive_forgetting_factor = float(
-            self.get_parameter("primitive_forgetting_factor").value
-        )
+        for name in (
+            "n_feat",
+            "n_surfel",
+            "k_assoc",
+            "k_sinkhorn",
+            "k_insert_tile",
+            "k_merge_pairs_tile",
+            "primitive_map_max_size",
+            "primitive_merge_max_tile_size",
+        ):
+            setattr(self.config, name, p[name])
+        self.config.primitive_forgetting_factor = p["primitive_forgetting_factor"]
         # Phase 6 tiling budgets (fail-fast if YAML drifts from compiled constants).
-        self.config.H_TILE = float(self.get_parameter("H_TILE").value)
-        self.config.R_ACTIVE_TILES_XY = int(self.get_parameter("R_ACTIVE_TILES_XY").value)
-        self.config.R_ACTIVE_TILES_Z = int(self.get_parameter("R_ACTIVE_TILES_Z").value)
-        self.config.N_ACTIVE_TILES = int(self.get_parameter("N_ACTIVE_TILES").value)
-        self.config.R_STENCIL_TILES_XY = int(self.get_parameter("R_STENCIL_TILES_XY").value)
-        self.config.R_STENCIL_TILES_Z = int(self.get_parameter("R_STENCIL_TILES_Z").value)
-        self.config.N_STENCIL_TILES = int(self.get_parameter("N_STENCIL_TILES").value)
-        self.config.M_TILE_VIEW = int(self.get_parameter("M_TILE_VIEW").value)
+        for name in (
+            "H_TILE",
+            "R_ACTIVE_TILES_XY",
+            "R_ACTIVE_TILES_Z",
+            "N_ACTIVE_TILES",
+            "R_STENCIL_TILES_XY",
+            "R_STENCIL_TILES_Z",
+            "N_STENCIL_TILES",
+            "M_TILE_VIEW",
+        ):
+            setattr(self.config, name, p[name])
 
         if self.config.H_TILE != constants.GC_H_TILE:
             raise ValueError(
@@ -533,55 +597,54 @@ class GeometricCompositionalBackend(Node):
         self.config.K_SINKHORN = int(self.config.k_sinkhorn)
 
         # Numerical epsilons
-        self.config.eps_psd = float(self.get_parameter("eps_psd").value)
-        self.config.eps_lift = float(self.get_parameter("eps_lift").value)
-        self.config.eps_mass = float(self.get_parameter("eps_mass").value)
+        self.config.eps_psd = p["eps_psd"]
+        self.config.eps_lift = p["eps_lift"]
+        self.config.eps_mass = p["eps_mass"]
         # Fusion conditioning
-        self.config.alpha_min = float(self.get_parameter("alpha_min").value)
-        self.config.alpha_max = float(self.get_parameter("alpha_max").value)
-        self.config.kappa_scale = float(self.get_parameter("kappa_scale").value)
-        self.config.c0_cond = float(self.get_parameter("c0_cond").value)
+        self.config.alpha_min = p["alpha_min"]
+        self.config.alpha_max = p["alpha_max"]
+        self.config.kappa_scale = p["kappa_scale"]
+        self.config.c0_cond = p["c0_cond"]
         # Power tempering
-        self.config.power_beta_min = float(self.get_parameter("power_beta_min").value)
-        self.config.power_beta_exc_c = float(self.get_parameter("power_beta_exc_c").value)
-        self.config.power_beta_z_c = float(self.get_parameter("power_beta_z_c").value)
+        self.config.power_beta_min = p["power_beta_min"]
+        self.config.power_beta_exc_c = p["power_beta_exc_c"]
+        self.config.power_beta_z_c = p["power_beta_z_c"]
         # Excitation coupling
-        self.config.c_dt = float(self.get_parameter("c_dt").value)
-        self.config.c_ex = float(self.get_parameter("c_ex").value)
-        self.config.c_frob = float(self.get_parameter("c_frob").value)
+        self.config.c_dt = p["c_dt"]
+        self.config.c_ex = p["c_ex"]
+        self.config.c_frob = p["c_frob"]
         # Planar prior
-        self.config.planar_z_ref = float(self.get_parameter("planar_z_ref").value)
-        self.config.planar_z_sigma = float(self.get_parameter("planar_z_sigma").value)
-        self.config.planar_vz_sigma = float(self.get_parameter("planar_vz_sigma").value)
-        self.config.enable_planar_prior = bool(self.get_parameter("enable_planar_prior").value)
+        self.config.planar_z_ref = p["planar_z_ref"]
+        self.config.planar_z_sigma = p["planar_z_sigma"]
+        self.config.planar_vz_sigma = p["planar_vz_sigma"]
+        self.config.enable_planar_prior = p["enable_planar_prior"]
         # Odom twist evidence
-        self.config.enable_odom_twist = bool(self.get_parameter("enable_odom_twist").value)
-        self.config.odom_twist_vel_sigma = float(self.get_parameter("odom_twist_vel_sigma").value)
-        self.config.odom_twist_wz_sigma = float(self.get_parameter("odom_twist_wz_sigma").value)
-        self.odom_z_variance_prior = float(self.get_parameter("odom_z_variance_prior").value)
+        self.config.enable_odom_twist = p["enable_odom_twist"]
+        self.config.odom_twist_vel_sigma = p["odom_twist_vel_sigma"]
+        self.config.odom_twist_wz_sigma = p["odom_twist_wz_sigma"]
+        self.odom_z_variance_prior = p["odom_z_variance_prior"]
         # OT params
-        self.config.ot_epsilon = float(self.get_parameter("ot_epsilon").value)
-        self.config.ot_tau_a = float(self.get_parameter("ot_tau_a").value)
-        self.config.ot_tau_b = float(self.get_parameter("ot_tau_b").value)
+        self.config.ot_epsilon = p["ot_epsilon"]
+        self.config.ot_tau_a = p["ot_tau_a"]
+        self.config.ot_tau_b = p["ot_tau_b"]
         # Primitive map thresholds
-        self.config.primitive_merge_threshold = float(
-            self.get_parameter("primitive_merge_threshold").value
-        )
-        self.config.primitive_cull_weight_threshold = float(
-            self.get_parameter("primitive_cull_weight_threshold").value
-        )
+        self.config.primitive_merge_threshold = p["primitive_merge_threshold"]
+        self.config.primitive_cull_weight_threshold = p["primitive_cull_weight_threshold"]
         # Surfel extraction
-        self.config.surfel_voxel_size_m = float(self.get_parameter("surfel_voxel_size_m").value)
-        self.config.surfel_min_points_per_voxel = int(
-            self.get_parameter("surfel_min_points_per_voxel").value
-        )
+        self.config.surfel_voxel_size_m = p["surfel_voxel_size_m"]
+        self.config.surfel_min_points_per_voxel = p["surfel_min_points_per_voxel"]
         # Diagnostics
-        self.config.save_full_diagnostics = bool(self.get_parameter("save_full_diagnostics").value)
-        self.config.enable_parallel_stages = bool(self.get_parameter("enable_parallel_stages").value)
+        self.config.save_full_diagnostics = p["save_full_diagnostics"]
+        self.config.enable_parallel_stages = p["enable_parallel_stages"]
+        if self.config.save_full_diagnostics:
+            self.get_logger().warn(
+                "save_full_diagnostics is deprecated; only minimal tape diagnostics are recorded."
+            )
 
         # Explicit backend selection (single-path, fail-fast)
-        self.map_backend = str(self.get_parameter("map_backend").value).strip()
-        self.pose_evidence_backend = str(self.get_parameter("pose_evidence_backend").value).strip()
+        self.odom_topic = p["odom_topic"].strip()
+        self.map_backend = p["map_backend"].strip()
+        self.pose_evidence_backend = p["pose_evidence_backend"].strip()
         if self.map_backend != constants.GC_MAP_BACKEND_PRIMITIVE_MAP:
             raise ValueError(
                 f"map_backend must be {constants.GC_MAP_BACKEND_PRIMITIVE_MAP!r}; got {self.map_backend!r}"
@@ -591,15 +654,15 @@ class GeometricCompositionalBackend(Node):
                 f"pose_evidence_backend must be {constants.GC_POSE_EVIDENCE_BACKEND_PRIMITIVES!r}; "
                 f"got {self.pose_evidence_backend!r}"
             )
-        self.bev_backend_enabled = bool(self.get_parameter("bev_backend_enabled").value)
-        self.bev_views_n = int(self.get_parameter("bev_views_n").value)
+        self.bev_backend_enabled = p["bev_backend_enabled"]
+        self.bev_views_n = p["bev_views_n"]
         
         # Adaptive process noise IW state (datasheet priors) + derived Q
         self.process_noise_state: ProcessNoiseIWState = create_datasheet_process_noise_state()
         self.Q = process_noise_state_to_Q_jax(self.process_noise_state)
         
         # Adaptive measurement noise IW state (per-sensor, phase 1) + derived Sigma_meas (LiDAR)
-        lidar_sigma_meas = float(self.get_parameter("lidar_sigma_meas").value)
+        lidar_sigma_meas = p["lidar_sigma_meas"]
         self.measurement_noise_state: MeasurementNoiseIWState = create_datasheet_measurement_noise_state(
             lidar_sigma_meas=lidar_sigma_meas
         )
@@ -615,14 +678,14 @@ class GeometricCompositionalBackend(Node):
         )
 
         # Optional JAX warmup to reduce first-scan latency (no state mutation).
-        if bool(self.get_parameter("warmup_enable").value):
+        if p["warmup_enable"]:
             self._jit_warmup_primitives()
 
         # Parse and cache no-TF extrinsics (inline or from file; fail-fast if file missing when source=file).
-        extrinsics_source = str(self.get_parameter("extrinsics_source").value).strip().lower()
+        extrinsics_source = p["extrinsics_source"].strip().lower()
         if extrinsics_source == "file":
-            lidar_file = str(self.get_parameter("T_base_lidar_file").value).strip()
-            imu_file = str(self.get_parameter("T_base_imu_file").value).strip()
+            lidar_file = p["T_base_lidar_file"].strip()
+            imu_file = p["T_base_imu_file"].strip()
             if not lidar_file or not imu_file:
                 raise ValueError(
                     "extrinsics_source=file requires T_base_lidar_file and T_base_imu_file to be set"
@@ -636,12 +699,8 @@ class GeometricCompositionalBackend(Node):
                 raise ValueError(
                     f"extrinsics_source must be 'inline' or 'file'; got {extrinsics_source!r}"
                 )
-            self.R_base_lidar, self.t_base_lidar = _parse_T_base_sensor_6d(
-                self.get_parameter("T_base_lidar").value
-            )
-            self.R_base_imu, self.t_base_imu = _parse_T_base_sensor_6d(
-                self.get_parameter("T_base_imu").value
-            )
+            self.R_base_lidar, self.t_base_lidar = _parse_T_base_sensor_6d(p["T_base_lidar"])
+            self.R_base_imu, self.t_base_imu = _parse_T_base_sensor_6d(p["T_base_imu"])
 
         # Log extrinsics for runtime audit (verifies config is applied correctly)
         from scipy.spatial.transform import Rotation as R_scipy
@@ -657,14 +716,14 @@ class GeometricCompositionalBackend(Node):
         self.get_logger().info("=" * 60)
 
         # Camera (required): intrinsics and T_base_camera; fail-fast if missing
-        camera_K = list(self.get_parameter("camera_K").value)
+        camera_K = list(p["camera_K"])
         if len(camera_K) != 4:
             raise ValueError("camera_K must be [fx, fy, cx, cy]; got length %d" % len(camera_K))
         self.camera_K = camera_K  # [fx, fy, cx, cy]
         self.R_base_camera, self.t_base_camera = _parse_T_base_sensor_6d(
-            list(self.get_parameter("T_base_camera").value)
+            list(p["T_base_camera"])
         )
-        ringbuf_len = int(self.get_parameter("ringbuf_len").value)
+        ringbuf_len = p["ringbuf_len"]
         if ringbuf_len < 1:
             raise ValueError("ringbuf_len must be >= 1; got %d" % ringbuf_len)
         self.camera_ringbuf: List[Tuple[float, np.ndarray, np.ndarray]] = []  # (stamp_sec, rgb, depth)
@@ -673,10 +732,65 @@ class GeometricCompositionalBackend(Node):
         self.visual_feature_ringbuf: List[Tuple[float, VisualFeatureBatch]] = []
         self.visual_feature_ringbuf_max = ringbuf_len
         self.visual_feature_drop_count = 0
+        self.odom_ringbuf: List[Tuple[float, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]] = []
+        self.odom_ringbuf_max = ringbuf_len
+
+        # Time alignment profile (calibrated offsets + drift per stream).
+        self._time_align_enabled = False
+        self._time_align_profile = {}
+        self._time_align_reference = ""
+        profile_path = p["time_alignment_profile"].strip()
+        self._time_align_reference = p["time_alignment_reference_topic"].strip()
+        if profile_path:
+            import yaml
+            with open(profile_path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            ta = data.get("time_alignment", {})
+            self._time_align_reference = str(ta.get("reference", self._time_align_reference or "")).strip()
+            streams = ta.get("streams", {}) or {}
+            for topic, cfg in streams.items():
+                self._time_align_profile[str(topic)] = {
+                    "offset": float(cfg.get("offset_sec", 0.0)),
+                    "drift": float(cfg.get("drift_sec_per_sec", 0.0)),
+                    "t0": float(cfg.get("t0_sec", 0.0)),
+                }
+            if not self._time_align_reference:
+                raise ValueError("time_alignment_profile requires time_alignment.reference or time_alignment_reference_topic")
+            self._time_align_enabled = True
+        # Shared buffer lock for async callbacks (IMU/odom/camera/features).
+        self._buffer_lock = threading.Lock()
+        # Shared state lock for map/anchor access across threads.
+        self._state_lock = threading.Lock()
+
+        # Async LiDAR processing queues (bounded, single-path).
+        self._lidar_queue_len = p["lidar_queue_len"]
+        self._publish_queue_len = p["publish_queue_len"]
+        self._publish_timer_period_sec = p["publish_timer_period_sec"]
+        if self._lidar_queue_len < 1:
+            raise ValueError(f"lidar_queue_len must be >= 1; got {self._lidar_queue_len}")
+        if self._publish_queue_len < 1:
+            raise ValueError(f"publish_queue_len must be >= 1; got {self._publish_queue_len}")
+        if self._publish_timer_period_sec <= 0.0:
+            raise ValueError(
+                f"publish_timer_period_sec must be > 0; got {self._publish_timer_period_sec}"
+            )
+        self._lidar_queue: deque = deque(maxlen=self._lidar_queue_len)
+        self._lidar_cv = threading.Condition()
+        self._lidar_worker_stop = False
+        self._lidar_worker = None
+        self._lidar_msg_count = 0
+        self._lidar_drop_count = 0
+        self._lidar_error_count = 0
+        self._publish_queue: deque = deque(maxlen=self._publish_queue_len)
+        self._publish_drop_count = 0
         self.get_logger().info(
             "Camera: K=[fx=%s fy=%s cx=%s cy=%s], T_base_camera cached, ringbuf_len=%d"
             % (camera_K[0], camera_K[1], camera_K[2], camera_K[3], ringbuf_len)
         )
+        if self._time_align_enabled:
+            self.get_logger().info(
+                f"Backend time alignment: enabled (reference={self._time_align_reference})"
+            )
         # Camera intrinsics and splat_prep config (camera -> MeasurementBatch)
         fx, fy, cx, cy = float(camera_K[0]), float(camera_K[1]), float(camera_K[2]), float(camera_K[3])
         self.camera_intrinsics = PinholeIntrinsics(fx=fx, fy=fy, cx=cx, cy=cy)
@@ -685,19 +799,18 @@ class GeometricCompositionalBackend(Node):
         # Wire LiDAR origin (in base frame) into the pipeline so direction features are computed
         # from the sensor origin, not the base origin.
         self.config.lidar_origin_base = jnp.array(self.t_base_lidar, dtype=jnp.float64)
-        self.config.imu_gravity_scale = float(self.get_parameter("imu_gravity_scale").value)
+        self.config.imu_gravity_scale = p["imu_gravity_scale"]
         self.get_logger().info(f"IMU gravity scale: {self.config.imu_gravity_scale:.6f}")
-        self.config.deskew_rotation_only = bool(self.get_parameter("deskew_rotation_only").value)
-        _et = self.get_parameter("enable_timing").value
-        self.config.enable_timing = _et if isinstance(_et, bool) else (str(_et).lower() == "true")
+        self.config.deskew_rotation_only = p["deskew_rotation_only"]
+        self.config.enable_timing = p["enable_timing"]
         self.get_logger().info(f"Timing diagnostics: {'enabled' if self.config.enable_timing else 'disabled'}")
         self.get_logger().info(
             f"Parallel stages: {'enabled' if self.config.enable_parallel_stages else 'disabled'}"
         )
         self.get_logger().info(f"Deskew rotation-only: {self.config.deskew_rotation_only}")
-        self.init_window_odom_count = int(self.get_parameter("init_window_odom_count").value)
+        self.init_window_odom_count = p["init_window_odom_count"]
         self.get_logger().info(f"Init window: first_odom_pose = aggregate of first {self.init_window_odom_count} odom")
-        self.pointcloud_layout = str(self.get_parameter("pointcloud_layout").value).strip().lower()
+        self.pointcloud_layout = p["pointcloud_layout"].strip().lower()
         if self.pointcloud_layout not in ("vlp16",):
             raise ValueError(
                 f"pointcloud_layout must be 'vlp16'; got {self.pointcloud_layout!r}. "
@@ -706,8 +819,8 @@ class GeometricCompositionalBackend(Node):
         self.get_logger().info(f"PointCloud2 layout: {self.pointcloud_layout}")
 
         # Odom vs belief diagnostic (raw vs estimate)
-        self._odom_belief_diagnostic_file = str(self.get_parameter("odom_belief_diagnostic_file").value).strip()
-        self._odom_belief_diagnostic_max = int(self.get_parameter("odom_belief_diagnostic_max_scans").value)
+        self._odom_belief_diagnostic_file = p["odom_belief_diagnostic_file"].strip()
+        self._odom_belief_diagnostic_max = p["odom_belief_diagnostic_max_scans"]
         if self._odom_belief_diagnostic_file:
             self.get_logger().info(
                 f"Odom/belief diagnostic: writing to {self._odom_belief_diagnostic_file} "
@@ -874,13 +987,23 @@ class GeometricCompositionalBackend(Node):
         )
 
         # Deferred publish: drain at start of next callback so pipeline hot path doesn't block on ROS
-        self._pending_publish: Optional[Tuple[jnp.ndarray, float]] = None
 
     def _buffer_time_window(self, buffer: list, time_index: int = 0) -> tuple[float, float, float]:
         if not buffer:
             return 0.0, 0.0, 0.0
         stamps = [float(entry[time_index]) for entry in buffer]
         return float(min(stamps)), float(max(stamps)), float(stamps[-1])
+
+    def _align_stamp(self, topic: str, t: float) -> float:
+        if not self._time_align_enabled:
+            return float(t)
+        cfg = self._time_align_profile.get(topic)
+        if cfg is None:
+            return float(t)
+        t0 = float(cfg.get("t0", 0.0))
+        offset = float(cfg.get("offset", 0.0))
+        drift = float(cfg.get("drift", 0.0))
+        return float(t) + offset + drift * (float(t) - t0)
 
     def _stream_stats(
         self,
@@ -1000,8 +1123,9 @@ class GeometricCompositionalBackend(Node):
 
     def _init_ros(self):
         """Initialize ROS interfaces."""
-        self.odom_frame = str(self.get_parameter("odom_frame").value)
-        self.base_frame = str(self.get_parameter("base_frame").value)
+        p = self._params
+        self.odom_frame = p["odom_frame"]
+        self.base_frame = p["base_frame"]
         
         qos_sensor = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -1017,9 +1141,11 @@ class GeometricCompositionalBackend(Node):
             durability=DurabilityPolicy.VOLATILE,
         )
         
-        lidar_topic = str(self.get_parameter("lidar_topic").value)
-        odom_topic = str(self.get_parameter("odom_topic").value)
-        imu_topic = str(self.get_parameter("imu_topic").value)
+        lidar_topic = p["lidar_topic"]
+        odom_topic = p["odom_topic"]
+        self.odom_topic = odom_topic
+        imu_topic = p["imu_topic"]
+        self.imu_topic = imu_topic
         
         # Separate callback groups so IMU/odom can be buffered while lidar pipeline runs.
         # Without this, single-threaded or MutuallyExclusive groups would block IMU during
@@ -1045,7 +1171,8 @@ class GeometricCompositionalBackend(Node):
         self.get_logger().info(f"IMU: {imu_topic}")
 
         # Camera (required): RGBD subscription for debug/visualization
-        camera_rgbd_topic = str(self.get_parameter("camera_rgbd_topic").value).strip()
+        camera_rgbd_topic = p["camera_rgbd_topic"].strip()
+        self.camera_rgbd_topic = camera_rgbd_topic
         if not camera_rgbd_topic:
             raise ValueError("camera_rgbd_topic is required but empty")
         self.sub_camera_rgbd = self.create_subscription(
@@ -1055,7 +1182,8 @@ class GeometricCompositionalBackend(Node):
         self.get_logger().info(f"Camera RGBD: {camera_rgbd_topic} (ring buffer len={self.camera_ringbuf_max})")
 
         # Visual feature batch (C++ preprocessing)
-        visual_feature_topic = str(self.get_parameter("visual_feature_topic").value).strip()
+        visual_feature_topic = p["visual_feature_topic"].strip()
+        self.visual_feature_topic = visual_feature_topic
         if not visual_feature_topic:
             raise ValueError("visual_feature_topic is required but empty")
         self.sub_visual_features = self.create_subscription(
@@ -1073,11 +1201,20 @@ class GeometricCompositionalBackend(Node):
         self.pub_cert = self.create_publisher(String, "/gc/certificate", 10)
         self.pub_status = self.create_publisher(String, "/gc/status", 10)
 
+        # Publish queue drain timer (keeps ROS publish on the ROS thread).
+        self._publish_timer = self.create_timer(
+            self._publish_timer_period_sec,
+            self._drain_publish_queue,
+            callback_group=self.cb_group_sensors,
+        )
+        # Start async LiDAR worker thread.
+        self._start_lidar_worker()
+
         # Rerun visualization (Wayland-friendly; replaces RViz)
         self.rerun_visualizer: Optional[RerunVisualizer] = None
-        use_rerun = bool(self.get_parameter("use_rerun").value)
-        rerun_recording_path = str(self.get_parameter("rerun_recording_path").value).strip()
-        rerun_spawn = bool(self.get_parameter("rerun_spawn").value)
+        use_rerun = p["use_rerun"]
+        rerun_recording_path = p["rerun_recording_path"].strip()
+        rerun_spawn = p["rerun_spawn"]
         if use_rerun:
             if not rerun_spawn and not rerun_recording_path:
                 self.get_logger().warning(
@@ -1118,7 +1255,7 @@ class GeometricCompositionalBackend(Node):
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
 
         # Event log (append-only JSONL for replay)
-        self.event_log_path = str(self.get_parameter("event_log_path").value).strip()
+        self.event_log_path = self._params["event_log_path"].strip()
         self._event_log_file = None
         if self.event_log_path:
             import os
@@ -1126,7 +1263,7 @@ class GeometricCompositionalBackend(Node):
             self._event_log_file = open(self.event_log_path, "a", encoding="utf-8")
         
         # Trajectory export
-        self.trajectory_export_path = str(self.get_parameter("trajectory_export_path").value)
+        self.trajectory_export_path = self._params["trajectory_export_path"]
         self.trajectory_file = None
         if self.trajectory_export_path:
             self.trajectory_file = open(self.trajectory_export_path, "w")
@@ -1136,7 +1273,7 @@ class GeometricCompositionalBackend(Node):
         self.max_path_length = 1000
         
         # Status timer
-        status_period = float(self.get_parameter("status_check_period_sec").value)
+        status_period = float(self._params["status_check_period_sec"])
         self._status_clock = Clock(clock_type=ClockType.SYSTEM_TIME)
         self.status_timer = self.create_timer(
             status_period, self._publish_status, clock=self._status_clock
@@ -1171,6 +1308,8 @@ class GeometricCompositionalBackend(Node):
             K_ASSOC=int(self.config.k_assoc),
             K_SINKHORN=int(self.config.k_sinkhorn),
             K_INSERT_TILE=int(self.config.k_insert_tile),
+            K_MERGE_PAIRS_TILE=int(self.config.k_merge_pairs_tile),
+            MERGE_MAX_TILE_SIZE=int(self.config.primitive_merge_max_tile_size),
             M_TILE=int(self.config.primitive_map_max_size),
             H_TILE=float(self.config.H_TILE),
             N_ACTIVE_TILES=int(self.config.N_ACTIVE_TILES),
@@ -1185,11 +1324,11 @@ class GeometricCompositionalBackend(Node):
             pose_evidence_backend=self.pose_evidence_backend,
             map_backend=self.map_backend,
             topics={
-                "lidar": str(self.get_parameter("lidar_topic").value),
-                "odom": str(self.get_parameter("odom_topic").value),
-                "imu": str(self.get_parameter("imu_topic").value),
-                "camera_rgbd": str(self.get_parameter("camera_rgbd_topic").value),
-                "visual_features": str(self.get_parameter("visual_feature_topic").value),
+                "lidar": self._params["lidar_topic"],
+                "odom": self._params["odom_topic"],
+                "imu": self._params["imu_topic"],
+                "camera_rgbd": self._params["camera_rgbd_topic"],
+                "visual_features": self._params["visual_feature_topic"],
                 "runtime_manifest": "/gc/runtime_manifest",
                 "certificate": "/gc/certificate",
                 "status": "/gc/status",
@@ -1208,6 +1347,56 @@ class GeometricCompositionalBackend(Node):
         msg.data = json.dumps(manifest_dict)
         self.pub_manifest.publish(msg)
 
+    def _start_lidar_worker(self) -> None:
+        """Start the async LiDAR worker thread (single-path)."""
+        if self._lidar_worker is not None:
+            return
+        self._lidar_worker = threading.Thread(
+            target=self._lidar_worker_loop,
+            name="gc_lidar_worker",
+            daemon=True,
+        )
+        self._lidar_worker.start()
+
+    def _enqueue_lidar_msg(self, msg: PointCloud2) -> None:
+        """Enqueue LiDAR scan for async processing (bounded queue)."""
+        with self._lidar_cv:
+            self._lidar_msg_count += 1
+            if len(self._lidar_queue) >= self._lidar_queue.maxlen:
+                # Drop oldest to keep newest (real-time, bounded).
+                self._lidar_queue.popleft()
+                self._lidar_drop_count += 1
+                if self._lidar_drop_count % 50 == 0:
+                    self.get_logger().warn(
+                        f"LiDAR queue overflow: dropped {self._lidar_drop_count} scans "
+                        f"(queue_len={self._lidar_queue.maxlen})"
+                    )
+            self._lidar_queue.append(msg)
+            self._lidar_cv.notify()
+
+    def _lidar_worker_loop(self) -> None:
+        """Worker loop: process LiDAR scans asynchronously."""
+        while True:
+            with self._lidar_cv:
+                while not self._lidar_queue and not self._lidar_worker_stop:
+                    self._lidar_cv.wait(timeout=0.1)
+                if self._lidar_worker_stop:
+                    return
+                msg = self._lidar_queue.popleft()
+            # Process outside lock to avoid blocking enqueue.
+            try:
+                self._process_lidar_msg(msg)
+            except Exception as exc:
+                self._lidar_error_count += 1
+                self.get_logger().error(f"LiDAR processing failed (count={self._lidar_error_count}): {exc}")
+
+    def _drain_publish_queue(self) -> None:
+        """Publish processed poses from the queue (ROS thread)."""
+        if not self._publish_queue:
+            return
+        pose_6d, stamp = self._publish_queue.popleft()
+        self._publish_state_from_pose(pose_6d, stamp)
+
     def on_imu(self, msg: Imu):
         """Buffer IMU measurements for prediction."""
         self.imu_count += 1
@@ -1224,7 +1413,7 @@ class GeometricCompositionalBackend(Node):
             [msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z],
             dtype=np.float64,
         )
-        accel_scale = float(self.get_parameter("imu_accel_scale").value)
+        accel_scale = float(self._params["imu_accel_scale"])
         accel = accel_raw * accel_scale
 
         # No-TF mode: rotate IMU measurements into the base/body frame.
@@ -1232,20 +1421,23 @@ class GeometricCompositionalBackend(Node):
         gyro = self.R_base_imu @ gyro
         accel = self.R_base_imu @ accel
 
-        self.imu_buffer.append((stamp_sec, gyro, accel))
+        with self._buffer_lock:
+            self.imu_buffer.append((stamp_sec, gyro, accel))
 
-        if bool(self.get_parameter("use_imu_message_covariance").value):
+        if bool(self._params["use_imu_message_covariance"]):
             cov_g = np.array(msg.angular_velocity_covariance, dtype=np.float64).reshape(3, 3)
             cov_a = np.array(msg.linear_acceleration_covariance, dtype=np.float64).reshape(3, 3)
             if np.all(np.isfinite(cov_g)) and np.all(np.isfinite(cov_a)):
                 if not np.allclose(cov_g, 0.0) and not np.allclose(cov_a, 0.0):
-                    self.last_imu_cov_g = cov_g
-                    self.last_imu_cov_a = cov_a
+                    with self._buffer_lock:
+                        self.last_imu_cov_g = cov_g
+                        self.last_imu_cov_a = cov_a
         
         # Keep buffer bounded
-        if len(self.imu_buffer) > self.max_imu_buffer:
-            self.imu_buffer.pop(0)
-            self.imu_drop_count += 1
+        with self._buffer_lock:
+            if len(self.imu_buffer) > self.max_imu_buffer:
+                self.imu_buffer.pop(0)
+                self.imu_drop_count += 1
 
     def on_odom(self, msg: Odometry):
         """Store latest odometry for delta computation."""
@@ -1279,75 +1471,85 @@ class GeometricCompositionalBackend(Node):
             jnp.array([pos.x, pos.y, pos.z], dtype=jnp.float64),
         )
         
-        # Explicit anchor: provisional A0 on first odom (no scan drops); after K samples, set anchor_correction from A_smoothed
-        if self.first_odom_pose is None:
-            self.first_odom_pose = odom_pose_absolute  # A0 = first sample (provisional anchor)
-            self.odom_init_buffer.append((stamp_sec, odom_pose_absolute))
-            self.get_logger().info(
-                "Anchor A0 (provisional) set from first odom: "
-                f"frame_id='{msg.header.frame_id}' child_frame_id='{msg.child_frame_id}'"
-            )
-        else:
-            if not self._anchor_smoothed_done:
+        with self._buffer_lock:
+            imu_buffer_local = list(self.imu_buffer)
+            # Explicit anchor: provisional A0 on first odom (no scan drops); after K samples, set anchor_correction from A_smoothed
+            if self.first_odom_pose is None:
+                self.first_odom_pose = odom_pose_absolute  # A0 = first sample (provisional anchor)
                 self.odom_init_buffer.append((stamp_sec, odom_pose_absolute))
-            if not self._anchor_smoothed_done and len(self.odom_init_buffer) >= self.init_window_odom_count:
-                # Closed-form smoothed anchor: weighted t̄ + polar(M) for R̄ (PIPELINE_DESIGN_GAPS §5.4.1)
-                A0 = self.first_odom_pose
-                stamps = [s for s, _ in self.odom_init_buffer]
-                poses = [p for _, p in self.odom_init_buffer]
-                weights = _imu_stability_weights(
-                    stamps, self.imu_buffer,
-                    constants.GC_INIT_ANCHOR_GYRO_SCALE,
-                    constants.GC_INIT_ANCHOR_ACCEL_SCALE,
-                    constants.GRAVITY_MAG,
-                )
-                w_sum = sum(weights)
-                if w_sum <= 0.0:
-                    weights = None  # uniform weighting when IMU weights sum to zero (e.g. wrong accel units)
-                trans_mean = np.average(
-                    [np.array(p[:3], dtype=np.float64) for p in poses],
-                    axis=0, weights=weights,
-                )
-                # Planar: anchor Z is a reference, not average of odom Z (odom Z is unobserved).
-                trans_mean[2] = float(self.config.planar_z_ref)
-                R_matrices = [Rotation.from_rotvec(np.array(p[3:6], dtype=np.float64)).as_matrix() for p in poses]
-                M = np.average(R_matrices, axis=0, weights=weights)
-                R_polar = _polar_so3(M)
-                rotvec_mean = Rotation.from_matrix(R_polar).as_rotvec()
-                A_smoothed = se3_from_rotvec_trans(
-                    jnp.array(rotvec_mean, dtype=jnp.float64),
-                    jnp.array(trans_mean, dtype=jnp.float64),
-                )
-                self.anchor_correction = se3_compose(se3_inverse(A_smoothed), A0)
-                self.odom_init_buffer.clear()
-                self._anchor_smoothed_done = True
-                yaw_deg = float(Rotation.from_matrix(R_polar).as_euler("xyz", degrees=True)[2])
                 self.get_logger().info(
-                    f"Anchor smoothed: K={self.init_window_odom_count}, A_smoothed set; "
-                    f"trans=({trans_mean[0]:.3f}, {trans_mean[1]:.3f}, {trans_mean[2]:.3f}) yaw={yaw_deg:+.2f}deg"
+                    "Anchor A0 (provisional) set from first odom: "
+                    f"frame_id='{msg.header.frame_id}' child_frame_id='{msg.child_frame_id}'"
                 )
+            else:
+                if not self._anchor_smoothed_done:
+                    self.odom_init_buffer.append((stamp_sec, odom_pose_absolute))
+                if not self._anchor_smoothed_done and len(self.odom_init_buffer) >= self.init_window_odom_count:
+                    # Closed-form smoothed anchor: weighted t̄ + polar(M) for R̄ (PIPELINE_DESIGN_GAPS §5.4.1)
+                    A0 = self.first_odom_pose
+                    stamps = [s for s, _ in self.odom_init_buffer]
+                    poses = [p for _, p in self.odom_init_buffer]
+                    weights = _imu_stability_weights(
+                        stamps, imu_buffer_local,
+                        constants.GC_INIT_ANCHOR_GYRO_SCALE,
+                        constants.GC_INIT_ANCHOR_ACCEL_SCALE,
+                        constants.GRAVITY_MAG,
+                    )
+                    w_sum = sum(weights)
+                    if w_sum <= 0.0:
+                        weights = None  # uniform weighting when IMU weights sum to zero (e.g. wrong accel units)
+                    trans_mean = np.average(
+                        [np.array(p[:3], dtype=np.float64) for p in poses],
+                        axis=0, weights=weights,
+                    )
+                    # Planar: anchor Z is a reference, not average of odom Z (odom Z is unobserved).
+                    trans_mean[2] = float(self.config.planar_z_ref)
+                    R_matrices = [Rotation.from_rotvec(np.array(p[3:6], dtype=np.float64)).as_matrix() for p in poses]
+                    M = np.average(R_matrices, axis=0, weights=weights)
+                    R_polar = _polar_so3(M)
+                    rotvec_mean = Rotation.from_matrix(R_polar).as_rotvec()
+                    A_smoothed = se3_from_rotvec_trans(
+                        jnp.array(rotvec_mean, dtype=jnp.float64),
+                        jnp.array(trans_mean, dtype=jnp.float64),
+                    )
+                    with self._state_lock:
+                        self.anchor_correction = se3_compose(se3_inverse(A_smoothed), A0)
+                    self.odom_init_buffer.clear()
+                    self._anchor_smoothed_done = True
+                    yaw_deg = float(Rotation.from_matrix(R_polar).as_euler("xyz", degrees=True)[2])
+                    self.get_logger().info(
+                        f"Anchor smoothed: K={self.init_window_odom_count}, A_smoothed set; "
+                        f"trans=({trans_mean[0]:.3f}, {trans_mean[1]:.3f}, {trans_mean[2]:.3f}) yaw={yaw_deg:+.2f}deg"
+                    )
 
-        # odom_relative = first_odom^{-1} ∘ odom_absolute (belief stays in A0 frame)
-        first_odom_inv = se3_inverse(self.first_odom_pose)
-        self.last_odom_pose = se3_compose(first_odom_inv, odom_pose_absolute)
-        self.last_odom_stamp = stamp_sec
-        # Pose covariance is row-major 6x6: [x,y,z,roll,pitch,yaw]
-        # Note: Covariance is unchanged by the relative transformation (same uncertainty)
-        cov = np.array(msg.pose.covariance, dtype=np.float64).reshape(6, 6)
-        # Cap z variance to limit trust in odom z (planar robots often have bad/unobserved z)
-        cov[2, 2] = max(cov[2, 2], float(self.odom_z_variance_prior))
-        self.last_odom_cov_se3 = jnp.array(cov, dtype=jnp.float64)
+            # odom_relative = first_odom^{-1} ∘ odom_absolute (belief stays in A0 frame)
+            first_odom_inv = se3_inverse(self.first_odom_pose)
+            self.last_odom_pose = se3_compose(first_odom_inv, odom_pose_absolute)
+            self.last_odom_stamp = stamp_sec
+            # Pose covariance is row-major 6x6: [x,y,z,roll,pitch,yaw]
+            # Note: Covariance is unchanged by the relative transformation (same uncertainty)
+            cov = np.array(msg.pose.covariance, dtype=np.float64).reshape(6, 6)
+            # Cap z variance to limit trust in odom z (planar robots often have bad/unobserved z)
+            cov[2, 2] = max(cov[2, 2], float(self.odom_z_variance_prior))
+            self.last_odom_cov_se3 = jnp.array(cov, dtype=jnp.float64)
 
-        # Read twist (velocity) from odometry message
-        # ROS twist is in body frame: [linear.x/y/z, angular.x/y/z]
-        twist = msg.twist.twist
-        self.last_odom_twist = jnp.array([
-            twist.linear.x, twist.linear.y, twist.linear.z,
-            twist.angular.x, twist.angular.y, twist.angular.z
-        ], dtype=jnp.float64)  # (6,) [vx, vy, vz, wx, wy, wz] in body frame
-        # Twist covariance is row-major 6x6
-        twist_cov = np.array(msg.twist.covariance, dtype=np.float64).reshape(6, 6)
-        self.last_odom_twist_cov = jnp.array(twist_cov, dtype=jnp.float64)
+            # Read twist (velocity) from odometry message
+            # ROS twist is in body frame: [linear.x/y/z, angular.x/y/z]
+            twist = msg.twist.twist
+            self.last_odom_twist = jnp.array([
+                twist.linear.x, twist.linear.y, twist.linear.z,
+                twist.angular.x, twist.angular.y, twist.angular.z
+            ], dtype=jnp.float64)  # (6,) [vx, vy, vz, wx, wy, wz] in body frame
+            # Twist covariance is row-major 6x6
+            twist_cov = np.array(msg.twist.covariance, dtype=np.float64).reshape(6, 6)
+            self.last_odom_twist_cov = jnp.array(twist_cov, dtype=jnp.float64)
+
+            # Cache odom samples for time-aligned selection at scan time.
+            self.odom_ringbuf.append(
+                (stamp_sec, self.last_odom_pose, self.last_odom_cov_se3, self.last_odom_twist, self.last_odom_twist_cov)
+            )
+            if len(self.odom_ringbuf) > self.odom_ringbuf_max:
+                self.odom_ringbuf.pop(0)
 
     def _on_camera_rgbd(self, msg: RGBDImage):
         """Store coherent (rgb, depth) pair in ring buffer from camera_rgbd_node."""
@@ -1375,10 +1577,11 @@ class GeometricCompositionalBackend(Node):
             depth = depth_data[:, :dw].astype(np.float64)
 
             # Push to ring buffer (stamp, rgb, depth)
-            self.camera_ringbuf.append((stamp_sec, rgb, depth))
-            if len(self.camera_ringbuf) > self.camera_ringbuf_max:
-                self.camera_ringbuf.pop(0)
-                self.camera_drop_count += 1
+            with self._buffer_lock:
+                self.camera_ringbuf.append((stamp_sec, rgb, depth))
+                if len(self.camera_ringbuf) > self.camera_ringbuf_max:
+                    self.camera_ringbuf.pop(0)
+                    self.camera_drop_count += 1
         except Exception as e:
             self.get_logger().warn("Camera RGBD buffer failed: %s" % e)
 
@@ -1387,10 +1590,11 @@ class GeometricCompositionalBackend(Node):
         stamp_sec = float(msg.stamp_sec) if msg.stamp_sec > 0.0 else (
             msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         )
-        self.visual_feature_ringbuf.append((stamp_sec, msg))
-        if len(self.visual_feature_ringbuf) > self.visual_feature_ringbuf_max:
-            self.visual_feature_ringbuf.pop(0)
-            self.visual_feature_drop_count += 1
+        with self._buffer_lock:
+            self.visual_feature_ringbuf.append((stamp_sec, msg))
+            if len(self.visual_feature_ringbuf) > self.visual_feature_ringbuf_max:
+                self.visual_feature_ringbuf.pop(0)
+                self.visual_feature_drop_count += 1
 
     def _feature_batch_to_list(self, batch: VisualFeatureBatch) -> List[Feature3D]:
         """Convert VisualFeatureBatch to Feature3D list (camera frame)."""
@@ -1451,6 +1655,10 @@ class GeometricCompositionalBackend(Node):
         return features
 
     def on_lidar(self, msg: PointCloud2):
+        """Enqueue LiDAR scan for async processing."""
+        self._enqueue_lidar_msg(msg)
+
+    def _process_lidar_msg(self, msg: PointCloud2):
         """
         Process LiDAR scan through the full GC pipeline.
 
@@ -1458,12 +1666,6 @@ class GeometricCompositionalBackend(Node):
         """
         self.scan_count += 1
         self.get_logger().info(f"on_lidar callback #{self.scan_count} received")
-
-        # Drain deferred publish from previous scan before resetting counters.
-        if self._pending_publish is not None:
-            pose_6d, stamp = self._pending_publish
-            self._publish_state_from_pose(pose_6d, stamp)
-            self._pending_publish = None
 
         # Reset per-scan runtime counters (host/device transfer + sync estimates).
         reset_runtime_counters()
@@ -1530,6 +1732,28 @@ class GeometricCompositionalBackend(Node):
         # =====================================================================
         t_scan = stamp_sec  # CORRECT: scan time is header.stamp, not per-point timestamps
 
+        # Snapshot shared buffers for async processing (avoid holding lock during compute).
+        with self._buffer_lock:
+            imu_buffer = list(self.imu_buffer)
+            last_odom_pose = self.last_odom_pose
+            last_odom_cov_se3 = self.last_odom_cov_se3
+            last_odom_twist = self.last_odom_twist
+            last_odom_twist_cov = self.last_odom_twist_cov
+            last_odom_stamp = self.last_odom_stamp
+            odom_ringbuf = list(self.odom_ringbuf)
+            last_imu_cov_g = self.last_imu_cov_g
+            last_imu_cov_a = self.last_imu_cov_a
+            visual_feature_ringbuf = list(self.visual_feature_ringbuf)
+            camera_ringbuf = list(self.camera_ringbuf)
+        odom_twist_local = (
+            last_odom_twist if last_odom_twist is not None else jnp.zeros((6,), dtype=jnp.float64)
+        )
+        odom_twist_cov_local = (
+            last_odom_twist_cov
+            if last_odom_twist_cov is not None
+            else (1e6 * jnp.eye(6, dtype=jnp.float64))
+        )
+
         if self.rerun_visualizer is not None and points.shape[0] > 0:
             record_device_to_host(points, syncs=1)
             self.rerun_visualizer.log_lidar(np.array(points, dtype=np.float64), t_scan)
@@ -1537,49 +1761,48 @@ class GeometricCompositionalBackend(Node):
         # Preserve previous scan time for scan-to-scan interval handling.
         # This must be captured BEFORE updating self.last_scan_stamp.
         t_prev_scan = float(self.last_scan_stamp) if self.last_scan_stamp > 0.0 else 0.0
-        
-        # Derive scan bounds for deskew (within-scan only).
-        # Scan time bounds (PointCloud2 vlp16: header.stamp or per-point t):
-        # - timebase_sec = start of accumulation window
-        # - header.stamp = end of accumulation window (when message published)
-        # - All time_offset = 0 (no per-point timestamps available)
-        # So we MUST use timebase_sec as scan_start_time and header.stamp as scan_end_time
-        # to capture the accumulation window, even though we can't deskew individual points.
-        stamp_j = jnp.array(stamp_sec, dtype=jnp.float64)
-        timestamps_min_dev = jnp.min(timestamps)
-        record_device_to_host(timestamps_min_dev, syncs=1)
-        timestamps_min = float(timestamps_min_dev)
-        timestamps_max_dev = jnp.max(timestamps)
-        record_device_to_host(timestamps_max_dev, syncs=1)
-        timestamps_max = float(timestamps_max_dev)
-        
-        # If all timestamps are the same (rosette pattern with time_offset=0),
-        # use timebase_sec (from timestamps) as scan_start and header.stamp as scan_end.
-        if jnp.abs(timestamps_max - timestamps_min) < 1e-9:  # All timestamps identical
-            # Rosette pattern: use accumulation window
-            scan_start_time = timestamps_min  # = timebase_sec
-            record_device_to_host(stamp_j, syncs=1)
-            scan_end_time = float(stamp_j)    # = header.stamp
-        else:
-            # Per-point timestamps available: use actual min/max
-            scan_start_time_dev = jnp.minimum(stamp_j, timestamps_min)
-            record_device_to_host(scan_start_time_dev, syncs=1)
-            scan_start_time = float(scan_start_time_dev)
-            scan_end_time_dev = jnp.maximum(stamp_j, timestamps_max)
-            record_device_to_host(scan_end_time_dev, syncs=1)
-            scan_end_time = float(scan_end_time_dev)
 
-        # Compute dt since last scan (using t_scan, not scan_end_time)
+        # =====================================================================
+        # TIME SYNC ONCE AT START: materialize scan bounds and dt from device
+        # All later time use is Python floats; no further device sync for time.
+        # =====================================================================
+        time_bounds = jnp.array([jnp.min(timestamps), jnp.max(timestamps)], dtype=jnp.float64)
+        record_device_to_host(time_bounds, syncs=1)
+        timestamps_min, timestamps_max = float(time_bounds[0]), float(time_bounds[1])
+        if abs(timestamps_max - timestamps_min) < 1e-9:
+            scan_start_time = timestamps_min
+            scan_end_time = stamp_sec  # header.stamp
+        else:
+            scan_start_time = min(stamp_sec, timestamps_min)
+            scan_end_time = max(stamp_sec, timestamps_max)
         dt_raw = (
-            t_scan - t_prev_scan
+            (t_scan - t_prev_scan)
             if t_prev_scan > 0.0
             else (scan_end_time - scan_start_time)
         )
         eps_dt = np.finfo(np.float64).eps
-        dt_sec_dev = jnp.sqrt(jnp.array(dt_raw, dtype=jnp.float64) ** 2 + eps_dt)
-        record_device_to_host(dt_sec_dev, syncs=1)
-        dt_sec = float(dt_sec_dev)
-        self.last_scan_stamp = t_scan  # CORRECT: update using t_scan (header.stamp)
+        dt_sec = float(np.sqrt(dt_raw**2 + eps_dt))
+        self.last_scan_stamp = t_scan
+
+        # Apply alignment to IMU buffer timestamps (continuous; no gates).
+        if self._time_align_enabled and imu_buffer:
+            imu_buffer = [
+                (self._align_stamp(self.imu_topic, float(t)), g, a)
+                for (t, g, a) in imu_buffer
+            ]
+
+        # Select closest odom sample to scan time (aligned).
+        if odom_ringbuf:
+            best_idx = 0
+            best_dt = abs(self._align_stamp(self.odom_topic, float(odom_ringbuf[0][0])) - t_scan)
+            for i in range(1, len(odom_ringbuf)):
+                t_i = self._align_stamp(self.odom_topic, float(odom_ringbuf[i][0]))
+                dt_i = abs(t_i - t_scan)
+                if dt_i < best_dt:
+                    best_dt = dt_i
+                    best_idx = i
+            odom_stamp, last_odom_pose, last_odom_cov_se3, last_odom_twist, last_odom_twist_cov = odom_ringbuf[best_idx]
+            last_odom_stamp = self._align_stamp(self.odom_topic, float(odom_stamp))
 
         # =====================================================================
         # TIMESTAMP AUDIT LOGGING (before IMU processing)
@@ -1598,35 +1821,35 @@ class GeometricCompositionalBackend(Node):
         )
 
         # Visual features are required when the visual feature topic is configured.
-        if not self.visual_feature_ringbuf:
+        if not visual_feature_ringbuf:
             raise RuntimeError(
                 "Visual feature ring buffer is empty; visual features are required for GC v2. "
                 "Ensure the C++ visual_feature_node is running and publishing /gc/sensors/visual_features."
             )
         else:
             best_idx = 0
-            best_dt = abs(self.visual_feature_ringbuf[0][0] - t_scan)
-            for i, (t_frame, _) in enumerate(self.visual_feature_ringbuf):
-                dt_frame = abs(t_frame - t_scan)
+            best_dt = abs(self._align_stamp(self.visual_feature_topic, float(visual_feature_ringbuf[0][0])) - t_scan)
+            for i, (t_frame, _) in enumerate(visual_feature_ringbuf):
+                dt_frame = abs(self._align_stamp(self.visual_feature_topic, float(t_frame)) - t_scan)
                 if dt_frame < best_dt:
                     best_dt = dt_frame
                     best_idx = i
-            stamp_feat, feat_batch = self.visual_feature_ringbuf[best_idx]
+            stamp_feat, feat_batch = visual_feature_ringbuf[best_idx]
             if self.scan_count <= 5:
                 self.get_logger().info(
-                    f"Visual feature batch selected: idx={best_idx}/{len(self.visual_feature_ringbuf)}, "
+                    f"Visual feature batch selected: idx={best_idx}/{len(visual_feature_ringbuf)}, "
                     f"t_frame={stamp_feat:.6f}, t_scan={t_scan:.6f}, dt={best_dt:.6f}s"
                 )
             # Optional RGBD logging for Rerun (debug only)
-            if self.rerun_visualizer is not None and self.camera_ringbuf:
+            if self.rerun_visualizer is not None and camera_ringbuf:
                 rb_idx = 0
-                rb_dt = abs(self.camera_ringbuf[0][0] - t_scan)
-                for i, (t_frame, _, _) in enumerate(self.camera_ringbuf):
-                    dt_frame = abs(t_frame - t_scan)
+                rb_dt = abs(self._align_stamp(self.camera_rgbd_topic, float(camera_ringbuf[0][0])) - t_scan)
+                for i, (t_frame, _, _) in enumerate(camera_ringbuf):
+                    dt_frame = abs(self._align_stamp(self.camera_rgbd_topic, float(t_frame)) - t_scan)
                     if dt_frame < rb_dt:
                         rb_dt = dt_frame
                         rb_idx = i
-                stamp_rgb, rgb, depth = self.camera_ringbuf[rb_idx]
+                stamp_rgb, rgb, depth = camera_ringbuf[rb_idx]
                 self.rerun_visualizer.log_rgbd(rgb, depth, stamp_rgb)
 
             features = self._feature_batch_to_list(feat_batch)
@@ -1698,7 +1921,7 @@ class GeometricCompositionalBackend(Node):
         eps_t = 1e-9
         window = [
             (t, g, a)
-            for (t, g, a) in self.imu_buffer
+            for (t, g, a) in imu_buffer
             if t_min - eps_t <= t <= t_max + eps_t
         ]
         if len(window) > constants.GC_MAX_IMU_PREINT_LEN:
@@ -1736,7 +1959,7 @@ class GeometricCompositionalBackend(Node):
             t_imu_min = float(np.min(valid_stamps))
             t_imu_max = float(np.max(valid_stamps))
             self.get_logger().info(
-                f"Scan #{self.scan_count} IMU buffer: {n_valid_imu}/{len(self.imu_buffer)} valid, "
+                f"Scan #{self.scan_count} IMU buffer: {n_valid_imu}/{len(imu_buffer)} valid, "
                 f"stamp_range=[{t_imu_min:.6f}, {t_imu_max:.6f}], "
                 f"integration_window=({t_last_scan:.6f}, {t_scan:.6f})"
             )
@@ -1774,13 +1997,13 @@ class GeometricCompositionalBackend(Node):
         if self._odom_belief_diagnostic_file and (self._odom_belief_diagnostic_max <= 0 or self.scan_count <= self._odom_belief_diagnostic_max):
             if self.current_belief is not None:
                 _diag_bel_x, _diag_bel_y, _diag_bel_yaw, _diag_bel_vx, _diag_bel_vy = _belief_xyyaw_vel(self.current_belief)
-            if self.last_odom_pose is not None:
-                record_device_to_host(self.last_odom_pose, syncs=1)
-                op = np.array(self.last_odom_pose, dtype=np.float64).ravel()[:6]
+            if last_odom_pose is not None:
+                record_device_to_host(last_odom_pose, syncs=1)
+                op = np.array(last_odom_pose, dtype=np.float64).ravel()[:6]
                 _diag_odom_x, _diag_odom_y = float(op[0]), float(op[1])
                 _diag_odom_yaw = _yaw_deg_from_pose_6d(op)
-            record_device_to_host(self.last_odom_twist, syncs=1)
-            ot = np.array(self.last_odom_twist, dtype=np.float64).ravel()[:6]
+            record_device_to_host(odom_twist_local, syncs=1)
+            ot = np.array(odom_twist_local, dtype=np.float64).ravel()[:6]
             _diag_odom_vx, _diag_odom_vy, _diag_odom_wz = float(ot[0]), float(ot[1]), float(ot[5])
 
         try:
@@ -1788,11 +2011,11 @@ class GeometricCompositionalBackend(Node):
             self.config.Sigma_meas = measurement_noise_mean_jax(self.measurement_noise_state, idx=2)
             self.config.Sigma_g = measurement_noise_mean_jax(self.measurement_noise_state, idx=0)
             self.config.Sigma_a = measurement_noise_mean_jax(self.measurement_noise_state, idx=1)
-            if bool(self.get_parameter("use_imu_message_covariance").value):
-                if self.last_imu_cov_g is not None:
-                    self.config.Sigma_g = jnp.array(self.last_imu_cov_g, dtype=jnp.float64)
-                if self.last_imu_cov_a is not None:
-                    self.config.Sigma_a = jnp.array(self.last_imu_cov_a, dtype=jnp.float64)
+            if bool(self._params["use_imu_message_covariance"]):
+                if last_imu_cov_g is not None:
+                    self.config.Sigma_g = jnp.array(last_imu_cov_g, dtype=jnp.float64)
+                if last_imu_cov_a is not None:
+                    self.config.Sigma_a = jnp.array(last_imu_cov_a, dtype=jnp.float64)
 
             # Precompute Q once for this scan (shared across hypotheses)
             Q_scan = process_noise_state_to_Q_jax(self.process_noise_state)
@@ -1811,10 +2034,10 @@ class GeometricCompositionalBackend(Node):
                     imu_stamps=imu_stamps_j,
                     imu_gyro=imu_gyro_j,
                     imu_accel=imu_accel_j,
-                    odom_pose=self.last_odom_pose if self.last_odom_pose is not None else se3_identity(),
+                    odom_pose=last_odom_pose if last_odom_pose is not None else se3_identity(),
                     odom_cov_se3=(
-                        self.last_odom_cov_se3
-                        if self.last_odom_cov_se3 is not None
+                        last_odom_cov_se3
+                        if last_odom_cov_se3 is not None
                         else (1e12 * jnp.eye(6, dtype=jnp.float64))
                     ),
                     scan_start_time=scan_start_time,
@@ -1824,8 +2047,8 @@ class GeometricCompositionalBackend(Node):
                     t_scan=t_scan,            # IMU integration interval end
                     Q=Q_scan,
                     config=self.config,
-                    odom_twist=self.last_odom_twist,  # Phase 2: odom twist for velocity factors
-                    odom_twist_cov=self.last_odom_twist_cov,
+                    odom_twist=odom_twist_local,  # Phase 2: odom twist for velocity factors
+                    odom_twist_cov=odom_twist_cov_local,
                     primitive_map=self.primitive_map,
                     camera_batch=camera_batch,
                     scan_seq=int(self.scan_count),
@@ -1846,7 +2069,8 @@ class GeometricCompositionalBackend(Node):
                 # Stage 1: Update PrimitiveMap from first hypothesis
                 # (For multi-hypothesis, we use hypothesis 0's map update; proper multi-hyp requires merging)
                 if i == 0 and result.primitive_map_updated is not None:
-                    self.primitive_map = result.primitive_map_updated
+                    with self._state_lock:
+                        self.primitive_map = result.primitive_map_updated
 
                 # Accumulate commutative IW sufficient statistics
                 w_h = float(self.hyp_weights[i])
@@ -1898,62 +2122,27 @@ class GeometricCompositionalBackend(Node):
                     chart_id=combined_belief.chart_id,
                     anchor_id=combined_belief.anchor_id,
                     triggers=["ProcessNoiseIWUpdate"],
-                    influence=InfluenceCert(
-                        lift_strength=0.0,
+                    influence=InfluenceCert.identity().with_overrides(
                         psd_projection_delta=float(proc_iw_cert_vec[0]),
                         nu_projection_delta=float(proc_iw_cert_vec[1]),
-                        mass_epsilon_ratio=0.0,
-                        anchor_drift_rho=0.0,
-                        dt_scale=1.0,
-                        extrinsic_scale=1.0,
-                        trust_alpha=1.0,
                     ),
                 )
                 iw_meas_cert = CertBundle.create_approx(
                     chart_id=combined_belief.chart_id,
                     anchor_id=combined_belief.anchor_id,
                     triggers=["MeasurementNoiseIWUpdate"],
-                    influence=InfluenceCert(
-                        lift_strength=0.0,
+                    influence=InfluenceCert.identity().with_overrides(
                         psd_projection_delta=float(meas_iw_cert_vec[0]),
                         nu_projection_delta=float(meas_iw_cert_vec[1]),
-                        mass_epsilon_ratio=0.0,
-                        anchor_drift_rho=0.0,
-                        dt_scale=1.0,
-                        extrinsic_scale=1.0,
-                        trust_alpha=1.0,
                     ),
                 )
-                runtime_counts = consume_runtime_counters()
-                device_runtime_cert = DeviceRuntimeCert(
-                    host_sync_count_est=runtime_counts.host_sync_count_est,
-                    device_to_host_bytes_est=runtime_counts.device_to_host_bytes_est,
-                    host_to_device_bytes_est=runtime_counts.host_to_device_bytes_est,
-                    jit_recompile_count=runtime_counts.jit_recompile_count,
-                )
-                results[0].aggregated_cert.compute.scan_io = scan_io_cert
-                results[0].aggregated_cert.compute.device_runtime = device_runtime_cert
-                self.cert_history.append(aggregate_certificates([results[0].aggregated_cert, iw_process_cert, iw_meas_cert]))
-                if len(self.cert_history) > 100:
-                    self.cert_history.pop(0)
 
-            # Collect diagnostics: minimal tape (default) or full ScanDiagnostics
-            if results and results[0].diagnostics_tape is not None:
-                from dataclasses import replace
-                entry = replace(results[0].diagnostics_tape, scan_number=self.scan_count)
-                self.diagnostics_log.append_tape(entry)
-            elif results and results[0].diagnostics is not None:
-                diag = results[0].diagnostics
-                diag.scan_number = self.scan_count
-                diag.trace_Q_mode = float(jnp.trace(self.Q))
-                diag.trace_Sigma_lidar_mode = float(jnp.trace(self.config.Sigma_meas))
-                diag.trace_Sigma_g_mode = float(jnp.trace(self.config.Sigma_g))
-                diag.trace_Sigma_a_mode = float(jnp.trace(self.config.Sigma_a))
-                self.diagnostics_log.append(diag)
-
-            # Defer publish to next callback (state/TF/path published when next scan starts)
+            # Enqueue publish (drained by ROS timer; non-blocking).
             pose_6d = combined_belief.mean_world_pose()
-            self._pending_publish = (jnp.array(pose_6d), stamp_sec)
+            if len(self._publish_queue) >= self._publish_queue.maxlen:
+                self._publish_queue.popleft()
+                self._publish_drop_count += 1
+            self._publish_queue.append((jnp.array(pose_6d), stamp_sec))
 
             # Odom vs belief diagnostic: append one row (raw odom, belief start, belief end)
             if self._odom_belief_diagnostic_file and (self._odom_belief_diagnostic_max <= 0 or self.scan_count <= self._odom_belief_diagnostic_max):
@@ -1978,6 +2167,25 @@ class GeometricCompositionalBackend(Node):
                 except OSError as e:
                     self.get_logger().warn(f"Odom/belief diagnostic write failed: {e}")
 
+            # Diagnostics at end of callback (after publish and odom-belief); run when needed.
+            if results:
+                runtime_counts = consume_runtime_counters()
+                device_runtime_cert = DeviceRuntimeCert(
+                    host_sync_count_est=runtime_counts.host_sync_count_est,
+                    device_to_host_bytes_est=runtime_counts.device_to_host_bytes_est,
+                    host_to_device_bytes_est=runtime_counts.host_to_device_bytes_est,
+                    jit_recompile_count=runtime_counts.jit_recompile_count,
+                )
+                results[0].aggregated_cert.compute.scan_io = scan_io_cert
+                results[0].aggregated_cert.compute.device_runtime = device_runtime_cert
+                self.cert_history.append(aggregate_certificates([results[0].aggregated_cert, iw_process_cert, iw_meas_cert]))
+                if len(self.cert_history) > 100:
+                    self.cert_history.pop(0)
+                if results[0].diagnostics_tape is not None:
+                    from dataclasses import replace
+                    entry = replace(results[0].diagnostics_tape, scan_number=self.scan_count)
+                    self.diagnostics_log.append_tape(entry)
+
             if self.scan_count <= 10 or self.scan_count % 50 == 0:
                 self.get_logger().info(
                     f"Scan {self.scan_count}: {n_points} pts, pipeline #{self.pipeline_runs}, "
@@ -1993,7 +2201,11 @@ class GeometricCompositionalBackend(Node):
 
     def _publish_state_from_pose(self, pose_6d: jnp.ndarray, stamp_sec: float):
         """Publish state from a 6D pose [trans, rotvec] in anchor frame. Export uses anchor_correction ∘ pose."""
-        pose_export = se3_compose(self.anchor_correction, pose_6d)
+        with self._state_lock:
+            anchor_correction = self.anchor_correction
+            primitive_map = self.primitive_map
+            current_belief = self.current_belief
+        pose_export = se3_compose(anchor_correction, pose_6d)
         rotvec, trans = se3_to_rotvec_trans(pose_export)
         R = Rotation.from_rotvec(np.array(rotvec))
         quat = R.as_quat()
@@ -2049,10 +2261,10 @@ class GeometricCompositionalBackend(Node):
             self.rerun_visualizer.log_trajectory(path_xyz, stamp_sec)
 
         # PrimitiveMap as PointCloud2 (/gc/map/points)
-        if self.map_publisher is not None and self.primitive_map is not None:
+        if self.map_publisher is not None and primitive_map is not None:
             tile_ids = None
-            if self.current_belief is not None:
-                pose = self.current_belief.mean_world_pose(eps_lift=self.config.eps_lift)
+            if current_belief is not None:
+                pose = current_belief.mean_world_pose(eps_lift=self.config.eps_lift)
                 center_xyz = np.asarray(pose[:3], dtype=np.float64).reshape(3)
                 tile_ids = ma_hex_stencil_tile_ids(
                     center_xyz=center_xyz,
@@ -2060,7 +2272,7 @@ class GeometricCompositionalBackend(Node):
                     radius_xy=int(self.config.R_ACTIVE_TILES_XY),
                     radius_z=int(self.config.R_ACTIVE_TILES_Z),
                 )
-            self.map_publisher.publish(self.primitive_map, stamp_sec, tile_ids=tile_ids)
+            self.map_publisher.publish(primitive_map, stamp_sec, tile_ids=tile_ids)
         
         # TUM export
         if self.trajectory_file:
@@ -2073,16 +2285,28 @@ class GeometricCompositionalBackend(Node):
     def _publish_status(self):
         """Publish periodic status."""
         elapsed = time.time() - self.node_start_time
-        
-        prim_count = int(self.primitive_map.total_count) if self.primitive_map is not None else 0
+
+        with self._state_lock:
+            primitive_map = self.primitive_map
+        prim_count = int(primitive_map.total_count) if primitive_map is not None else 0
         status = {
             "elapsed_sec": elapsed,
             "odom_count": self.odom_count,
             "scan_count": self.scan_count,
             "imu_count": self.imu_count,
+            "lidar_msg_count": self._lidar_msg_count,
+            "lidar_drop_count": self._lidar_drop_count,
+            "lidar_error_count": self._lidar_error_count,
+            "lidar_queue_len": len(self._lidar_queue),
+            "lidar_queue_max": self._lidar_queue.maxlen,
+            "publish_drop_count": self._publish_drop_count,
+            "publish_queue_len": len(self._publish_queue),
+            "publish_queue_max": self._publish_queue.maxlen,
             "pipeline_runs": self.pipeline_runs,
             "hypotheses": self.config.K_HYP,
             "primitive_map_count": prim_count,
+            "time_align_enabled": bool(self._time_align_enabled),
+            "time_align_reference": self._time_align_reference,
         }
         
         msg = String()
@@ -2092,18 +2316,24 @@ class GeometricCompositionalBackend(Node):
         self.get_logger().info(
             f"GC Status: odom={self.odom_count}, scans={self.scan_count}, "
             f"imu={self.imu_count}, pipeline={self.pipeline_runs}, "
-            f"primitive_map={prim_count}"
+            f"primitive_map={prim_count}, "
+            f"lidar_q={len(self._lidar_queue)}/{self._lidar_queue.maxlen} drops={self._lidar_drop_count} errors={self._lidar_error_count}, "
+            f"pub_q={len(self._publish_queue)}/{self._publish_queue.maxlen} drops={self._publish_drop_count}"
         )
 
     def destroy_node(self):
         """Clean up."""
         if self.rerun_visualizer is not None:
             self.rerun_visualizer.flush()
-        # Drain deferred publish so last scan state is written
-        if self._pending_publish is not None:
-            pose_6d, stamp = self._pending_publish
-            self._publish_state_from_pose(pose_6d, stamp)
-            self._pending_publish = None
+        # Stop LiDAR worker thread.
+        with self._lidar_cv:
+            self._lidar_worker_stop = True
+            self._lidar_cv.notify_all()
+        if self._lidar_worker is not None:
+            self._lidar_worker.join(timeout=2.0)
+        # Drain publish queue so last scan state is written
+        while self._publish_queue:
+            self._drain_publish_queue()
         if self.trajectory_file:
             self.trajectory_file.flush()
             self.trajectory_file.close()
@@ -2113,7 +2343,7 @@ class GeometricCompositionalBackend(Node):
             self._event_log_file.close()
 
         # Save diagnostics log for dashboard
-        diagnostics_path = str(self.get_parameter("diagnostics_export_path").value)
+        diagnostics_path = self._params["diagnostics_export_path"]
         if diagnostics_path and self.diagnostics_log.total_scans > 0:
             self.diagnostics_log.end_time = time.time()
             try:
@@ -2129,7 +2359,7 @@ class GeometricCompositionalBackend(Node):
                 self.get_logger().warn(f"Failed to save diagnostics: {e}")
 
         # Export primitive map for post-run JAXsplat (or other) visualization
-        splat_path = str(self.get_parameter("splat_export_path").value).strip()
+        splat_path = self._params["splat_export_path"].strip()
         if splat_path and self.primitive_map is not None and self.primitive_map.total_count > 0:
             try:
                 import os

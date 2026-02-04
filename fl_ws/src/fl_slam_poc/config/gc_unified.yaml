@@ -4,37 +4,12 @@ gc_sensor_hub:
       input_topic: /acl_jackal/lidar_points
       output_topic: /gc/sensors/lidar_points
       qos_depth: 10
-      publish_time_reference: true
-      time_reference_topic: /gc/sensors/time_reference
-    odom_normalizer:
-      input_topic: /acl_jackal/jackal_velocity_controller/odom
-      output_topic: /gc/sensors/odom
-      output_frame: ''
-      child_frame: ''
-      enable_time_alignment: true
-      time_reference_topic: /gc/sensors/time_reference
-      max_drift_sec: 0.5
-    imu_normalizer:
-      input_topic: /acl_jackal/forward/imu
-      output_topic: /gc/sensors/imu
-      output_frame: ''
-      enable_time_alignment: true
-      time_reference_topic: /gc/sensors/time_reference
-      max_drift_sec: 0.5
-    dead_end_audit:
-      topic_specs:
-      - /acl_jackal/forward/infra1/image_rect_raw/compressed|sensor_msgs/msg/CompressedImage
-      - /acl_jackal/forward/infra2/image_rect_raw/compressed|sensor_msgs/msg/CompressedImage
-      required_topics: []
-      required_timeout_sec: 10.0
-      status_publish_period_sec: 5.0
-      qos_reliability: best_effort
-      qos_depth: 10
+      publish_time_reference: false
 gc_backend:
   ros__parameters:
     lidar_topic: /gc/sensors/lidar_points
-    odom_topic: /gc/sensors/odom
-    imu_topic: /gc/sensors/imu
+    odom_topic: /acl_jackal/jackal_velocity_controller/odom
+    imu_topic: /acl_jackal/forward/imu
     odom_frame: acl_jackal2/odom
     base_frame: acl_jackal2/base
     pointcloud_layout: vlp16
@@ -59,6 +34,8 @@ gc_backend:
     init_window_odom_count: 10
     enable_timing: false
     enable_parallel_stages: true
+    time_alignment_profile: /home/will/Documents/Coding/Phantom Fellowship MIT/Impact_Project_v1/config/time_alignment/kimera_10_14_acl_jackal_005.yaml
+    time_alignment_reference_topic: /acl_jackal/lidar_points
     map_backend: primitive_map
     pose_evidence_backend: primitives
     eps_psd: 1e-12
@@ -90,6 +67,7 @@ gc_backend:
     k_assoc: 8
     k_sinkhorn: 50
     k_insert_tile: 64
+    k_merge_pairs_tile: 4
     primitive_map_max_size: 50000
     primitive_forgetting_factor: 0.999
     primitive_merge_threshold: 0.1

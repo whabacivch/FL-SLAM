@@ -419,15 +419,7 @@ def extract_lidar_surfels(
             ess_total=float(n_use),
             support_frac=support_frac,
         ),
-        influence=InfluenceCert(
-            lift_strength=0.0,
-            psd_projection_delta=0.0,
-            mass_epsilon_ratio=0.0,
-            anchor_drift_rho=0.0,
-            dt_scale=1.0,
-            extrinsic_scale=1.0,
-            trust_alpha=1.0,
-        ),
+        influence=InfluenceCert.identity(),
     )
 
     effect = ExpectedEffect(

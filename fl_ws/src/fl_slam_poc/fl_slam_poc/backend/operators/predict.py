@@ -186,14 +186,10 @@ def predict_diffusion(
             cond=float(cond),
             near_null_count=int(near_null_count),
         ),
-        influence=InfluenceCert(
+        influence=InfluenceCert.identity().with_overrides(
             lift_strength=float(lift_prev) + float(lift_inv),
             psd_projection_delta=float(total_projection_delta),
-            mass_epsilon_ratio=0.0,
-            anchor_drift_rho=0.0,
             dt_scale=dt_sec_val,
-            extrinsic_scale=1.0,
-            trust_alpha=1.0,
         ),
     )
 

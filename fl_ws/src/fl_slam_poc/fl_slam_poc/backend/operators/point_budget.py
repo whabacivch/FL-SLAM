@@ -207,14 +207,8 @@ def point_budget_resample(
             ess_total=float(ess),
             support_frac=support_frac,
         ),
-        influence=InfluenceCert(
-            lift_strength=0.0,
-            psd_projection_delta=0.0,
+        influence=InfluenceCert.identity().with_overrides(
             mass_epsilon_ratio=constants.GC_EPS_MASS / (float(total_mass_in) + constants.GC_EPS_MASS),
-            anchor_drift_rho=0.0,
-            dt_scale=1.0,
-            extrinsic_scale=1.0,
-            trust_alpha=1.0,
         ),
     )
 

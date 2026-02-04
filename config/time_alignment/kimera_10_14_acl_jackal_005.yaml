@@ -1,0 +1,21 @@
+time_alignment:
+  reference: /acl_jackal/lidar_points
+  window_sec: 60.0
+  t0_sec: 1665772901.387538
+  streams:
+    /acl_jackal/forward/imu:
+      offset_sec: -4.0650367736816406e-05
+      drift_sec_per_sec: 8.742070740081122e-07
+      t0_sec: 1665772901.387538
+    /acl_jackal/jackal_velocity_controller/odom:
+      offset_sec: -0.0005834102630615234
+      drift_sec_per_sec: 5.6820291124087336e-05
+      t0_sec: 1665772901.387538
+    /acl_jackal/forward/color/image_raw/compressed:
+      offset_sec: -0.009879112243652344
+      drift_sec_per_sec: 0.00033284857673818527
+      t0_sec: 1665772901.387538
+    /acl_jackal/forward/depth/image_rect_raw:
+      offset_sec: -0.03444206714630127
+      drift_sec_per_sec: -7.204473007410586e-05
+      t0_sec: 1665772901.387538

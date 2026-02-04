@@ -189,16 +189,7 @@ These remaining gaps (IMU cov, LiDAR intensity, consistency-based weighting) can
 
 ### 5.6 Frame or axis convention mismatch (investigation)
 
-**Report first (code vs docs):**
-
-- **FRAME_AND_QUATERNION_CONVENTIONS.md**: Kimera LiDAR frame `acl_jackal2/velodyne_link` is **Z-up** (ground normal · Z ≈ 0.996); `T_base_lidar` from calibration.
-- **Code:** `backend_node.py` applies `pts_base = R_base_lidar @ pts_np.T + t_base_lidar`; `gc_kimera.yaml` sets `T_base_lidar` from Kimera calibration.
-
-**Observed (evaluation):** For frame correction and anchor smoothing see `archive/docs/` (archived dataset docs).
-
-**Interpretation:** If the LiDAR frame is actually Z-down and we use the current rotation, geometry would be Z-flipped; run `tools/diagnose_coordinate_frames.py` and set `T_base_lidar` rotation to `[π, 0, 0]` if the diagnostic reports Z-down.
-
-**Recommendation:** Run `tools/diagnose_coordinate_frames.py` on the bag; align `FRAME_AND_QUATERNION_CONVENTIONS.md` and `T_base_lidar` with the result. See [KIMERA_FRAME_MAPPING.md](KIMERA_FRAME_MAPPING.md).
+See [FRAME_AND_QUATERNION_CONVENTIONS.md](FRAME_AND_QUATERNION_CONVENTIONS.md) and [KIMERA_FRAME_MAPPING.md](KIMERA_FRAME_MAPPING.md). Code: `backend_node.py` applies `pts_base = R_base_lidar @ pts_np.T + t_base_lidar`; `gc_kimera.yaml` sets `T_base_lidar`. Run `tools/diagnose_coordinate_frames.py` on the bag; if it reports Z-down, set `T_base_lidar` rotation to `[π, 0, 0]`.
 
 ---
 

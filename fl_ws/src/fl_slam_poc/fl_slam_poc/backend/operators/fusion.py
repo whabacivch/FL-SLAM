@@ -128,13 +128,7 @@ def fusion_scale_from_certificates(
             dt_asymmetry=float(dt_asymmetry),
             z_to_xy_ratio=float(z_to_xy_ratio),
         ),
-        influence=InfluenceCert(
-            lift_strength=0.0,
-            psd_projection_delta=0.0,
-            mass_epsilon_ratio=0.0,
-            anchor_drift_rho=0.0,
-            dt_scale=1.0,
-            extrinsic_scale=1.0,
+        influence=InfluenceCert.identity().with_overrides(
             trust_alpha=alpha,
         ),
     )
@@ -207,13 +201,8 @@ def info_fusion_additive(
             cond=L_post_result.conditioning.cond,
             near_null_count=L_post_result.conditioning.near_null_count,
         ),
-        influence=InfluenceCert(
-            lift_strength=0.0,
+        influence=InfluenceCert.identity().with_overrides(
             psd_projection_delta=L_post_result.projection_delta,
-            mass_epsilon_ratio=0.0,
-            anchor_drift_rho=0.0,
-            dt_scale=1.0,
-            extrinsic_scale=1.0,
             trust_alpha=alpha,
         ),
     )

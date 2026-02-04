@@ -4,10 +4,43 @@ Project: Frobenius-Legendre SLAM POC (Impact Project_v1)
 
 This file tracks all significant changes, design decisions, and implementation milestones for the FL-SLAM project.
 
+## 2026-02-04: Docs consolidated (Kimera calibration, pipeline depth)
+
+- **Removed:** `docs/KIMERA_CALIBRATION_AND_FRAME.md` and `docs/PIPELINE_DEPTH_CONTRACT.md`.
+- **Merged:** Kimera calibration content (directory layout, how GC gets extrinsics, GT vs estimate/ATE) into `docs/KIMERA_FRAME_MAPPING.md`. Depth contract (camera_depth authoritative, one fused depth path) merged into `docs/PIPELINE_ORDER_AND_EVIDENCE.md`.
+- **Trimmed:** `docs/FRAME_AND_QUATERNION_CONVENTIONS.md` Kimera frame names to a pointer to KIMERA_FRAME_MAPPING; `docs/PIPELINE_DESIGN_GAPS.md` §5.6 shortened to a pointer. References updated in README, DATASET_DOWNLOAD_GUIDE, and doc cross-links.
+
+## 2026-02-04: Pipeline NaN checks migrated to JAX
+
+- **Pipeline (pipeline.py)**: Replaced NumPy-based finite checks on JAX arrays with JAX checks to avoid full-array syncs. Use `jnp.all(jnp.isfinite(x))` / `jnp.any(~jnp.isfinite(x))` and sync only a boolean (or small aggregates on failure). Applied to: `omega_avg`, `rotvec0`/`pose_pred_local`/`delta_pose_int`, per-block L evidence checks, and `L_evidence` diagnostic (with block-wise `jnp.any(~jnp.isfinite(block))` for error messages). NumPy sync only on failure for error construction or for downstream `np.linalg.eigvalsh(L_total_np)` in diagnostics.
+- **Left as NumPy**: backend_node (ROS/numpy cov/pose), frontend sensors (ROS/list data), sinkhorn_ot (numpy cost matrix), primitive_map (numpy in merge path). No change where data is already on host.
+
+## 2026-02-04: Map merge-reduce enabled (fixed budget) + no-gate map update
+
+- **PrimitiveMap merge-reduce**: Implemented fixed-budget merge-reduce per tile (Bhattacharyya distance + moment matching), with `K_MERGE_PAIRS_PER_TILE=4` and weight-weighted vMF/color merge; Frobenius correction applied and certified when merges occur. Added `k_merge_pairs_tile` to runtime config/manifest and unified YAML. Updated map maintenance to run merge-reduce after cull/forget each scan.
+- **Map update invariants**: Removed `n_valid` gates in fuse/insert paths; map update now runs every scan with mask-only no-op behavior when there are no valid measurements. Added `merged_count` to `MapUpdateCert`.
+
+## 2026-02-04: Frontend simplification + backend time alignment (profile)
+
+- **Removed audit/normalizer nodes**: Deleted dead-end audit and wiring auditor nodes, and removed IMU/odom normalizer nodes and their launch/config wiring. Sensor hub now only runs `pointcloud_passthrough`.
+- **Backend time alignment**: Added calibrated per-stream time alignment in backend using a profile (offset + drift) relative to LiDAR scan clock. IMU, visual, camera, and odom streams are aligned for selection/windowing without gating.
+
+## 2026-02-03: Time sync at pipeline start; diagnostics deferred; gyro JIT
+
+- **Time sync at start**: Backend node now performs a single device→host time sync at the beginning of the LiDAR callback: materialize `timestamps_min`/`timestamps_max` once, then compute `scan_start_time`, `scan_end_time`, `dt_sec` in Python. No further device sync for time; removes scattered `record_device_to_host` for stamp/scan bounds/dt.
+- **Diagnostics at end**: Diagnostics (runtime counters, device_runtime_cert, cert_history, diagnostics_log append) run at the end of the callback after publish enqueue and odom-belief CSV, so the hot path is pipeline → combine → IW update → publish.
+- **Gyro JIT**: `imu_gyro_rotation_evidence` core is JIT-compiled via `_imu_gyro_rotation_evidence_jax` + `_imu_gyro_rotation_evidence_jit`; removed NumPy NaN checks that blocked JIT. Cert/effect built after one host sync.
+
 ## 2026-02-04: Jackal2 camera calibration + time reference QoS alignment
 
 - Updated `gc_unified.yaml` with acl_jackal2 camera intrinsics (from `/acl_jackal/forward/color/camera_info`) and `T_base_camera` extrinsics from Kimera calibration.
 - Aligned `/gc/sensors/time_reference` subscriptions to best-effort QoS (camera_rgbd_node + odom_normalizer) to match LiDAR passthrough and remove time alignment mismatch.
+
+## 2026-02-04: Async LiDAR processing + thread-safe buffers
+
+- Made LiDAR processing asynchronous with a bounded queue and worker thread to prevent callback blocking and scan drops.
+- Added publish queue + timer to keep ROS publishing on the ROS thread while decoupling heavy JAX compute.
+- Added locks for shared buffers and map/anchor state; status now reports queue depths and drop counts.
 
 ## 2026-02-02: Backend params applied for primitive budgets (config mismatch fix)
 
@@ -3284,6 +3317,18 @@ Status monitoring: Will report DEAD_RECKONING if no loop factors
 - `pytest -q` under `fl_ws/src/fl_slam_poc` passes.
 - `colcon build --packages-select fl_slam_poc` succeeds.
 - `bash scripts/run_and_evaluate.sh` runs end-to-end on M3DGR (trajectory quality remains under investigation).
+
+## 2026-02-04
+### Simplification
+- Added shared no-op helper for primitive map early-exit returns and refactored repeated no-op blocks.
+- Added `InfluenceCert.identity()`/`with_overrides()` and updated default influence construction across operators.
+- Added GC 22D index slices in `constants.py` and replaced raw slice literals in 22D evidence paths.
+- Added parameter schema loading in backend node and centralized parameter defaults/casts.
+- Unified IMU accel scale and covariance toggle reads through the parameter cache.
+- Refactored diagnostics to minimal tape + certificate summary (full ScanDiagnostics deprecated) and updated dashboard.
+- Added merge-reduce tile-size cap and merged no-op handling with explicit budget trigger.
+- Added constants index for auditability.
+- Added test helpers for certificate construction to reduce duplication.
 
 ## 2026-02-03
 ### Phase 6 (Real Tiling)

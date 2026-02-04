@@ -105,15 +105,7 @@ def deskew_constant_twist(
         chart_id=chart_id,
         anchor_id=anchor_id,
         support=SupportCert(ess_total=float(ess_imu), support_frac=retained),
-        influence=InfluenceCert(
-            lift_strength=0.0,
-            psd_projection_delta=0.0,
-            mass_epsilon_ratio=0.0,
-            anchor_drift_rho=0.0,
-            dt_scale=1.0,
-            extrinsic_scale=1.0,
-            trust_alpha=1.0,
-        ),
+        influence=InfluenceCert.identity(),
     )
 
     effect = ExpectedEffect(

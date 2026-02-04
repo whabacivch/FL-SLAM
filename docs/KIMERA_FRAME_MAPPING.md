@@ -1,8 +1,32 @@
 # Kimera Dataset Frame Mapping (GC v2)
 
-This document is the **single source of truth** for mapping Kimera dataset frames to GC v2 parameters. For **where calibration and frame info live** in the Kimera bag directory and how to fix evaluation alignment, see [KIMERA_CALIBRATION_AND_FRAME.md](KIMERA_CALIBRATION_AND_FRAME.md). Frame names and conventions were taken from the Kimera bag sample summary `rosbags/Kimera_Data/ros2/10_14_acl_jackal-005_sample25.md` (first-25-messages inspection). When a physical Kimera ROS 2 bag is available, use **[KIMERA_BAG_INSPECTION.md](KIMERA_BAG_INSPECTION.md)** for the full inspection checklist (frames, first-N messages, Z-up/Z-down, extrinsics, timing); run `tools/validate_frame_conventions.py` or `tools/inspect_rosbag_deep.py` to confirm or update frame values.
+This document is the **single source of truth** for Kimera frames, calibration paths, and GC config. Frame names and conventions were taken from the Kimera bag sample `rosbags/Kimera_Data/ros2/10_14_acl_jackal-005_sample25.md`. When a physical Kimera ROS 2 bag is available, use **[KIMERA_BAG_INSPECTION.md](KIMERA_BAG_INSPECTION.md)** for the inspection checklist; run `tools/validate_frame_conventions.py` or `tools/inspect_rosbag_deep.py` to confirm or update frame values.
 
-**Reference:** [FRAME_AND_QUATERNION_CONVENTIONS.md](FRAME_AND_QUATERNION_CONVENTIONS.md) for GC internal conventions (Z-up world, base planar, T_{parent<-child}).
+**Reference:** [FRAME_AND_QUATERNION_CONVENTIONS.md](FRAME_AND_QUATERNION_CONVENTIONS.md) for GC conventions (Z-up world, base planar, T_{parent<-child}).
+
+---
+
+## Directory layout (Kimera_Data)
+
+All paths below are under `rosbags/Kimera_Data/`.
+
+| Path | Purpose |
+|------|--------|
+| **calibration/README.md** | Conventions: `T_a_b` maps frame b → frame a; `T_BS` = sensor w.r.t. body. |
+| **calibration/robots/<robot>/extrinsics.yaml** | Per-robot 4×4 transforms: `T_baselink_lidar`, `T_cameralink_gyro`, etc. |
+| **calibration/extrinsics_manifest.yaml** | Index of robots and transform names. |
+| **dataset_ready_manifest.yaml** | Mapping: `ros2_bag`, `ground_truth_tum`, `extrinsics`. |
+| **PREP_README.md** | GT format (TUM: timestamp x y z qx qy qz qw); sequences 1014, 1207, 1208. |
+| **ground_truth/<seq>/<robot>_gt.tum** | Ground truth trajectory (e.g. `1014/acl_jackal_gt.tum`). |
+
+For **acl_jackal** (bag `10_14_acl_jackal-005`): extrinsics at `calibration/robots/acl_jackal/extrinsics.yaml`; GT at `ground_truth/1014/acl_jackal_gt.tum`.
+
+---
+
+## How GC gets extrinsics
+
+- **Tool:** `tools/kimera_calibration_to_gc.py` reads `robots/acl_jackal/extrinsics.yaml` and outputs GC format `[x, y, z, rx, ry, rz]` (translation m, rotvec rad). `T_baselink_lidar` → **T_base_lidar**; `T_cameralink_gyro` → **T_base_imu** (rotation overridable with `--imu-rotation`).
+- **Config:** `fl_ws/src/fl_slam_poc/config/gc_kimera.yaml` contains the values (from that tool or dataset). Eval script passes the same via launch args.
 
 ---
 
@@ -57,11 +81,11 @@ python tools/diagnose_coordinate_frames.py rosbags/Kimera_Data/ros2/10_14_acl_ja
 
 ---
 
-## Ground truth frame vs GC anchor
+## Ground truth frame vs GC anchor (why ATE can be wrong)
 
-- **Kimera GT:** From `ground_truth/<seq>/<robot>_gt.tum` (e.g. world frame “p” or dataset-specific). Timestamps in seconds (from CSV ns).
-- **GC anchor:** Trajectory is exported in anchor frame (first odom as origin).
-- **Evaluation:** We align GT timestamps to the estimate timeline with `align_ground_truth.py`, then use **initial-pose alignment** in `evaluate_slam.py` (GT → estimate frame at first pose). No extra transform needed unless GT is in a different body frame than GC base; then a body calib (e.g. body_T_wheel) can be used if provided.
+- **Kimera GT:** From `ground_truth/<seq>/<robot>_gt.tum`. Timestamps in seconds. Dataset_ready_manifest says *"Align frames to GC v2 conventions before eval."*
+- **GC anchor:** Trajectory is exported in anchor frame (first odom as origin), Z-up planar, TUM format.
+- **Evaluation:** We align GT timestamps with `align_ground_truth.py`, then **initial-pose alignment** in `evaluate_slam.py` (GT → estimate at first pose). If GT is in a different world frame (e.g. different up/forward axis), initial-pose alignment can still leave axis semantics mismatched → huge ATE/RPE. **What to do:** (1) Confirm GT frame in dataset docs. (2) If needed, add a GT→estimate frame transform in `align_ground_truth.py` or `evaluate_slam.py`. (3) Treat very large ATE/RPE as frame/convention mismatch; see the note from `run_and_evaluate_gc.sh` when ATE > 10 m or RPE @ 1 m > 1.
 
 ---
 
@@ -127,3 +151,15 @@ Kimera bag topics and frame_ids (from dataset README / sample):
 - **Frame:** Forward camera optical frame (e.g. `acl_jackal2/forward_color_optical_frame`, `acl_jackal2/forward_depth_optical_frame`).
 
 GC launch defaults for Kimera: `camera_rgb_compressed_topic:=/acl_jackal/forward/color/image_raw/compressed`, `camera_depth_raw_topic:=/acl_jackal/forward/depth/image_rect_raw`. See `gc_rosbag.launch.py` camera args.
+
+---
+
+## Quick reference: files we read
+
+| What | File(s) |
+|------|--------|
+| LiDAR/IMU extrinsics (acl_jackal) | `rosbags/Kimera_Data/calibration/robots/acl_jackal/extrinsics.yaml` |
+| GC config (Kimera profile) | `fl_ws/src/fl_slam_poc/config/gc_kimera.yaml` |
+| Convert calib → GC | `python tools/kimera_calibration_to_gc.py rosbags/Kimera_Data/calibration/robots/acl_jackal/extrinsics.yaml` |
+| Bag ↔ GT ↔ extrinsics | `rosbags/Kimera_Data/dataset_ready_manifest.yaml` |
+| GT trajectory (10_14 acl_jackal) | `rosbags/Kimera_Data/ground_truth/1014/acl_jackal_gt.tum` |

@@ -21,7 +21,10 @@ from fl_slam_poc.common.certificates import (
     InfluenceCert,
     MismatchCert,
 )
-from fl_slam_poc.common.primitives import domain_projection_psd, spd_cholesky_inverse_lifted
+from fl_slam_poc.common.primitives import (
+    domain_projection_psd_core,
+    spd_cholesky_inverse_lifted_core,
+)
 from fl_slam_poc.common.geometry import se3_jax
 
 
@@ -30,6 +33,71 @@ class ImuGyroEvidenceResult:
     L_gyro: jnp.ndarray  # (22,22)
     h_gyro: jnp.ndarray  # (22,)
     r_rot: jnp.ndarray   # (3,) rotation residual
+
+
+def _imu_gyro_rotation_evidence_jax(
+    rotvec_start_WB: jnp.ndarray,
+    rotvec_end_pred_WB: jnp.ndarray,
+    delta_rotvec_meas: jnp.ndarray,
+    Sigma_g: jnp.ndarray,
+    dt_int: jnp.ndarray,  # scalar 0-d
+    eps_psd: float,
+    eps_lift: float,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """
+    JIT-compiled core: returns (L, h, r_rot, nll_proxy, eig_min, eig_max, near_null_count, lift_strength).
+    All outputs are JAX arrays (scalars as 0-d) for JIT compatibility.
+    """
+    rotvec_start_WB = jnp.asarray(rotvec_start_WB, dtype=jnp.float64).reshape(-1)
+    rotvec_end_pred_WB = jnp.asarray(rotvec_end_pred_WB, dtype=jnp.float64).reshape(-1)
+    delta_rotvec_meas = jnp.asarray(delta_rotvec_meas, dtype=jnp.float64).reshape(-1)
+    Sigma_g = jnp.asarray(Sigma_g, dtype=jnp.float64)
+    dt_pos = jnp.maximum(jnp.asarray(dt_int, dtype=jnp.float64), 0.0)
+
+    R_start = se3_jax.so3_exp(rotvec_start_WB)
+    R_delta = se3_jax.so3_exp(delta_rotvec_meas)
+    R_end_imu = R_start @ R_delta
+    R_end_pred = se3_jax.so3_exp(rotvec_end_pred_WB)
+    R_diff = R_end_pred.T @ R_end_imu
+    r_rot = se3_jax.so3_log(R_diff)
+
+    eps_mass = constants.GC_EPS_MASS
+    dt_eff = dt_pos + eps_mass
+    mass_scale = dt_pos / dt_eff
+
+    Sigma_rot = Sigma_g * dt_eff
+    Sigma_rot_psd, _ = domain_projection_psd_core(Sigma_rot, eps_psd)
+    L_rot, lift_strength = spd_cholesky_inverse_lifted_core(Sigma_rot_psd, eps_lift)
+    L_rot_scaled = mass_scale * L_rot
+
+    L = jnp.zeros((D_Z, D_Z), dtype=jnp.float64)
+    L = L.at[constants.GC_IDX_ROT, constants.GC_IDX_ROT].set(L_rot_scaled)
+    h = jnp.zeros((D_Z,), dtype=jnp.float64)
+    h = h.at[constants.GC_IDX_ROT].set(L_rot_scaled @ r_rot)
+
+    nll_proxy = 0.5 * (r_rot @ L_rot @ r_rot)
+    L_rot_psd, _ = domain_projection_psd_core(L_rot, eps_psd)
+    eigvals = jnp.linalg.eigvalsh(L_rot_psd)
+    eig_min = jnp.min(eigvals)
+    eig_max = jnp.max(eigvals)
+    near_null_count = jnp.sum(eigvals < eps_psd)
+    return L, h, r_rot, nll_proxy, eig_min, eig_max, near_null_count, lift_strength
+
+
+@jax.jit
+def _imu_gyro_rotation_evidence_jit(
+    rotvec_start_WB: jnp.ndarray,
+    rotvec_end_pred_WB: jnp.ndarray,
+    delta_rotvec_meas: jnp.ndarray,
+    Sigma_g: jnp.ndarray,
+    dt_int: jnp.ndarray,
+    eps_psd: float,
+    eps_lift: float,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    return _imu_gyro_rotation_evidence_jax(
+        rotvec_start_WB, rotvec_end_pred_WB, delta_rotvec_meas, Sigma_g,
+        dt_int, eps_psd, eps_lift,
+    )
 
 
 def imu_gyro_rotation_evidence(
@@ -57,84 +125,39 @@ def imu_gyro_rotation_evidence(
     where dt_int = Σ_i Δt_i over actual IMU sample intervals (bag-agnostic definition).
     
     Continuous mass check: if dt_int ≈ 0 (no samples), evidence is ~0 without boolean gates.
+    Core computation is JIT-compiled; cert/effect are built after one host sync.
     """
-    rotvec_start_WB = jnp.asarray(rotvec_start_WB, dtype=jnp.float64).reshape(-1)
-    rotvec_end_pred_WB = jnp.asarray(rotvec_end_pred_WB, dtype=jnp.float64).reshape(-1)
-    delta_rotvec_meas = jnp.asarray(delta_rotvec_meas, dtype=jnp.float64).reshape(-1)
-    Sigma_g = jnp.asarray(Sigma_g, dtype=jnp.float64)
-
-    R_start = se3_jax.so3_exp(rotvec_start_WB)
-    R_delta = se3_jax.so3_exp(delta_rotvec_meas)
-    R_end_imu = R_start @ R_delta
-    R_end_pred = se3_jax.so3_exp(rotvec_end_pred_WB)
-
-    # Residual must be pred^{-1} ∘ meas so that the canonical quadratic term
-    # 0.5 (r - 0)^T Σ^{-1} (r - 0) drives R_end_pred toward R_end_imu.
-    R_diff = R_end_pred.T @ R_end_imu
-    r_rot = se3_jax.so3_log(R_diff)
-
-    # dt_int is bag-agnostic: sum of actual IMU sample intervals.
-    # Continuous mass check: when dt_int -> 0, evidence weight -> 0 (no boolean gates).
-    eps_mass = constants.GC_EPS_MASS
-    dt_pos = jnp.maximum(jnp.array(dt_int, dtype=jnp.float64), 0.0)
-    dt_eff = dt_pos + eps_mass  # strictly-positive for PSD/inversion stability
-    mass_scale = dt_pos / dt_eff
-
-    Sigma_rot = Sigma_g * dt_eff
-    Sigma_rot_psd = domain_projection_psd(Sigma_rot, eps_psd).M_psd
-    L_rot, lift_strength = spd_cholesky_inverse_lifted(Sigma_rot_psd, eps_lift)
-    
-    # Diagnostic: check for NaN at each step
-    import numpy as _np
-    if not _np.all(_np.isfinite(_np.array(R_diff))):
-        raise ValueError(f"R_diff has NaN: {_np.array(R_diff)}")
-    if not _np.all(_np.isfinite(_np.array(r_rot))):
-        raise ValueError(f"r_rot has NaN from so3_log. R_diff trace={float(jnp.trace(R_diff)):.6f}")
-    if not _np.all(_np.isfinite(_np.array(L_rot))):
-        raise ValueError(f"L_rot has NaN. Sigma_rot diag={_np.diag(_np.array(Sigma_rot))}, dt_eff={float(dt_eff)}")
-    
-    # Scale evidence by continuous mass (branch-free)
-    L_rot_scaled = mass_scale * L_rot
-
-    L = jnp.zeros((D_Z, D_Z), dtype=jnp.float64)
-    # GC ordering: [trans(0:3), rot(3:6)] - rotation evidence goes to [3:6] block
-    L = L.at[3:6, 3:6].set(L_rot_scaled)
-    h = jnp.zeros((D_Z,), dtype=jnp.float64)
-    h = h.at[3:6].set(L_rot_scaled @ r_rot)
-
-    nll_proxy = 0.5 * float(r_rot @ L_rot @ r_rot)
-
-    eigvals = jnp.linalg.eigvalsh(domain_projection_psd(L_rot, eps_psd).M_psd)
-    eig_min = float(jnp.min(eigvals))
-    eig_max = float(jnp.max(eigvals))
-    cond = eig_max / max(eig_min, 1e-18)
+    dt_int_j = jnp.array(dt_int, dtype=jnp.float64)
+    L, h, r_rot, nll_proxy, eig_min, eig_max, near_null_count, lift_strength = _imu_gyro_rotation_evidence_jit(
+        rotvec_start_WB, rotvec_end_pred_WB, delta_rotvec_meas, Sigma_g,
+        dt_int_j, eps_psd, eps_lift,
+    )
+    # Single sync: materialize scalars for cert/effect (no NumPy; no gates).
+    nll_p = float(nll_proxy)
+    e_min = float(eig_min)
+    e_max = float(eig_max)
+    cond = e_max / max(e_min, 1e-18)
+    n_near = int(near_null_count)
+    lift = float(lift_strength)
 
     cert = CertBundle.create_approx(
         chart_id=chart_id,
         anchor_id=anchor_id,
         triggers=["ImuGyroRotationGaussian"],
         conditioning=ConditioningCert(
-            eig_min=eig_min,
-            eig_max=eig_max,
+            eig_min=e_min,
+            eig_max=e_max,
             cond=cond,
-            near_null_count=int(jnp.sum(eigvals < eps_psd)),
+            near_null_count=n_near,
         ),
-        mismatch=MismatchCert(nll_per_ess=nll_proxy, directional_score=0.0),
-        influence=InfluenceCert(
-            lift_strength=float(lift_strength),
-            psd_projection_delta=0.0,
-            mass_epsilon_ratio=0.0,
-            anchor_drift_rho=0.0,
-            dt_scale=1.0,
-            extrinsic_scale=1.0,
-            trust_alpha=1.0,
+        mismatch=MismatchCert(nll_per_ess=nll_p, directional_score=0.0),
+        influence=InfluenceCert.identity().with_overrides(
+            lift_strength=lift,
         ),
     )
-
     effect = ExpectedEffect(
         objective_name="imu_gyro_rotation_nll_proxy",
-        predicted=nll_proxy,
+        predicted=nll_p,
         realized=None,
     )
-
     return ImuGyroEvidenceResult(L_gyro=L, h_gyro=h, r_rot=r_rot), cert, effect

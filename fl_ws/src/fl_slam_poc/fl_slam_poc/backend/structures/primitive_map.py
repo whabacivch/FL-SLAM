@@ -22,7 +22,7 @@ All operators are fixed-cost and applied every scan.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Callable, Any
 import numpy as np
 
 from fl_slam_poc.common.jax_init import jax, jnp
@@ -605,6 +605,24 @@ def renderable_batch_from_view(
 # =============================================================================
 
 
+def _exact_no_op_result(
+    result_factory: Callable[[], Any],
+    chart_id: str,
+    anchor_id: str,
+    objective_name: str,
+    predicted: float = 0.0,
+    realized: float = 0.0,
+) -> Tuple[Any, CertBundle, ExpectedEffect]:
+    result = result_factory()
+    cert = CertBundle.create_exact(chart_id=chart_id, anchor_id=anchor_id)
+    effect = ExpectedEffect(
+        objective_name=objective_name,
+        predicted=predicted,
+        realized=realized,
+    )
+    return result, cert, effect
+
+
 @dataclass
 class PrimitiveMapInsertResult:
     """Result of PrimitiveMapInsert operator."""
@@ -657,19 +675,19 @@ def primitive_map_insert(
 
     if n_to_insert == 0:
         # No space - return unchanged
-        result = PrimitiveMapInsertResult(
-            atlas_map=atlas_map,
-            tile_id=tile_id,
-            n_inserted=0,
-            new_ids=jnp.array([], dtype=jnp.int64),
-        )
-        cert = CertBundle.create_exact(chart_id=chart_id, anchor_id=anchor_id)
-        effect = ExpectedEffect(
+        return _exact_no_op_result(
+            result_factory=lambda: PrimitiveMapInsertResult(
+                atlas_map=atlas_map,
+                tile_id=tile_id,
+                n_inserted=0,
+                new_ids=jnp.array([], dtype=jnp.int64),
+            ),
+            chart_id=chart_id,
+            anchor_id=anchor_id,
             objective_name="primitive_map_insert",
             predicted=float(M),
             realized=0.0,
         )
-        return result, cert, effect
 
     # Find empty slots
     empty_indices = jnp.where(~tile.valid_mask, size=n_to_insert)[0]
@@ -925,10 +943,14 @@ def primitive_map_fuse(
         tile = create_empty_tile(tile_id=tile_id, m_tile=int(atlas_map.m_tile))
     K = target_slots.shape[0]
     if K == 0:
-        result = PrimitiveMapFuseResult(atlas_map=atlas_map, tile_id=tile_id, n_fused=0)
-        cert = CertBundle.create_exact(chart_id=chart_id, anchor_id=anchor_id)
-        effect = ExpectedEffect(objective_name="primitive_map_fuse", predicted=0.0, realized=0.0)
-        return result, cert, effect
+        return _exact_no_op_result(
+            result_factory=lambda: PrimitiveMapFuseResult(atlas_map=atlas_map, tile_id=tile_id, n_fused=0),
+            chart_id=chart_id,
+            anchor_id=anchor_id,
+            objective_name="primitive_map_fuse",
+            predicted=0.0,
+            realized=0.0,
+        )
 
     # Streaming reduce-by-key: scatter-add into map-sized accumulators (fixed-cost chunks).
     map_size = tile.Lambdas.shape[0]
@@ -1074,10 +1096,19 @@ def primitive_map_cull(
     if tile is None:
         tile = create_empty_tile(tile_id=tile_id, m_tile=int(atlas_map.m_tile))
     if tile.count == 0:
-        result = PrimitiveMapCullResult(atlas_map=atlas_map, tile_id=tile_id, n_culled=0, mass_dropped=0.0)
-        cert = CertBundle.create_exact(chart_id=chart_id, anchor_id=anchor_id)
-        effect = ExpectedEffect(objective_name="primitive_map_cull", predicted=0.0, realized=0.0)
-        return result, cert, effect
+        return _exact_no_op_result(
+            result_factory=lambda: PrimitiveMapCullResult(
+                atlas_map=atlas_map,
+                tile_id=tile_id,
+                n_culled=0,
+                mass_dropped=0.0,
+            ),
+            chart_id=chart_id,
+            anchor_id=anchor_id,
+            objective_name="primitive_map_cull",
+            predicted=0.0,
+            realized=0.0,
+        )
 
     # Find primitives below threshold
     below_threshold = tile.valid_mask & (tile.weights < weight_threshold)
@@ -1097,10 +1128,19 @@ def primitive_map_cull(
     n_culled = int(jnp.sum(below_threshold))
 
     if n_culled == 0:
-        result = PrimitiveMapCullResult(atlas_map=atlas_map, tile_id=tile_id, n_culled=0, mass_dropped=0.0)
-        cert = CertBundle.create_exact(chart_id=chart_id, anchor_id=anchor_id)
-        effect = ExpectedEffect(objective_name="primitive_map_cull", predicted=0.0, realized=0.0)
-        return result, cert, effect
+        return _exact_no_op_result(
+            result_factory=lambda: PrimitiveMapCullResult(
+                atlas_map=atlas_map,
+                tile_id=tile_id,
+                n_culled=0,
+                mass_dropped=0.0,
+            ),
+            chart_id=chart_id,
+            anchor_id=anchor_id,
+            objective_name="primitive_map_cull",
+            predicted=0.0,
+            realized=0.0,
+        )
 
     # Clear culled entries
     valid_mask = tile.valid_mask & ~below_threshold
@@ -1143,14 +1183,8 @@ def primitive_map_cull(
         chart_id=chart_id,
         anchor_id=anchor_id,
         triggers=["budgeting", "mass_drop"],
-        influence=InfluenceCert(
-            lift_strength=0.0,
-            psd_projection_delta=0.0,
+        influence=InfluenceCert.identity().with_overrides(
             mass_epsilon_ratio=mass_dropped / (jnp.sum(tile.weights) + constants.GC_EPS_MASS),
-            anchor_drift_rho=0.0,
-            dt_scale=1.0,
-            extrinsic_scale=1.0,
-            trust_alpha=1.0,
         ),
     )
     effect = ExpectedEffect(
@@ -1191,10 +1225,14 @@ def primitive_map_forget(
     tile_id = int(tile_id)
     tile = atlas_map.tiles.get(tile_id)
     if tile is None:
-        result = PrimitiveMapForgetResult(atlas_map=atlas_map, tile_id=tile_id)
-        cert = CertBundle.create_exact(chart_id=chart_id, anchor_id=anchor_id)
-        effect = ExpectedEffect(objective_name="primitive_map_forget", predicted=0.0, realized=0.0)
-        return result, cert, effect
+        return _exact_no_op_result(
+            result_factory=lambda: PrimitiveMapForgetResult(atlas_map=atlas_map, tile_id=tile_id),
+            chart_id=chart_id,
+            anchor_id=anchor_id,
+            objective_name="primitive_map_forget",
+            predicted=0.0,
+            realized=0.0,
+        )
     gamma = float(forgetting_factor)
 
     new_tile = PrimitiveMapTile(
@@ -1345,6 +1383,8 @@ def primitive_map_merge_reduce(
     atlas_map: AtlasMap,
     tile_id: int,
     merge_threshold: float = constants.GC_PRIMITIVE_MERGE_THRESHOLD,
+    max_pairs: int = constants.GC_K_MERGE_PAIRS_PER_TILE,
+    max_tile_size: int = constants.GC_PRIMITIVE_MERGE_MAX_TILE_SIZE,
     eps_psd: float = constants.GC_EPS_PSD,
     eps_lift: float = constants.GC_EPS_LIFT,
     chart_id: str = constants.GC_CHART_ID,
@@ -1362,48 +1402,224 @@ def primitive_map_merge_reduce(
         atlas_map: Current atlas map
         tile_id: Target tile ID
         merge_threshold: Distance below which to merge
+        max_tile_size: Cap on tile size for merge-reduce (prevents O(M^2) work)
         eps_psd: PSD regularization
         eps_lift: Matrix inversion regularization
 
     Returns:
         (result, CertBundle, ExpectedEffect)
     """
-    # For now, implement a simple version that doesn't merge
-    # Full implementation would require nearest-neighbor search
-    # and careful handling of the Gaussian/vMF mixture reduction
-
-    # TODO: Implement actual merge logic with:
-    # 1. Build k-d tree or spatial hash of primitive positions
-    # 2. Find pairs with Bhattacharyya distance < threshold
-    # 3. Merge via moment matching (weight-preserving)
-    # 4. Log Frobenius correction for out-of-family approximation
-
-    tile_id = int(tile_id)
-    if tile_id not in atlas_map.tiles:
+    def _no_op(
+        predicted: float,
+        triggers: Optional[List[str]] = None,
+        influence: Optional[InfluenceCert] = None,
+    ) -> Tuple[PrimitiveMapMergeReduceResult, CertBundle, ExpectedEffect]:
         result = PrimitiveMapMergeReduceResult(
             atlas_map=atlas_map,
             tile_id=tile_id,
             n_merged=0,
             frobenius_correction=0.0,
         )
-        cert = CertBundle.create_exact(chart_id=chart_id, anchor_id=anchor_id)
+        if triggers:
+            cert = CertBundle.create_approx(
+                chart_id=chart_id,
+                anchor_id=anchor_id,
+                triggers=triggers,
+                frobenius_applied=True,
+                influence=influence or InfluenceCert.identity(),
+            )
+        else:
+            cert = CertBundle.create_exact(chart_id=chart_id, anchor_id=anchor_id)
         effect = ExpectedEffect(
             objective_name="primitive_map_merge_reduce",
-            predicted=0.0,
+            predicted=predicted,
             realized=0.0,
         )
         return result, cert, effect
 
-    result = PrimitiveMapMergeReduceResult(
-        atlas_map=atlas_map,
-        tile_id=tile_id,
-        n_merged=0,
-        frobenius_correction=0.0,
+    tile_id = int(tile_id)
+    if tile_id not in atlas_map.tiles:
+        return _no_op(predicted=0.0)
+
+    tile = atlas_map.tiles.get(tile_id)
+    if tile is None:
+        return _no_op(predicted=0.0)
+
+    # Fixed-cost: compute pairwise Bhattacharyya distance for all pairs in tile.
+    weights = jnp.asarray(tile.weights, dtype=jnp.float64).reshape(-1)
+    valid = jnp.asarray(tile.valid_mask, dtype=bool).reshape(-1)
+    M = int(weights.shape[0])
+    if M < 2 or int(jnp.sum(valid.astype(jnp.int32))) < 2 or int(max_pairs) <= 0:
+        return _no_op(predicted=float(max_pairs))
+    max_tile_size_i = int(max_tile_size)
+    if max_tile_size_i > 0 and M > max_tile_size_i:
+        over = float(M - max_tile_size_i) / float(max(M, 1))
+        return _no_op(
+            predicted=float(max_pairs),
+            triggers=["merge_reduce_budget_cap"],
+            influence=InfluenceCert.identity().with_overrides(
+                mass_epsilon_ratio=over,
+            ),
+        )
+
+    Lambdas = jnp.asarray(tile.Lambdas, dtype=jnp.float64)
+    thetas = jnp.asarray(tile.thetas, dtype=jnp.float64)
+    etas = jnp.asarray(tile.etas, dtype=jnp.float64)
+    colors = jnp.asarray(tile.colors, dtype=jnp.float64)
+    primitive_ids = jnp.asarray(tile.primitive_ids, dtype=jnp.int64)
+    timestamps = jnp.asarray(tile.timestamps, dtype=jnp.float64)
+    created_timestamps = jnp.asarray(tile.created_timestamps, dtype=jnp.float64)
+    last_supported_scan_seq = jnp.asarray(tile.last_supported_scan_seq, dtype=jnp.int64)
+    last_update_scan_seq = jnp.asarray(tile.last_update_scan_seq, dtype=jnp.int64)
+
+    # Compute Gaussian means/covariances for each primitive.
+    Lambda_reg = Lambdas + eps_lift * jnp.eye(3, dtype=jnp.float64)[None, :, :]
+    mu = jax.vmap(jnp.linalg.solve)(Lambda_reg, thetas)
+    Sigma = jax.vmap(jnp.linalg.inv)(Lambda_reg)
+    det_Sigma = jnp.linalg.det(Sigma)
+
+    i_idx, j_idx = jnp.triu_indices(M, k=1)
+    mu_i = mu[i_idx]
+    mu_j = mu[j_idx]
+    Sigma_i = Sigma[i_idx]
+    Sigma_j = Sigma[j_idx]
+    det_i = det_Sigma[i_idx]
+    det_j = det_Sigma[j_idx]
+
+    S = 0.5 * (Sigma_i + Sigma_j)
+    det_S = jnp.linalg.det(S)
+    S_inv = jax.vmap(jnp.linalg.inv)(S + eps_lift * jnp.eye(3, dtype=jnp.float64)[None, :, :])
+    dmu = (mu_i - mu_j)[:, :, None]
+    quad = 0.125 * jnp.squeeze(jnp.matmul(jnp.matmul(dmu.transpose(0, 2, 1), S_inv), dmu), axis=(1, 2))
+    log_term = 0.5 * jnp.log(det_S / jnp.sqrt(det_i * det_j + 1e-24))
+    dist = quad + log_term
+
+    pair_valid = valid[i_idx] & valid[j_idx]
+    dist = jnp.where(pair_valid, dist, jnp.asarray(jnp.inf, dtype=jnp.float64))
+
+    # Deterministic pair selection: sort by distance, then select disjoint pairs up to max_pairs.
+    order = jnp.argsort(dist)
+    used = np.zeros((M,), dtype=bool)
+    selected_pairs: List[Tuple[int, int]] = []
+    for idx in np.array(order):
+        if len(selected_pairs) >= int(max_pairs):
+            break
+        i = int(i_idx[idx])
+        j = int(j_idx[idx])
+        if not np.isfinite(float(dist[idx])):
+            break
+        if float(dist[idx]) >= float(merge_threshold):
+            break
+        if used[i] or used[j]:
+            continue
+        used[i] = True
+        used[j] = True
+        selected_pairs.append((i, j))
+
+    if not selected_pairs:
+        return _no_op(predicted=float(max_pairs))
+
+    # Apply merges: keep lower index; invalidate higher index.
+    Lambdas_new = Lambdas
+    thetas_new = thetas
+    etas_new = etas
+    weights_new = weights
+    colors_new = colors
+    valid_new = valid
+    timestamps_new = timestamps
+    created_timestamps_new = created_timestamps
+    last_supported_new = last_supported_scan_seq
+    last_update_new = last_update_scan_seq
+
+    for i, j in selected_pairs:
+        w1 = float(weights_new[i])
+        w2 = float(weights_new[j])
+        wsum = w1 + w2
+        if wsum <= 0.0:
+            continue
+
+        mu1 = mu[i]
+        mu2 = mu[j]
+        Sigma1 = Sigma[i]
+        Sigma2 = Sigma[j]
+
+        mu_m = (w1 * mu1 + w2 * mu2) / wsum
+        d1 = (mu1 - mu_m).reshape(3, 1)
+        d2 = (mu2 - mu_m).reshape(3, 1)
+        Sigma_m = (w1 * (Sigma1 + d1 @ d1.T) + w2 * (Sigma2 + d2 @ d2.T)) / wsum
+        Sigma_m = Sigma_m + eps_psd * jnp.eye(3, dtype=jnp.float64)
+        Lambda_m = jnp.linalg.inv(Sigma_m)
+        theta_m = Lambda_m @ mu_m
+
+        # vMF payload: weight-weighted sum (user-selected default).
+        eta_m = (w1 * etas_new[i] + w2 * etas_new[j]) / wsum
+        color_m = (w1 * colors_new[i] + w2 * colors_new[j]) / wsum
+
+        Lambdas_new = Lambdas_new.at[i].set(Lambda_m)
+        thetas_new = thetas_new.at[i].set(theta_m)
+        etas_new = etas_new.at[i].set(eta_m)
+        weights_new = weights_new.at[i].set(wsum)
+        colors_new = colors_new.at[i].set(color_m)
+        timestamps_new = timestamps_new.at[i].set(jnp.maximum(timestamps_new[i], timestamps_new[j]))
+        created_timestamps_new = created_timestamps_new.at[i].set(
+            jnp.minimum(created_timestamps_new[i], created_timestamps_new[j])
+        )
+        last_supported_new = last_supported_new.at[i].set(
+            jnp.maximum(last_supported_new[i], last_supported_new[j])
+        )
+        last_update_new = last_update_new.at[i].set(
+            jnp.maximum(last_update_new[i], last_update_new[j])
+        )
+
+        # Invalidate j
+        weights_new = weights_new.at[j].set(0.0)
+        valid_new = valid_new.at[j].set(False)
+
+    n_merged = int(len(selected_pairs))
+    new_tile = PrimitiveMapTile(
+        tile_id=tile.tile_id,
+        Lambdas=Lambdas_new,
+        thetas=thetas_new,
+        etas=etas_new,
+        weights=weights_new,
+        timestamps=timestamps_new,
+        created_timestamps=created_timestamps_new,
+        last_supported_scan_seq=last_supported_new,
+        last_update_scan_seq=last_update_new,
+        primitive_ids=primitive_ids,
+        valid_mask=valid_new,
+        colors=colors_new,
+        next_local_id=tile.next_local_id,
+        count=int(jnp.sum(valid_new.astype(jnp.int32))),
     )
-    cert = CertBundle.create_exact(chart_id=chart_id, anchor_id=anchor_id)
+    tiles = dict(atlas_map.tiles)
+    tiles[tile_id] = new_tile
+    new_atlas = AtlasMap(
+        tiles=tiles,
+        next_global_id=atlas_map.next_global_id,
+        total_count=int(atlas_map.total_count - n_merged),
+        m_tile=atlas_map.m_tile,
+    )
+
+    # Merge-reduce is an approximation (mixture reduction) => Frobenius correction required.
+    cert = CertBundle.create_approx(
+        chart_id=chart_id,
+        anchor_id=anchor_id,
+        triggers=["primitive_map_merge_reduce"],
+        frobenius_applied=True,
+        influence=InfluenceCert.identity().with_overrides(
+            mass_epsilon_ratio=float(n_merged) / float(max(M, 1)),
+        ),
+    )
     effect = ExpectedEffect(
         objective_name="primitive_map_merge_reduce",
-        predicted=0.0,
-        realized=0.0,
+        predicted=float(max_pairs),
+        realized=float(n_merged),
+    )
+    result = PrimitiveMapMergeReduceResult(
+        atlas_map=new_atlas,
+        tile_id=tile_id,
+        n_merged=n_merged,
+        frobenius_correction=float(n_merged),
     )
     return result, cert, effect

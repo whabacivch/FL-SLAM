@@ -209,7 +209,7 @@ Performance is under active iteration; see `docs/PIPELINE_DESIGN_GAPS.md` for cu
 | **docs/IMU_BELIEF_MAP_AND_FUSION.md** | Pipeline reference: topics, steps, evidence, fusion |
 | **docs/FRAME_AND_QUATERNION_CONVENTIONS.md** | Frames, quaternions, SE(3) |
 | **docs/PIPELINE_DESIGN_GAPS.md** | Known limitations (cross-sensor consistency, unused covariances, nonlinear approximations) |
-| **archive/docs/** | Archived dataset/docs (e.g. M3DGR_DYNAMIC01_ARCHIVE) |
+| **archive/docs/** | Archived dataset/docs |
 | **docs/PREINTEGRATION_STEP_BY_STEP.md** | IMU preintegration steps (including gravity) |
 | **docs/EVALUATION.md** | Evaluation metrics and workflow |
 | **docs/TESTING.md** | Testing framework |

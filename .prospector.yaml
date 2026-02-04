@@ -1,0 +1,20 @@
+# Prospector config: limit to fl_slam_poc + tools, exclude heavy/third-party paths
+output-format: grouped
+ignore-paths:
+  - archive
+  - H_Aware
+  - fl_ws/build
+  - fl_ws/install
+  - fl_ws/log
+  - .venv
+  - .git
+  - results
+max-line-length: 120
+pylint:
+  disable:
+    - consider-using-f-string  # project uses .format in places
+    - too-many-arguments
+    - too-many-locals
+    - too-many-branches
+    - too-many-statements
+    - duplicate-code
